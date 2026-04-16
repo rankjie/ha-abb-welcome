@@ -16,8 +16,9 @@ port 5060. Door unlocks typically complete in well under 100 ms.
 
 ## Requirements
 
-- An ABB Welcome **IP gateway** that you can reach on your local network (typical
-  setup: `192.168.x.x`, model `ASM04` or similar, system type `mrange`).
+- An ABB Welcome **IP gateway** that you can reach on your local network
+  (e.g. ABB **83342** or another `mrange`-system IP gateway, typically reachable
+  at `192.168.x.x`).
 - An **ABB-Welcome / Busch-Jaeger MyBuildings** account that is already linked to
   that gateway (the same login you use in the official ABB Welcome mobile app).
 - The gateway's **web admin password** (the one used at `https://<gateway-ip>/`).
