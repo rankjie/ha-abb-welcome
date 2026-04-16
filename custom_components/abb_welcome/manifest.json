@@ -1,0 +1,12 @@
+{
+  "domain": "abb_welcome",
+  "name": "ABB Welcome",
+  "codeowners": ["@rankjie"],
+  "config_flow": true,
+  "documentation": "https://github.com/rankjie/ha-abb-welcome",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/rankjie/ha-abb-welcome/issues",
+  "requirements": ["cryptography>=42.0.0", "requests>=2.32.0"],
+  "version": "1.0.0"
+}

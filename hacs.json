@@ -1,0 +1,7 @@
+{
+  "name": "ABB Welcome",
+  "render_readme": true,
+  "country": ["DE", "NL", "BE", "FR", "IT", "ES", "GB"],
+  "homeassistant": "2024.1.0",
+  "zip_release": false
+}
