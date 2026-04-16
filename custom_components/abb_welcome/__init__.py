@@ -11,6 +11,19 @@ from .sip_client import SIPClient
 
 _LOGGER = logging.getLogger(__name__)
 
+# Force INFO-level logging for everything in this integration so users get a
+# verbose pairing trace by default — no need to add a logger: block to
+# configuration.yaml.  Users who want to silence it can override via the
+# normal Home Assistant logger configuration.
+for _name in (
+    "custom_components.abb_welcome",
+    "custom_components.abb_welcome.portal",
+    "custom_components.abb_welcome.config_flow",
+    "custom_components.abb_welcome.sip_client",
+    "custom_components.abb_welcome.button",
+):
+    logging.getLogger(_name).setLevel(logging.INFO)
+
 PLATFORMS = [Platform.BUTTON]
 
 
