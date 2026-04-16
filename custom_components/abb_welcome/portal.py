@@ -309,7 +309,6 @@ def poll_acl_update(
     cert_pem: bytes,
     key_pem: bytes,
     own_uuid: str,
-    *,
     attempts: int = 30,
     interval: float = 3.0,
 ) -> str | None:
