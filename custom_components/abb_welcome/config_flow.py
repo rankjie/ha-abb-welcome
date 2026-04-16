@@ -43,6 +43,16 @@ from .portal import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_LOG_PREFIX = "[abb] "
+
+
+def _log_info(msg: str, *args: object) -> None:
+    _LOGGER.info(_LOG_PREFIX + msg, *args)
+
+
+def _log_error(msg: str, *args: object) -> None:
+    _LOGGER.error(_LOG_PREFIX + msg, *args)
+
 
 CONF_GATEWAY_PASSWORD = "gateway_password"  # noqa: S105 (config-flow field name)
 
@@ -141,7 +151,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                     elif "integrity code" in msg:
                         errors["base"] = "integrity_code_rejected"
                     else:
-                        _LOGGER.error("Gateway admin error: %s", err)
+                        _log_error("Gateway admin error: %s", err)
                         errors["base"] = "gateway_admin_failed"
                 except PortalError as err:
                     msg = str(err).lower()
@@ -150,7 +160,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                     elif "no discovery" in msg or "gateway entry" in msg:
                         errors["base"] = "gateway_not_found"
                     else:
-                        _LOGGER.error("Portal pairing error: %s", err)
+                        _log_error("Portal pairing error: %s", err)
                         errors["base"] = "unknown"
                 except Exception as err:  # noqa: BLE001
                     _LOGGER.exception("Unexpected portal pairing error: %s", err)
@@ -235,7 +245,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 parse_acl_update, payload, self._private_key_pem
             )
         except PortalError as err:
-            _LOGGER.error("ACL parse failed: %s", err)
+            _log_error("ACL parse failed: %s", err)
             return self.async_abort(reason="acl_parse_failed")
 
         self._sip_password = sip_password

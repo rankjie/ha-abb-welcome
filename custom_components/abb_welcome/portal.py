@@ -69,6 +69,15 @@ _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 30
 
+# All log messages from this module are prefixed with [abb] so users can grep
+# Home Assistant logs easily.  Use `_log(level, msg, *args)` to keep the prefix
+# consistent across the file.
+LOG_PREFIX = "[abb] "
+
+
+def _log(level: int, msg: str, *args: Any) -> None:
+    _LOGGER.log(level, LOG_PREFIX + msg, *args)
+
 
 class PortalError(Exception):
     """Raised when a portal API call fails."""
@@ -79,6 +88,7 @@ def generate_keypair_and_csr(username: str) -> tuple[bytes, bytes, rsa.RSAPrivat
 
     Returns ``(private_key_pem, csr_pem, private_key_object)``.
     """
+    _log(logging.INFO, "[step 1/8] Generating RSA-2048 keypair + CSR (CN=%s)", username)
     priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     priv_pem = priv.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -90,24 +100,32 @@ def generate_keypair_and_csr(username: str) -> tuple[bytes, bytes, rsa.RSAPrivat
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, username)]))
         .sign(priv, hashes.SHA256())
     )
-    return priv_pem, csr.public_bytes(serialization.Encoding.PEM), priv
+    csr_pem = csr.public_bytes(serialization.Encoding.PEM)
+    _log(logging.DEBUG, "Generated keypair (%d-byte priv) and CSR (%d-byte PEM)",
+                  len(priv_pem), len(csr_pem))
+    return priv_pem, csr_pem, priv
 
 
 def resolve_portal_url(username: str) -> str:
     """Look up the regional portal URL via the GEO service."""
+    sha = hashlib.sha256(username.encode()).hexdigest()
+    _log(logging.INFO, "[step 2/8] GEO lookup for username sha256=%s", sha)
     try:
-        sha = hashlib.sha256(username.encode()).hexdigest()
         resp = requests.get(
             f"{GEO_URL}/api/config/services",
             params={"by_username_sha256": sha},
             timeout=10,
         )
+        _log(logging.DEBUG, "GEO -> HTTP %d (%d bytes)", resp.status_code, len(resp.content))
         resp.raise_for_status()
         api_hosts = resp.json().get("api") or []
         if api_hosts:
-            return f"https://{api_hosts[0]}"
-    except (requests.RequestException, ValueError):
-        _LOGGER.debug("GEO lookup failed; falling back to %s", DEFAULT_PORTAL_URL)
+            url = f"https://{api_hosts[0]}"
+            _log(logging.INFO, "Portal URL resolved: %s", url)
+            return url
+        _log(logging.WARNING, "GEO returned empty api host list; falling back to %s", DEFAULT_PORTAL_URL)
+    except (requests.RequestException, ValueError) as err:
+        _log(logging.WARNING, "GEO lookup failed (%s); falling back to %s", err, DEFAULT_PORTAL_URL)
     return DEFAULT_PORTAL_URL
 
 
@@ -120,8 +138,13 @@ def request_certificate(
 ) -> bytes:
     """Submit the CSR to the portal and return the signed cert (PEM)."""
     csr_b64 = base64.b64encode(csr_pem).decode()
+    url = f"{portal_url}/certificate/request"
+    _log(logging.INFO, 
+        "[step 3/8] POST %s (HTTP Digest auth, client-name=%s, client-type=%s)",
+        url, client_name, CLIENT_TYPE,
+    )
     resp = requests.post(
-        f"{portal_url}/certificate/request",
+        url,
         auth=requests.auth.HTTPDigestAuth(username, password),
         json={
             "client-csr": csr_b64,
@@ -130,15 +153,18 @@ def request_certificate(
         },
         timeout=DEFAULT_TIMEOUT,
     )
+    _log(logging.INFO, "Cert response: HTTP %d (%d bytes)", resp.status_code, len(resp.content))
     if resp.status_code == 401:
-        raise PortalError("Portal authentication failed (HTTP 401)")
+        raise PortalError("Portal authentication failed (HTTP 401) — check MyBuildings username/password")
     if resp.status_code not in (200, 201):
+        _log(logging.ERROR, "Cert request failed body: %s", resp.text[:500])
         raise PortalError(
             f"Certificate request failed: HTTP {resp.status_code} {resp.text[:200]}"
         )
 
     body = resp.text.strip()
     if body.startswith("-----BEGIN"):
+        _log(logging.DEBUG, "Cert returned as raw PEM (%d bytes)", len(body))
         return body.encode()
 
     # Fallback for environments that JSON-wrap the cert.
@@ -154,6 +180,7 @@ def request_certificate(
 
 def derive_identity(cert_pem: bytes, portal_username: str) -> dict[str, str]:
     """Derive SIP username, GRUU and own_portal_uuid from a signed cert."""
+    _log(logging.INFO, "[step 4/8] Deriving identity from certificate")
     cert = x509.load_pem_x509_certificate(cert_pem)
     der = cert.public_bytes(serialization.Encoding.DER)
     sha1 = hashlib.sha1(der).hexdigest().upper()
@@ -171,10 +198,15 @@ def derive_identity(cert_pem: bytes, portal_username: str) -> dict[str, str]:
     if not own_uuid:
         raise PortalError("Could not extract own_portal_uuid from certificate SAN")
 
+    sip_username = f"{portal_username}_{gruu}"
+    _log(logging.INFO,
+        "Identity: sip_username=%s gruu=%s own_portal_uuid=%s sha1=%s",
+        sip_username, gruu, own_uuid, sha1[:16] + "...",
+    )
     return {
         "fingerprint_sha1": sha1,
         "gruu": gruu,
-        "sip_username": f"{portal_username}_{gruu}",
+        "sip_username": sip_username,
         "own_portal_uuid": own_uuid,
     }
 
@@ -195,7 +227,10 @@ def compute_integrity_code(fingerprint_sha1: str, rand: int | None = None) -> tu
     decorated = ":".join(fingerprint_sha1[i : i + 2] for i in range(0, 40, 2))
     rand_str = f"{rand:04d}"
     hhhh = hashlib.md5(f"{rand_str}:{decorated}".encode()).hexdigest().upper()[:4]
-    return f"{rand_str}{hhhh}", f"{rand_str} {hhhh}"
+    eight = f"{rand_str}{hhhh}"
+    display = f"{rand_str} {hhhh}"
+    _log(logging.INFO, "[step 5/8] Computed integrity code: %s (gateway will recompute and verify)", display)
+    return eight, display
 
 
 def _mtls_session(cert_pem: bytes, key_pem: bytes) -> tuple[requests.Session, list[str]]:
@@ -290,12 +325,19 @@ def send_connect_event(
         "source": own_uuid,
         "payload": integrity_code,
     }
+    _log(logging.INFO,
+        "[step 6/8] POST %s/event type=%s destination=[%s] source=%s",
+        portal_url, EVENT_TYPE_CONNECT, gateway_uuid, own_uuid,
+    )
+    _log(logging.DEBUG, "Connect event body id=%s timestamp=%s", body["id"], body["timestamp"])
     session, temps = _mtls_session(cert_pem, key_pem)
     try:
         resp = session.post(
             f"{portal_url}/event", json=body, timeout=DEFAULT_TIMEOUT
         )
+        _log(logging.INFO, "Connect event response: HTTP %d", resp.status_code)
         if resp.status_code not in (200, 201):
+            _log(logging.ERROR, "Connect event failure body: %s", resp.text[:500])
             raise PortalError(
                 f"Connect event rejected: HTTP {resp.status_code} {resp.text[:200]}"
             )
@@ -316,9 +358,13 @@ def poll_acl_update(
 
     Returns the base64-decoded payload as text, or None on timeout.
     """
+    _log(logging.INFO,
+        "[step 8/8] Polling /event?type=%s for own_uuid=%s (max %d attempts, %.1fs interval)",
+        EVENT_TYPE_ACL_UPDATE, own_uuid, attempts, interval,
+    )
     session, temps = _mtls_session(cert_pem, key_pem)
     try:
-        for _ in range(attempts):
+        for n in range(1, attempts + 1):
             try:
                 resp = session.get(
                     f"{portal_url}/event",
@@ -332,16 +378,23 @@ def poll_acl_update(
                 )
                 resp.raise_for_status()
                 events = (resp.json() or {}).get("events") or []
-            except (requests.RequestException, ValueError):
+            except (requests.RequestException, ValueError) as err:
+                _log(logging.DEBUG, "Poll attempt %d transport error: %s", n, err)
                 events = []
+            _log(logging.DEBUG, "Poll attempt %d: %d events visible", n, len(events))
             for evt in events:
                 dest = evt.get("destination") or []
                 if own_uuid in dest:
                     payload_b64 = evt.get("payload", "")
                     pad = "=" * (-len(payload_b64) % 4)
                     raw = base64.b64decode(payload_b64 + pad)
+                    _log(logging.INFO,
+                        "ACL-update arrived (event id=%s, %d-byte payload) on attempt %d",
+                        evt.get("id"), len(raw), n,
+                    )
                     return raw.decode("utf-8", errors="replace")
             time.sleep(interval)
+        _log(logging.WARNING, "ACL-update polling timed out after %d attempts", attempts)
         return None
     finally:
         session.close()
@@ -356,6 +409,7 @@ def parse_acl_update(
     Returns ``(sip_password, sip_domain, doors)`` where each door is
     ``{"name", "address", "station_id"}``.
     """
+    _log(logging.INFO, "Parsing ACL-update payload (%d bytes)", len(payload))
     lines = payload.splitlines()
     if not lines:
         raise PortalError("Empty ACL-update payload")
@@ -371,6 +425,7 @@ def parse_acl_update(
         ).decode().strip()
     except Exception as err:  # noqa: BLE001
         raise PortalError(f"SIP password decryption failed: {err}") from err
+    _log(logging.INFO, "SIP password decrypted (%d chars; value redacted)", len(sip_password))
 
     config = configparser.ConfigParser()
     try:
@@ -401,6 +456,10 @@ def parse_acl_update(
                 "station_id": station_id,
             }
         )
+
+    _log(logging.INFO, "ACL-update parsed: sip_domain=%s, %d door(s)", sip_domain, len(doors))
+    for d in doors:
+        _log(logging.DEBUG, "  door: %s -> %s", d["name"], d["address"])
 
     if not sip_domain or not doors:
         raise PortalError("ACL-update payload missing network domain or doors")
@@ -475,6 +534,10 @@ def _gateway_login(
 ) -> requests.Session:
     """Authenticate to the gateway web admin and return the live session."""
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    _log(logging.INFO,
+        "Logging into gateway https://%s/cgi-bin/checklogin.cgi as %s",
+        gateway_ip, admin_username,
+    )
     session = requests.Session()
     resp = session.post(
         f"https://{gateway_ip}/cgi-bin/checklogin.cgi",
@@ -489,11 +552,13 @@ def _gateway_login(
         verify=False,
     )
     body = resp.text.strip()
+    _log(logging.DEBUG, "Gateway login response: HTTP %d body=%r", resp.status_code, body)
     if resp.status_code != 200 or body not in ("1", "2"):
         session.close()
         raise GatewayAdminError(
             f"Gateway login failed (HTTP {resp.status_code}, body {body!r})"
         )
+    _log(logging.INFO, "Gateway login OK (server returned %r)", body)
     return session
 
 
@@ -508,9 +573,11 @@ def gateway_local_info(
     This sidesteps the cloud discovery race — useful for new clients that
     aren't yet visible in any portal discovery event.
     """
+    _log(logging.INFO, "Fetching gateway info via op=6 (uuid + portalname + regstate)")
     session = _gateway_login(gateway_ip, admin_username, admin_password)
     try:
         info = _gw_post(session, gateway_ip, "/cgi-bin/portalclient.cgi", {"op": "6"})
+        _log(logging.INFO, "Gateway op=6 returned: %s", info)
         if "uuid" not in info:
             raise GatewayAdminError(
                 f"Gateway op=6 response missing uuid: {info!r}"
@@ -540,14 +607,21 @@ def gateway_authorize(
     if permissions:
         perms.update(permissions)
 
+    _log(logging.INFO, "[step 7/8] Auto-approving pairing on gateway as friendlyname=%s", client_name)
     session = _gateway_login(gateway_ip, admin_username, admin_password)
     try:
         time.sleep(request_pause)
 
         # 2. Find our pending sid by friendlyname.
+        _log(logging.INFO, "Listing apps via op=10 to find pending entry")
         listing = _gw_post(session, gateway_ip, "/cgi-bin/portalclient.cgi", {"op": "10"})
+        apps = listing.get("apps") or []
+        _log(logging.DEBUG, "Gateway lists %d apps", len(apps))
+        for app in apps:
+            _log(logging.DEBUG, "  app: sid=%s friendlyname=%s state=%s uuid=%s",
+                 app.get("sid"), app.get("friendlyname"), app.get("state"), app.get("uuid"))
         sid = ""
-        for app in listing.get("apps") or []:
+        for app in apps:
             if app.get("friendlyname") == client_name and app.get("state") == "unpaired":
                 sid = app.get("sid", "")
                 break
@@ -556,13 +630,16 @@ def gateway_authorize(
                 f"No pending app named {client_name!r} on the gateway "
                 "(connect event may not have arrived yet — try again)"
             )
+        _log(logging.INFO, "Found pending app: sid=%s friendlyname=%s", sid, client_name)
         time.sleep(request_pause)
 
         # 3. Save permissions for the pending entry (op=2).
         perms_body = {"op": "2", "sid": sid, "state": "unpaired", **perms}
+        _log(logging.INFO, "Setting permissions via op=2 for sid=%s: %s", sid, perms)
         perms_result = _gw_post(
             session, gateway_ip, "/cgi-bin/portalclient.cgi", perms_body
         )
+        _log(logging.DEBUG, "op=2 returned %r", perms_result)
         if perms_result.get("result") != 1:
             raise GatewayAdminError(
                 f"Setting permissions failed: gateway returned {perms_result!r}"
@@ -570,14 +647,17 @@ def gateway_authorize(
         time.sleep(request_pause)
 
         # 4. Submit the integrity code (op=3).
+        _log(logging.INFO, "Submitting integrity code via op=3 for sid=%s", sid)
         code_body = {"op": "3", "sid": sid, "securitycode": integrity_code}
         code_result = _gw_post(
             session, gateway_ip, "/cgi-bin/portalclient.cgi", code_body
         )
+        _log(logging.DEBUG, "op=3 returned %r", code_result)
         if code_result.get("result") != 1:
             raise GatewayAdminError(
                 f"Integrity code rejected: gateway returned {code_result!r}"
             )
+        _log(logging.INFO, "Gateway accepted integrity code; sid=%s now paired", sid)
         return sid
     finally:
         session.close()
