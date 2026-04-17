@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "ABB Welcome",
-        "description": "Pair this Home Assistant instance with your ABB Welcome IP gateway.\n\nFour fields:\n• MyBuildings portal username and password (same as the official ABB Welcome mobile app).\n• Gateway local IP address.\n• Gateway web admin password (the one used at https://<gateway-ip>/).\n\nAfter you submit, the integration finishes pairing automatically — no need to open the gateway web admin yourself.",
+        "description": "Pair this Home Assistant instance with your ABB Welcome IP gateway.\n\nFour fields:\n• MyBuildings portal username and password (same as the official ABB Welcome mobile app).\n• Gateway local IP address.\n• Gateway web admin password (the one used at https://gateway-ip/).\n\nAfter you submit, the integration finishes pairing automatically — no need to open the gateway web admin yourself.",
         "data": {
           "abb_username": "Portal Username",
           "abb_password": "Portal Password",
@@ -20,7 +20,7 @@
       "cannot_connect": "Cannot reach the gateway on port 5060. Check the IP and that you are on the same network.",
       "invalid_auth": "Invalid portal credentials.",
       "gateway_not_found": "No IP gateway is visible to this portal account.",
-      "gateway_admin_auth_failed": "Gateway admin password is wrong (login at https://<gateway-ip>/ as `admin` failed).",
+      "gateway_admin_auth_failed": "Gateway admin password is wrong (login at https://gateway-ip/ as `admin` failed).",
       "no_pending_app": "The gateway did not see our pairing request. Try again or check that the portal account is linked to this gateway.",
       "integrity_code_rejected": "The gateway rejected the integrity code we computed. Open an issue with your gateway firmware version.",
       "gateway_admin_failed": "Talking to the gateway admin CGI failed — see the Home Assistant log.",
