@@ -118,6 +118,11 @@ class ABBWelcomeCamera(Camera):
         self._stream_url: str | None = None
         self._stream_started_at: float = 0.0
         self._auto_hangup_task: asyncio.Task | None = None
+        # HA's WebRTC provider system probes ``stream_source()`` at entity-add
+        # time.  We don't want that probe to dial the intercom (would block
+        # other cameras with a 403, since the gateway only allows one active
+        # call).  Skip until the entity is fully initialized.
+        self._added = False
 
     @classmethod
     def _get_lock(cls) -> asyncio.Lock:
@@ -125,12 +130,19 @@ class ABBWelcomeCamera(Camera):
             cls._shared_lock = asyncio.Lock()
         return cls._shared_lock
 
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._added = True
+
     async def stream_source(self) -> str | None:
         """Return a URL HA's stream component can read.
 
         Lazily dials the outdoor station + spawns ffmpeg.  Subsequent
         calls within the active window return the same URL.
         """
+        if not self._added:
+            # WebRTC provider probe at entity-add time — don't dial.
+            return None
         lock = self._get_lock()
         async with lock:
             now = time.monotonic()

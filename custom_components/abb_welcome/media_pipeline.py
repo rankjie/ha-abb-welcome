@@ -235,7 +235,7 @@ class MediaPipeline:
 
         # Spin up FFmpeg.
         self._sdp_path = Path("/tmp") / f"abb_pipeline_{ingest_port}.sdp"
-        self._sdp_path.write_text(
+        sdp_text = (
             "v=0\r\n"
             "o=- 0 0 IN IP4 127.0.0.1\r\n"
             "s=ABB\r\n"
@@ -244,6 +244,8 @@ class MediaPipeline:
             f"m=video {ingest_port} RTP/AVP 102\r\n"
             "a=rtpmap:102 H264/90000\r\n"
         )
+        sdp_path = self._sdp_path
+        await loop.run_in_executor(None, sdp_path.write_text, sdp_text)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind(("127.0.0.1", 0))
         self._tcp_port = sock.getsockname()[1]
@@ -307,8 +309,11 @@ class MediaPipeline:
         self._audio_sock = None
 
         if self._sdp_path is not None:
+            sdp_path = self._sdp_path
             try:
-                self._sdp_path.unlink(missing_ok=True)
+                await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: sdp_path.unlink(missing_ok=True)
+                )
             except OSError:
                 pass
             self._sdp_path = None
