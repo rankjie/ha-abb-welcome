@@ -32,6 +32,9 @@ for _name in (
     "custom_components.abb_welcome.sip_listener",
     "custom_components.abb_welcome.button",
     "custom_components.abb_welcome.binary_sensor",
+    "custom_components.abb_welcome.camera",
+    "custom_components.abb_welcome.intercom_dialer",
+    "custom_components.abb_welcome.media_pipeline",
     "custom_components.abb_welcome.image",
     "custom_components.abb_welcome.event",
     "custom_components.abb_welcome.sensor",
@@ -41,6 +44,7 @@ for _name in (
 PLATFORMS = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
+    Platform.CAMERA,
     Platform.IMAGE,
     Platform.EVENT,
     Platform.SENSOR,
