@@ -33,14 +33,26 @@ async def async_setup_entry(
     )
 
 
-def _parse_event_timestamp(value: str) -> datetime | None:
-    """Parse the ISO-8601 timestamp the portal puts on each event."""
-    if not value:
+def _parse_event_timestamp(value: str | int | float | None) -> datetime | None:
+    """Parse a portal event's timestamp, accepting ISO-8601 or Unix epoch."""
+    if value in (None, ""):
         return None
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
+    # Some endpoints emit numeric epoch seconds — handle both str digits and int.
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    text = str(value).strip()
+    if text.isdigit():
+        try:
+            return datetime.fromtimestamp(int(text), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(value)
+        return datetime.fromisoformat(text)
     except ValueError:
         return None
 
@@ -92,12 +104,32 @@ class ABBWelcomeScreenshotImage(ImageEntity):
             return
         self._image = data.latest_screenshot
         self._last_event_id = data.latest_screenshot_event_id
+
+        raw_ts = ""
         ts: datetime | None = None
         for evt in data.events:
             if evt.event_id == self._last_event_id:
+                raw_ts = evt.timestamp
                 ts = _parse_event_timestamp(evt.timestamp)
                 break
-        self._attr_image_last_updated = ts or datetime.now(timezone.utc)
+
+        if ts is not None:
+            self._attr_image_last_updated = ts
+            _LOGGER.info(
+                "[abb] Screenshot event %s captured at %s (raw=%r)",
+                self._last_event_id, ts.isoformat(), raw_ts,
+            )
+        else:
+            # No parseable event timestamp — fall back to ``now`` so the
+            # frontend cache-buster still fires.  Without this the browser
+            # would keep showing the previous image.
+            self._attr_image_last_updated = datetime.now(timezone.utc)
+            _LOGGER.warning(
+                "[abb] Screenshot event %s has no parseable timestamp "
+                "(raw=%r) — using current time. Please report this with a "
+                "DEBUG log so the parser can be extended.",
+                self._last_event_id, raw_ts,
+            )
 
     @callback
     def _handle_update(self) -> None:
@@ -106,3 +138,19 @@ class ABBWelcomeScreenshotImage(ImageEntity):
 
     async def async_image(self) -> bytes | None:
         return self._image
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | None]:
+        """Expose the actual capture time as a clearly named attribute.
+
+        ``image_last_updated`` is also the entity's state value, but HA's
+        Lovelace cards often surface ``last_changed`` (when HA wrote the
+        state) rather than the image's own timestamp.  This attribute makes
+        the real capture time visible regardless of which timestamp the UI
+        chooses to display.
+        """
+        ts = self._attr_image_last_updated
+        return {
+            "captured_at": ts.isoformat() if ts else None,
+            "event_id": self._last_event_id or None,
+        }
