@@ -40,6 +40,7 @@ import hashlib
 import json as _json
 import logging
 import random
+import re
 import tempfile
 import time
 import urllib.parse
@@ -79,6 +80,78 @@ def _log(level: int, msg: str, *args: Any) -> None:
     _LOGGER.log(level, LOG_PREFIX + msg, *args)
 
 
+# ---------------------------------------------------------------------------
+# HTTP diagnostic logging.  Every outbound request in this module funnels
+# through ``_http_trace`` so a single ``logging.getLogger("custom_components."
+# "abb_welcome.portal").setLevel(DEBUG)`` produces a complete request/response
+# capture for every call (gateway CGI, MyBuildings portal, GEO).
+# ---------------------------------------------------------------------------
+
+_TRUNCATE_LIMIT = 800
+_REDACT_JSON_RE = re.compile(
+    r'("(?:password|securitycode|client-csr)"\s*:\s*)"[^"]*"'
+)
+_REDACT_FORM_RE = re.compile(r'(password=)[^&\s]*')
+
+
+def _redact_body(text: str) -> str:
+    """Mask passwords / integrity codes / CSRs in a body string."""
+    if not text:
+        return text
+    text = _REDACT_JSON_RE.sub(r'\1"***"', text)
+    text = _REDACT_FORM_RE.sub(r'\1***', text)
+    return text
+
+
+def _truncate(text: str, limit: int = _TRUNCATE_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"…(+{len(text) - limit} more bytes)"
+
+
+def _http_trace(resp: requests.Response, label: str = "") -> None:
+    """Emit a DEBUG-level full request/response trace for ``resp``.
+
+    Logs request method/URL, request headers (Authorization redacted, Cookie
+    intact so session loss is visible), request body (secrets redacted,
+    truncated), then response status, headers (including ``Set-Cookie``),
+    and body (redacted, truncated).  Early-exits cheaply when DEBUG is off.
+    """
+    if not _LOGGER.isEnabledFor(logging.DEBUG):
+        return
+    req = resp.request
+    tag = f"[{label}] " if label else ""
+
+    body: Any = req.body
+    if isinstance(body, bytes):
+        try:
+            body = body.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            body = repr(body)
+    body_text = body or ""
+
+    req_headers = dict(req.headers)
+    if "Authorization" in req_headers:
+        scheme = req_headers["Authorization"].split(" ", 1)[0]
+        req_headers["Authorization"] = f"{scheme} ***"
+
+    _log(logging.DEBUG, "%s>> %s %s", tag, req.method, req.url)
+    _log(logging.DEBUG, "%s>> req headers: %s", tag, req_headers)
+    if body_text:
+        _log(logging.DEBUG, "%s>> req body: %s",
+             tag, _truncate(_redact_body(str(body_text))))
+
+    _log(logging.DEBUG, "%s<< HTTP %d %s (%d bytes)",
+         tag, resp.status_code, resp.reason or "", len(resp.content))
+    _log(logging.DEBUG, "%s<< resp headers: %s", tag, dict(resp.headers))
+    try:
+        resp_text = resp.text
+    except Exception as err:  # noqa: BLE001
+        resp_text = f"<undecodable: {err}>"
+    _log(logging.DEBUG, "%s<< resp body: %s",
+         tag, _truncate(_redact_body(resp_text)))
+
+
 class PortalError(Exception):
     """Raised when a portal API call fails."""
 
@@ -116,6 +189,7 @@ def resolve_portal_url(username: str) -> str:
             params={"by_username_sha256": sha},
             timeout=10,
         )
+        _http_trace(resp, "geo")
         _log(logging.DEBUG, "GEO -> HTTP %d (%d bytes)", resp.status_code, len(resp.content))
         resp.raise_for_status()
         api_hosts = resp.json().get("api") or []
@@ -153,6 +227,7 @@ def request_certificate(
         },
         timeout=DEFAULT_TIMEOUT,
     )
+    _http_trace(resp, "cert/request")
     _log(logging.INFO, "Cert response: HTTP %d (%d bytes)", resp.status_code, len(resp.content))
     if resp.status_code == 401:
         raise PortalError("Portal authentication failed (HTTP 401) — check MyBuildings username/password")
@@ -276,6 +351,7 @@ def discover_gateway(
             },
             timeout=DEFAULT_TIMEOUT,
         )
+        _http_trace(resp, "discovery")
         resp.raise_for_status()
         events = (resp.json() or {}).get("events") or []
         if not events:
@@ -335,6 +411,7 @@ def send_connect_event(
         resp = session.post(
             f"{portal_url}/event", json=body, timeout=DEFAULT_TIMEOUT
         )
+        _http_trace(resp, "connect")
         _log(logging.INFO, "Connect event response: HTTP %d", resp.status_code)
         if resp.status_code not in (200, 201):
             _log(logging.ERROR, "Connect event failure body: %s", resp.text[:500])
@@ -376,6 +453,7 @@ def poll_acl_update(
                     },
                     timeout=DEFAULT_TIMEOUT,
                 )
+                _http_trace(resp, f"acl-poll[{n}]")
                 resp.raise_for_status()
                 events = (resp.json() or {}).get("events") or []
             except (requests.RequestException, ValueError) as err:
@@ -490,6 +568,28 @@ class GatewayAdminError(Exception):
     """Raised when a call to the gateway's local admin CGI fails."""
 
 
+# Body-encoding variants tried by ``_gw_post`` in order.  The first one is
+# what rankjie's gateway accepts (verified live) and what we observe in
+# Chrome dev-tools captures: ``application/x-www-form-urlencoded`` Content-Type
+# with a literal JSON string body.  Other firmware revisions appear to be
+# stricter — falling back to real ``op=...&...`` form encoding or to a true
+# ``application/json`` request body keeps the integration working without
+# requiring users to capture cURLs.
+_GW_BODY_VARIANTS: tuple[tuple[str, str], ...] = (
+    ("application/x-www-form-urlencoded", "json-literal"),
+    ("application/x-www-form-urlencoded", "form"),
+    ("application/json", "json"),
+)
+
+
+def _encode_gw_body(body: dict, variant: str) -> str:
+    if variant == "form":
+        return urllib.parse.urlencode(body)
+    # "json-literal" and "json" both serialise as a JSON string; only the
+    # Content-Type header changes between them.
+    return _json.dumps(body)
+
+
 def _gw_post(
     session: requests.Session,
     gateway_ip: str,
@@ -497,36 +597,81 @@ def _gw_post(
     body: dict,
     timeout: float = 15,
 ) -> dict:
-    """POST a JSON body to a gateway CGI endpoint, return the parsed JSON.
+    """POST a body to a gateway CGI endpoint with automatic encoding fallback.
 
-    The gateway's web admin uses a self-signed certificate, so verification
-    is disabled.  Bodies are sent as the literal request body with
-    ``Content-Type: application/x-www-form-urlencoded`` to mimic the browser.
+    Tries body shapes in this order until one returns a non-empty JSON object:
+
+      1. ``Content-Type: application/x-www-form-urlencoded`` + JSON-literal
+         body (the shape we observe in Chrome dev-tools captures and the only
+         shape that works on rankjie's gateway).
+      2. Same Content-Type + actual ``op=...&key=value`` form encoding.
+      3. ``Content-Type: application/json`` + JSON body.
+
+    HTTP/transport errors and non-200 responses raise ``GatewayAdminError``
+    immediately (no fallback — that's a real failure, not a content-type
+    mismatch).  Self-signed gateway certs mean verification stays disabled.
     """
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Origin": f"https://{gateway_ip}",
-        "Referer": f"https://{gateway_ip}/config.html?v=0.1",
-    }
-    resp = session.post(
-        f"https://{gateway_ip}{path}",
-        data=_json.dumps(body),
-        headers=headers,
-        timeout=timeout,
-        verify=False,
-    )
-    if resp.status_code != 200:
-        raise GatewayAdminError(
-            f"{path} returned HTTP {resp.status_code}: {resp.text[:200]}"
+    last_status = 0
+    last_text = ""
+    last_parsed: dict = {}
+    op_label = body.get("op", "?")
+
+    for content_type, variant in _GW_BODY_VARIANTS:
+        headers = {
+            "Content-Type": content_type,
+            "Origin": f"https://{gateway_ip}",
+            "Referer": f"https://{gateway_ip}/config.html?v=0.1",
+        }
+        data = _encode_gw_body(body, variant)
+        resp = session.post(
+            f"https://{gateway_ip}{path}",
+            data=data,
+            headers=headers,
+            timeout=timeout,
+            verify=False,
         )
-    text = resp.text.strip()
-    if not text:
-        return {}
-    try:
-        return resp.json()
-    except ValueError:
-        # Some endpoints return a bare scalar like "1" or "FALSE".
-        return {"_raw": text}
+        _http_trace(resp, f"gw{path}?op={op_label}[{variant}]")
+        if resp.status_code != 200:
+            raise GatewayAdminError(
+                f"{path} returned HTTP {resp.status_code}: {resp.text[:200]}"
+            )
+
+        text = resp.text.strip()
+        if not text:
+            parsed: dict = {}
+        else:
+            try:
+                parsed = resp.json()
+            except ValueError:
+                # Some endpoints return a bare scalar like "1" or "FALSE".
+                parsed = {"_raw": text}
+
+        last_status, last_text, last_parsed = resp.status_code, text, parsed
+
+        if parsed:
+            if variant != "json-literal":
+                _log(logging.WARNING,
+                    "Gateway %s op=%s succeeded with fallback body encoding %r "
+                    "(default 'json-literal' returned empty). Your gateway "
+                    "firmware appears stricter than the reference build — "
+                    "future calls will retry from the default each time.",
+                    path, op_label, variant,
+                )
+            return parsed
+
+        _log(logging.DEBUG,
+            "Gateway %s op=%s returned empty body with encoding %r; trying next variant",
+            path, op_label, variant,
+        )
+
+    _log(logging.WARNING,
+        "Gateway %s op=%s returned empty body with all encodings tried "
+        "(last HTTP %d, body=%r). Likely cause: session not authenticated "
+        "(no auth cookie) — enable DEBUG on custom_components.abb_welcome.portal "
+        "to inspect Set-Cookie from /cgi-bin/checklogin.cgi.",
+        path, op_label, last_status, last_text,
+    )
+    return last_parsed
 
 
 def _gateway_login(
@@ -551,6 +696,7 @@ def _gateway_login(
         timeout=15,
         verify=False,
     )
+    _http_trace(resp, "checklogin")
     body = resp.text.strip()
     _log(logging.DEBUG, "Gateway login response: HTTP %d body=%r", resp.status_code, body)
     if resp.status_code != 200 or body not in ("1", "2"):
@@ -558,7 +704,20 @@ def _gateway_login(
         raise GatewayAdminError(
             f"Gateway login failed (HTTP {resp.status_code}, body {body!r})"
         )
-    _log(logging.INFO, "Gateway login OK (server returned %r)", body)
+    cookie_names = list(session.cookies.keys())
+    _log(logging.INFO,
+        "Gateway login OK (server returned %r); session cookies: %s",
+        body, cookie_names or "(none)",
+    )
+    if not cookie_names:
+        _log(logging.WARNING,
+            "checklogin.cgi returned %r but did NOT set any session cookies. "
+            "Subsequent CGI calls will be unauthenticated and will likely "
+            "return empty bodies. Enable DEBUG logging on "
+            "custom_components.abb_welcome.portal to inspect the Set-Cookie "
+            "response header and request shape.",
+            body,
+        )
     return session
 
 
