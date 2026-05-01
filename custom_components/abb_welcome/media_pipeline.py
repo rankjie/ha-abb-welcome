@@ -155,6 +155,13 @@ class MediaPipeline:
         self._gw_video: tuple[str, int] | None = None
         self._sdp_path: Path | None = None
         self._tcp_port: int = 0
+        # Python-side TCP server that fronts ffmpeg's MPEG-TS stdout.  This
+        # eliminates the race where HA's stream worker would try to connect
+        # before ffmpeg had reached its own ``listen()``: ``start_server``
+        # only resolves once the listening socket is up.
+        self._ts_server: asyncio.base_events.Server | None = None
+        self._ts_clients: set[asyncio.StreamWriter] = set()
+        self._ts_pump_task: asyncio.Task | None = None
 
     async def setup(self) -> tuple[socket.socket, socket.socket]:
         """Allocate the UDP receive sockets and pick a media IP.
@@ -246,38 +253,100 @@ class MediaPipeline:
         )
         sdp_path = self._sdp_path
         await loop.run_in_executor(None, sdp_path.write_text, sdp_text)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind(("127.0.0.1", 0))
-        self._tcp_port = sock.getsockname()[1]
-        sock.close()
+
+        # Bring up our TCP server FIRST so HA can connect at any time.
+        self._ts_server = await asyncio.start_server(
+            self._handle_ts_client, "127.0.0.1", 0
+        )
+        self._tcp_port = self._ts_server.sockets[0].getsockname()[1]
 
         cmd = [
             self.ffmpeg_binary,
             "-loglevel", "warning",
-            "-protocol_whitelist", "file,udp,rtp,tcp",
+            "-protocol_whitelist", "file,udp,rtp",
             "-fflags", "nobuffer+genpts",
             "-flags", "low_delay",
             "-i", str(self._sdp_path),
             "-c:v", "copy",
             "-an",
             "-f", "mpegts",
-            f"tcp://127.0.0.1:{self._tcp_port}?listen=1&listen_timeout=10000",
+            "pipe:1",
         ]
         _LOGGER.info("[abb] media: starting ffmpeg: %s", " ".join(cmd))
         self._ffmpeg = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         self._stderr_task = asyncio.create_task(
             self._drain_stderr(), name="abb_pipeline_stderr"
         )
+        self._ts_pump_task = asyncio.create_task(
+            self._pump_ts(), name="abb_pipeline_ts_pump"
+        )
         return f"tcp://127.0.0.1:{self._tcp_port}"
+
+    async def _handle_ts_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        peer = writer.get_extra_info("peername")
+        _LOGGER.info("[abb] media: HA stream client connected from %s", peer)
+        self._ts_clients.add(writer)
+        try:
+            # MPEG-TS over TCP is one-way; the client doesn't send anything.
+            # We just block on read so we notice EOF when HA disconnects.
+            while not self._stop.is_set():
+                data = await reader.read(1024)
+                if not data:
+                    return
+        except (ConnectionResetError, ConnectionAbortedError):
+            return
+        finally:
+            self._ts_clients.discard(writer)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _pump_ts(self) -> None:
+        """Forward ffmpeg stdout chunks to every connected TS client."""
+        if self._ffmpeg is None or self._ffmpeg.stdout is None:
+            return
+        try:
+            while True:
+                chunk = await self._ffmpeg.stdout.read(65536)
+                if not chunk:
+                    return
+                # Snapshot to avoid mutation during iteration.
+                stale: list[asyncio.StreamWriter] = []
+                for w in list(self._ts_clients):
+                    try:
+                        w.write(chunk)
+                        await w.drain()
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        stale.append(w)
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.debug("[abb] ts client write failed: %s", err)
+                        stale.append(w)
+                for w in stale:
+                    self._ts_clients.discard(w)
+                    try:
+                        w.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+        except asyncio.CancelledError:
+            return
 
     async def stop(self) -> None:
         self._stop.set()
-        for t in (self._keepalive_task, self._rtcp_task, self._stderr_task):
+        for t in (
+            self._keepalive_task,
+            self._rtcp_task,
+            self._stderr_task,
+            self._ts_pump_task,
+        ):
             if t is not None:
                 t.cancel()
                 try:
@@ -287,6 +356,22 @@ class MediaPipeline:
         self._keepalive_task = None
         self._rtcp_task = None
         self._stderr_task = None
+        self._ts_pump_task = None
+
+        # Tear down TS server + any connected HA stream workers.
+        for w in list(self._ts_clients):
+            try:
+                w.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._ts_clients.clear()
+        if self._ts_server is not None:
+            self._ts_server.close()
+            try:
+                await self._ts_server.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            self._ts_server = None
 
         if self._ffmpeg is not None and self._ffmpeg.returncode is None:
             try:
