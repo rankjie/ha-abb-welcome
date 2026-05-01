@@ -13,6 +13,7 @@ port 5060. Door unlocks typically complete in well under 100 ms.
 
 - One Home Assistant **button entity per outdoor station** (Outdoor 1 / Inner / Parking, etc.).
 - **Image entity** with the latest doorbell screenshot. The gateway only captures a frame when someone rings, so `image_last_updated` reflects the actual ring time, not a polling timestamp.
+- **Realtime ring binary_sensor** — passively listens on the gateway's local SIP port, fires within tens of milliseconds of someone pressing the doorbell. Also emits an `abb_welcome_ring` event on the HA bus with the caller URI and call_id for automations. Does not interfere with the indoor stations or the official ABB app.
 - **Refresh Events** button — forces a portal poll if you don't want to wait for the next 30 s tick.
 - **Event entity** + **last-event sensor** for ring / call / door-open history.
 - LAN-only runtime: no internet round-trip when you press a button.
