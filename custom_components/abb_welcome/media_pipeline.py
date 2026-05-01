@@ -319,16 +319,33 @@ class MediaPipeline:
         )
         self._tcp_port = self._ts_server.sockets[0].getsockname()[1]
 
+        # Latency-tuned flags:
+        #   -probesize / -analyzeduration: stop probing as soon as we have
+        #       a frame — default 5s probe is the biggest single source
+        #       of glass-to-glass delay before HA's stream worker even
+        #       sees the first byte.
+        #   -fflags nobuffer+genpts+flush_packets, -flags low_delay,
+        #       -max_delay 0: don't reorder, don't sit on packets.
+        #   -muxdelay 0 -muxpreload 0: ditto on the mux side.
+        #   -mpegts_flags resend_headers: PAT/PMT in every 188-byte
+        #       chunk window so HA's PyAV can parse on first segment.
         cmd = [
             self.ffmpeg_binary,
             "-loglevel", "warning",
             "-protocol_whitelist", "file,udp,rtp",
-            "-fflags", "nobuffer+genpts",
+            "-fflags", "nobuffer+genpts+flush_packets",
             "-flags", "low_delay",
+            "-probesize", "32",
+            "-analyzeduration", "0",
+            "-max_delay", "0",
             "-i", str(self._sdp_path),
             "-c:v", "copy",
             "-an",
             "-f", "mpegts",
+            "-mpegts_flags", "resend_headers",
+            "-muxdelay", "0",
+            "-muxpreload", "0",
+            "-flush_packets", "1",
             "pipe:1",
         ]
         _LOGGER.info("[abb] media: starting ffmpeg: %s", " ".join(cmd))
@@ -352,20 +369,50 @@ class MediaPipeline:
         )
         _LOGGER.info(
             "[abb] media: pipeline ready — gw_video=%s gw_audio=%s "
-            "ingest=127.0.0.1:%d ts_url=tcp://127.0.0.1:%d",
+            "ingest=127.0.0.1:%d ts_url=http://127.0.0.1:%d",
             self._gw_video, self._gw_audio, ingest_port, self._tcp_port,
         )
-        return f"tcp://127.0.0.1:{self._tcp_port}"
+        return f"http://127.0.0.1:{self._tcp_port}"
 
     async def _handle_ts_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         peer = writer.get_extra_info("peername")
-        _LOGGER.info("[abb] media: HA stream client connected from %s", peer)
+        _LOGGER.info("[abb] media: HTTP stream client connected from %s", peer)
+        # Speak just enough HTTP/1.0 to keep go2rtc / browsers happy.  We
+        # consume the request line + headers, then stream MPEG-TS body
+        # forever (Connection: close, no Content-Length).
+        try:
+            request_line = await asyncio.wait_for(
+                reader.readuntil(b"\r\n"), timeout=5.0
+            )
+            _LOGGER.debug("[abb] http request: %s", request_line.decode("ascii", "replace").rstrip())
+            while True:
+                line = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n"), timeout=5.0
+                )
+                if line == b"\r\n":
+                    break
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionResetError):
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        try:
+            writer.write(
+                b"HTTP/1.0 200 OK\r\n"
+                b"Content-Type: video/mp2t\r\n"
+                b"Cache-Control: no-cache\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+            )
+            await writer.drain()
+        except (ConnectionResetError, BrokenPipeError):
+            return
+
         self._ts_clients.add(writer)
         try:
-            # MPEG-TS over TCP is one-way; the client doesn't send anything.
-            # We just block on read so we notice EOF when HA disconnects.
             while not self._stop.is_set():
                 data = await reader.read(1024)
                 if not data:
@@ -602,7 +649,7 @@ class MediaPipeline:
 
     @property
     def stream_url(self) -> str:
-        return f"tcp://127.0.0.1:{self._tcp_port}"
+        return f"http://127.0.0.1:{self._tcp_port}"
 
     @property
     def video_proto(self) -> _RTPProtocol | None:

@@ -123,6 +123,12 @@ class ABBWelcomeCamera(Camera):
         # other cameras with a 403, since the gateway only allows one active
         # call).  Skip until the entity is fully initialized.
         self._added = False
+        # A non-routable but scheme-valid URL we hand the WebRTC provider
+        # probe so it registers without us dialing the gateway.  go2rtc
+        # only checks the URL's scheme to decide it can handle this
+        # camera; the real URL is generated on first user-initiated open.
+        slug = (door.station_id or door.address or door.name).replace("/", "_")
+        self._placeholder_url = f"http://127.0.0.1:65534/abb_probe/{slug}"
 
     @classmethod
     def _get_lock(cls) -> asyncio.Lock:
@@ -139,10 +145,17 @@ class ABBWelcomeCamera(Camera):
 
         Lazily dials the outdoor station + spawns ffmpeg.  Subsequent
         calls within the active window return the same URL.
+
+        Note: HA's WebRTC provider system probes ``stream_source()`` at
+        entity-add time to decide which provider (go2rtc, etc.) handles
+        this camera.  The provider only inspects the URL scheme, so we
+        return a placeholder ``http://`` URL during that probe — this
+        lets go2rtc claim the camera without us dialing the gateway.
+        Once the user actually opens the camera, ``stream_source`` is
+        called again and we do the real dial.
         """
         if not self._added:
-            # WebRTC provider probe at entity-add time — don't dial.
-            return None
+            return self._placeholder_url
         lock = self._get_lock()
         async with lock:
             now = time.monotonic()
