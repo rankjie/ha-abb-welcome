@@ -1,5 +1,7 @@
 # ABB Welcome — Home Assistant integration
 
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=rankjie&repository=ha-abb-welcome&category=integration)
+
 Local door-unlock buttons for ABB Welcome / Busch-Jaeger building intercoms backed
 by an **IP gateway** (system type `mrange`).
 
@@ -29,9 +31,13 @@ port 5060. Door unlocks typically complete in well under 100 ms.
 
 ### Via HACS (recommended)
 
-1. In HACS, open **Integrations** → **⋮** → **Custom repositories**.
-2. Add `https://github.com/rankjie/ha-abb-welcome` as an *Integration*.
-3. Install **ABB Welcome** and restart Home Assistant.
+Click the badge to add this repository to HACS in one step:
+
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=rankjie&repository=ha-abb-welcome&category=integration)
+
+Then install **ABB Welcome** from HACS and restart Home Assistant.
+
+If the button doesn't work (e.g. you haven't configured My Home Assistant): in HACS, open **⋮** → **Custom repositories**, add `https://github.com/rankjie/ha-abb-welcome` as an *Integration*, and install from there.
 
 ### Manual
 
