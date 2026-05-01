@@ -100,23 +100,43 @@ class _RTPProtocol(asyncio.DatagramProtocol):
         self,
         forward_to: tuple[str, int] | None,
         on_first_packet: Callable[[bytes, tuple[str, int]], None] | None,
+        label: str = "rtp",
+        rewrite_pt: int | None = None,
     ) -> None:
         self.forward_to = forward_to
         self.on_first_packet = on_first_packet
+        self.label = label
+        # The ABB gateway negotiates one PT in SDP (e.g. 102) but sends
+        # the actual RTP packets with a different PT (e.g. 96).  ffmpeg's
+        # demuxer uses the SDP rtpmap to look up codec, so a mismatch
+        # silently drops every packet.  Rewriting the incoming PT to
+        # whatever we declared in the ffmpeg SDP fixes it.
+        self.rewrite_pt = rewrite_pt
         self.transport: asyncio.DatagramTransport | None = None
         self.packets = 0
+        self.bytes_received = 0
         self.last_seq = 0
         self.media_ssrc = 0
+        self.payload_types: dict[int, int] = {}
+        self._rewrites = 0
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         self.packets += 1
+        self.bytes_received += len(data)
         if len(data) >= 12:
+            pt = data[1] & 0x7F
+            self.payload_types[pt] = self.payload_types.get(pt, 0) + 1
             self.last_seq = struct.unpack_from("!H", data, 2)[0]
             if self.media_ssrc == 0:
                 self.media_ssrc = struct.unpack_from("!I", data, 8)[0]
+            if self.rewrite_pt is not None and pt != self.rewrite_pt:
+                marker = data[1] & 0x80
+                rewritten = bytes((data[0], marker | (self.rewrite_pt & 0x7F))) + data[2:]
+                data = rewritten
+                self._rewrites += 1
         if self.packets == 1 and self.on_first_packet is not None:
             self.on_first_packet(data, addr)
         if self.forward_to is not None and self.transport is not None:
@@ -162,6 +182,10 @@ class MediaPipeline:
         self._ts_server: asyncio.base_events.Server | None = None
         self._ts_clients: set[asyncio.StreamWriter] = set()
         self._ts_pump_task: asyncio.Task | None = None
+        self._stats_task: asyncio.Task | None = None
+        self._ffmpeg_watch_task: asyncio.Task | None = None
+        self._ts_bytes_forwarded: int = 0
+        self._first_ts_chunk_logged = False
 
     async def setup(self) -> tuple[socket.socket, socket.socket]:
         """Allocate the UDP receive sockets and pick a media IP.
@@ -177,13 +201,25 @@ class MediaPipeline:
         return self._audio_sock, self._video_sock
 
     async def start(
-        self, gw_audio: tuple[str, int] | None, gw_video: tuple[str, int] | None
+        self,
+        gw_audio: tuple[str, int] | None,
+        gw_video: tuple[str, int] | None,
+        *,
+        video_pt: int | None = None,
+        video_codec: str | None = None,
+        video_fmtp: str | None = None,
     ) -> str:
         """Start RTP listeners + ffmpeg.  Returns the ``tcp://...`` URL.
 
         ``gw_audio`` / ``gw_video`` come from the gateway's SDP answer —
         we punch the UDM stateful firewall by sending a few RTP keepalives
         out, then keep doing so periodically.
+
+        ``video_pt`` / ``video_codec`` / ``video_fmtp`` are taken
+        verbatim from the gateway's SDP answer.  We mirror them into the
+        SDP we hand to ffmpeg so depacketization (especially H.264
+        sprop-parameter-sets / packetization-mode) matches what's on the
+        wire.
         """
         if self._video_sock is None or self._audio_sock is None:
             raise RuntimeError("call setup() before start()")
@@ -196,7 +232,9 @@ class MediaPipeline:
 
         # Bring up datagram endpoints.  Audio is dropped (we don't need it
         # right now) but kept for keepalive purposes.
-        self._audio_proto = _RTPProtocol(forward_to=None, on_first_packet=None)
+        self._audio_proto = _RTPProtocol(
+            forward_to=None, on_first_packet=None, label="audio"
+        )
         self._audio_transport, _ = await loop.create_datagram_endpoint(
             lambda: self._audio_proto, sock=self._audio_sock
         )
@@ -218,9 +256,15 @@ class MediaPipeline:
                 except OSError:
                     pass
 
+        # SDP-declared PT we'll force on outbound (loopback) RTP so it
+        # always matches the ffmpeg-side SDP regardless of what the
+        # gateway's wire encoding actually is.
+        sdp_pt = video_pt if video_pt is not None else 96
         self._video_proto = _RTPProtocol(
             forward_to=("127.0.0.1", ingest_port),
             on_first_packet=_video_first,
+            label="video",
+            rewrite_pt=sdp_pt,
         )
         self._video_transport, _ = await loop.create_datagram_endpoint(
             lambda: self._video_proto, sock=self._video_sock
@@ -242,14 +286,29 @@ class MediaPipeline:
 
         # Spin up FFmpeg.
         self._sdp_path = Path("/tmp") / f"abb_pipeline_{ingest_port}.sdp"
-        sdp_text = (
-            "v=0\r\n"
-            "o=- 0 0 IN IP4 127.0.0.1\r\n"
-            "s=ABB\r\n"
-            "c=IN IP4 127.0.0.1\r\n"
-            "t=0 0\r\n"
-            f"m=video {ingest_port} RTP/AVP 102\r\n"
-            "a=rtpmap:102 H264/90000\r\n"
+        # PT/codec/fmtp must match what the gateway is actually sending,
+        # which is what we just parsed from its SDP answer.  If
+        # mismatched, ffmpeg silently discards every packet and HA's
+        # stream worker times out with "Invalid data found".
+        pt = video_pt if video_pt is not None else 96
+        codec = video_codec or "H264/90000"
+        sdp_lines = [
+            "v=0",
+            "o=- 0 0 IN IP4 127.0.0.1",
+            "s=ABB",
+            "c=IN IP4 127.0.0.1",
+            "t=0 0",
+            f"m=video {ingest_port} RTP/AVP {pt}",
+            f"a=rtpmap:{pt} {codec}",
+        ]
+        if video_fmtp:
+            sdp_lines.append(f"a=fmtp:{pt} {video_fmtp}")
+        sdp_lines.append("")
+        sdp_text = "\r\n".join(sdp_lines) + "\r\n"
+        _LOGGER.info(
+            "[abb] media: SDP for ffmpeg uses pt=%d codec=%s fmtp=%s "
+            "ingest_port=%d",
+            pt, codec, video_fmtp, ingest_port,
         )
         sdp_path = self._sdp_path
         await loop.run_in_executor(None, sdp_path.write_text, sdp_text)
@@ -285,6 +344,17 @@ class MediaPipeline:
         self._ts_pump_task = asyncio.create_task(
             self._pump_ts(), name="abb_pipeline_ts_pump"
         )
+        self._stats_task = asyncio.create_task(
+            self._stats_loop(), name="abb_pipeline_stats"
+        )
+        self._ffmpeg_watch_task = asyncio.create_task(
+            self._watch_ffmpeg(), name="abb_pipeline_ffmpeg_watch"
+        )
+        _LOGGER.info(
+            "[abb] media: pipeline ready — gw_video=%s gw_audio=%s "
+            "ingest=127.0.0.1:%d ts_url=tcp://127.0.0.1:%d",
+            self._gw_video, self._gw_audio, ingest_port, self._tcp_port,
+        )
         return f"tcp://127.0.0.1:{self._tcp_port}"
 
     async def _handle_ts_client(
@@ -318,7 +388,20 @@ class MediaPipeline:
             while True:
                 chunk = await self._ffmpeg.stdout.read(65536)
                 if not chunk:
+                    _LOGGER.warning(
+                        "[abb] media: ffmpeg stdout EOF after %d bytes forwarded",
+                        self._ts_bytes_forwarded,
+                    )
                     return
+                if not self._first_ts_chunk_logged:
+                    self._first_ts_chunk_logged = True
+                    head = chunk[:8].hex()
+                    _LOGGER.info(
+                        "[abb] media: first MPEG-TS chunk from ffmpeg "
+                        "(%d bytes, head=%s, sync=0x%02x)",
+                        len(chunk), head, chunk[0] if chunk else 0,
+                    )
+                self._ts_bytes_forwarded += len(chunk)
                 # Snapshot to avoid mutation during iteration.
                 stale: list[asyncio.StreamWriter] = []
                 for w in list(self._ts_clients):
@@ -338,6 +421,48 @@ class MediaPipeline:
                         pass
         except asyncio.CancelledError:
             return
+
+    async def _stats_loop(self) -> None:
+        """Log RTP + ffmpeg stats every 5 seconds while running."""
+        try:
+            while not self._stop.is_set():
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=5.0)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                vp = self._video_proto
+                ap = self._audio_proto
+                _LOGGER.info(
+                    "[abb] media stats: video pkts=%d bytes=%d pts=%s ssrc=0x%x | "
+                    "audio pkts=%d | ts_forwarded=%d clients=%d",
+                    vp.packets if vp else 0,
+                    vp.bytes_received if vp else 0,
+                    dict(vp.payload_types) if vp else {},
+                    vp.media_ssrc if vp else 0,
+                    ap.packets if ap else 0,
+                    self._ts_bytes_forwarded,
+                    len(self._ts_clients),
+                )
+        except asyncio.CancelledError:
+            return
+
+    async def _watch_ffmpeg(self) -> None:
+        """If ffmpeg dies before we tear down, surface the exit code."""
+        if self._ffmpeg is None:
+            return
+        try:
+            rc = await self._ffmpeg.wait()
+        except asyncio.CancelledError:
+            return
+        if not self._stop.is_set():
+            _LOGGER.error(
+                "[abb] media: ffmpeg exited unexpectedly with code %s "
+                "(ts_forwarded=%d, video_pkts=%d)",
+                rc,
+                self._ts_bytes_forwarded,
+                self._video_proto.packets if self._video_proto else 0,
+            )
 
     async def stop(self) -> None:
         self._stop.set()

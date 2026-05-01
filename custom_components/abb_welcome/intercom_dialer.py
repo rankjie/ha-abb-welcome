@@ -142,6 +142,8 @@ class MediaDescription:
     payload_types: list[int] = field(default_factory=list)
     connection_ip: str = ""
     rtpmap: dict[int, str] = field(default_factory=dict)
+    fmtp: dict[int, str] = field(default_factory=dict)
+    direction: str = ""  # sendrecv | sendonly | recvonly | inactive
 
 
 @dataclass
@@ -180,6 +182,17 @@ def parse_sdp(body: bytes | str) -> ParsedSdp:
                 current.rtpmap[int(pt_str)] = enc.strip()
             except ValueError:
                 continue
+        elif current is not None and line.startswith("a=fmtp:"):
+            rest = line[len("a=fmtp:"):]
+            try:
+                pt_str, params = rest.split(" ", 1)
+                current.fmtp[int(pt_str)] = params.strip()
+            except ValueError:
+                continue
+        elif current is not None and line.startswith("a=") and line[2:].rstrip() in (
+            "sendrecv", "sendonly", "recvonly", "inactive"
+        ):
+            current.direction = line[2:].rstrip()
     return sdp
 
 

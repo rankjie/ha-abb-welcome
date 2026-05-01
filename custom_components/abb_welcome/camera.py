@@ -183,15 +183,36 @@ class ABBWelcomeCamera(Camera):
             self._door, audio_port=audio_port, video_port=video_port
         )
 
+        for _m in call.answer.medias:
+            _LOGGER.info(
+                "[abb] camera %s SDP answer media: media=%s port=%d "
+                "ip=%s pts=%s rtpmap=%s fmtp=%s direction=%s",
+                self._door.name, _m.media, _m.port, _m.connection_ip,
+                _m.payload_types, _m.rtpmap, _m.fmtp, _m.direction,
+            )
+
         gw_audio: tuple[str, int] | None = None
         gw_video: tuple[str, int] | None = None
+        video_pt: int | None = None
+        video_codec: str | None = None
+        video_fmtp: str | None = None
         for m in call.answer.medias:
             if m.media == "audio" and m.connection_ip and m.port:
                 gw_audio = (m.connection_ip, m.port)
             elif m.media == "video" and m.connection_ip and m.port:
                 gw_video = (m.connection_ip, m.port)
+                if m.payload_types:
+                    video_pt = m.payload_types[0]
+                    video_codec = m.rtpmap.get(video_pt)
+                    video_fmtp = m.fmtp.get(video_pt)
 
-        url = await pipeline.start(gw_audio, gw_video)
+        url = await pipeline.start(
+            gw_audio,
+            gw_video,
+            video_pt=video_pt,
+            video_codec=video_codec,
+            video_fmtp=video_fmtp,
+        )
         self._pipeline = pipeline
         _LOGGER.info("[abb] camera %s stream URL: %s", self._door.name, url)
         return url
