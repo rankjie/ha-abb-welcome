@@ -259,7 +259,11 @@ class SipListener:
 
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
+        self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        self._local_ip: str = ""
+        self._local_port: int = 0
+        self._reg_cseq: int = 0
         self._state = "stopped"
         # Map Call-ID -> last INVITE frame so CANCEL can echo the right Vias.
         self._open_invites: dict[str, _SipFrame] = {}
@@ -292,8 +296,20 @@ class SipListener:
             )
 
     async def stop(self) -> None:
-        """Cancel the listener loop and close the socket."""
+        """Cancel the listener loop and close the socket.
+
+        If we're currently registered, try to send a graceful ``REGISTER``
+        with ``Expires: 0`` first so the gateway drops our binding
+        immediately instead of keeping a dead Contact in its forking list
+        until the original Expires window runs out.  Best-effort — we
+        absorb any failure to avoid blocking unload.
+        """
         self._stop_event.set()
+        if self._writer is not None and self._state == "registered":
+            try:
+                await asyncio.wait_for(self._deregister(), timeout=2.0)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("[abb] deregister on stop failed: %s", err)
         if self._writer is not None:
             try:
                 self._writer.close()
@@ -350,13 +366,17 @@ class SipListener:
         reader, writer = await asyncio.open_connection(
             self.host, self.port, ssl=ssl_ctx
         )
+        self._reader = reader
         self._writer = writer
         try:
             local_ip, local_port = writer.get_extra_info("sockname")[:2]
+            self._local_ip = local_ip
+            self._local_port = local_port
             cseq = 1
             cseq = await self._do_register(
                 reader, writer, local_ip, local_port, cseq, DEFAULT_EXPIRES
             )
+            self._reg_cseq = cseq
             self._set_state("registered")
 
             # Schedule periodic re-REGISTER.
@@ -375,11 +395,13 @@ class SipListener:
                     cseq = await self._do_register(
                         reader, writer, local_ip, local_port, cseq + 1, DEFAULT_EXPIRES
                     )
+                    self._reg_cseq = cseq
                     next_refresh = asyncio.get_running_loop().time() + refresh_in
                     continue
 
                 await self._dispatch(frame, writer, local_ip, local_port)
         finally:
+            self._reader = None
             self._writer = None
             try:
                 writer.close()
@@ -453,6 +475,28 @@ class SipListener:
             self.username, self.host, self.port, expires,
         )
         return cseq
+
+    async def _deregister(self) -> None:
+        """Send a REGISTER with Expires:0 so the gateway drops our binding now.
+
+        Without this, every restart leaves a stale Contact in the gateway's
+        forking list until its Expires window runs out (up to 10 min on the
+        reference firmware), causing the gateway to fork incoming INVITEs
+        to dead sockets and waste tens of milliseconds per ring.
+        """
+        if self._reader is None or self._writer is None:
+            return
+        if not self._local_ip or not self._local_port:
+            return
+        await self._do_register(
+            self._reader,
+            self._writer,
+            self._local_ip,
+            self._local_port,
+            self._reg_cseq + 1,
+            0,
+        )
+        _LOGGER.info("[abb] SIP listener de-registered (Expires=0)")
 
     # ----- Inbound dispatch -----
 
