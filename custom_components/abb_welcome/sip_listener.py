@@ -30,7 +30,10 @@ import uuid
 import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -268,14 +271,25 @@ class SipListener:
         """Current high-level state: stopped / connecting / registered / disconnected."""
         return self._state
 
-    def start(self) -> None:
-        """Schedule the listener loop.  Idempotent."""
+    def start(self, hass: "HomeAssistant" | None = None) -> None:
+        """Schedule the listener loop.  Idempotent.
+
+        Pass ``hass`` so the task is registered with HA's task tracking and
+        survives the chaotic startup window properly; without it we fall
+        back to a bare ``asyncio.create_task`` which can be starved during
+        HA boot when many integrations are coming up at once.
+        """
         if self._task is not None and not self._task.done():
             return
         self._stop_event.clear()
-        self._task = asyncio.create_task(
-            self._main_loop(), name="abb_welcome_sip_listener"
-        )
+        if hass is not None:
+            self._task = hass.async_create_background_task(
+                self._main_loop(), name="abb_welcome_sip_listener"
+            )
+        else:
+            self._task = asyncio.create_task(
+                self._main_loop(), name="abb_welcome_sip_listener"
+            )
 
     async def stop(self) -> None:
         """Cancel the listener loop and close the socket."""

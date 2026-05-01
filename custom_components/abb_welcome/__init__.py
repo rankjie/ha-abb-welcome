@@ -9,8 +9,9 @@ def _now_iso() -> str:
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.start import async_at_start
 
 from .const import CONF_UNLOCK_STRATEGY, DEFAULT_UNLOCK_STRATEGY, DOMAIN, SIP_PORT_TLS
 from .coordinator import ABBWelcomeCoordinator
@@ -145,7 +146,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             on_state_change=_on_state_change,
         )
         entry_data["sip_listener"] = listener
-        listener.start()
+
+        # Defer start until HA finishes booting.  Before EVENT_HOMEASSISTANT_
+        # STARTED the network stack and other integrations may not be ready,
+        # which on some setups leaves the listener task starved or its first
+        # connect failing in ways that show up as a stuck "stopped" state.
+        # async_at_start fires immediately if HA is already running (i.e. on
+        # integration reload), so the path is the same in both cases.
+        @callback
+        def _start_listener(_hass: HomeAssistant) -> None:
+            listener.start(_hass)
+
+        entry.async_on_unload(async_at_start(hass, _start_listener))
 
         async def _stop_listener(*_args) -> None:
             await listener.stop()
