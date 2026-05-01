@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
@@ -124,6 +124,7 @@ class ABBWelcomeListenerStateSensor(SensorEntity):
     _attr_name = "SIP Listener"
     _attr_icon = "mdi:phone-incoming"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.ENUM
     _attr_options = ["stopped", "connecting", "registered", "disconnected"]
 
     def __init__(self, gateway_uuid: str) -> None:
