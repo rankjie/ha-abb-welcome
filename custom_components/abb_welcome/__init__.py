@@ -1,15 +1,18 @@
 """ABB Welcome integration — LAN door unlock + cloud event history via SIP."""
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.start import async_at_start
 
@@ -166,7 +169,82 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    _async_register_services(hass)
     return True
+
+
+SERVICE_EXPORT_CREDENTIALS = "export_credentials"
+EXPORT_FIELDS = (
+    "gateway_ip",
+    "sip_username",
+    "sip_password",
+    "sip_domain",
+    "doors",
+    "certificate_pem",
+    "private_key_pem",
+    "gateway_admin_password",
+    "gateway_uuid",
+    "abb_username",
+)
+
+
+@callback
+def _async_register_services(hass: HomeAssistant) -> None:
+    """Register integration-wide services. Idempotent — safe to call on every entry setup."""
+    if hass.services.has_service(DOMAIN, SERVICE_EXPORT_CREDENTIALS):
+        return
+
+    async def _export_creds(call: ServiceCall) -> None:
+        target_entry_id = call.data.get("entry_id")
+        path = call.data.get("path") or "/config/abb_welcome_creds.json"
+
+        entries = hass.data.get(DOMAIN, {})
+        if not entries:
+            raise ValueError("No ABB Welcome config entries are loaded")
+
+        if target_entry_id:
+            if target_entry_id not in entries:
+                raise ValueError(f"No config entry with id={target_entry_id!r}")
+            entry_ids = [target_entry_id]
+        else:
+            entry_ids = list(entries.keys())
+
+        payload: dict = {"exported_at": _now_iso(), "entries": []}
+        for eid in entry_ids:
+            entry = hass.config_entries.async_get_entry(eid)
+            if entry is None:
+                continue
+            data = entry.data
+            payload["entries"].append(
+                {
+                    "entry_id": eid,
+                    "title": entry.title,
+                    **{k: data.get(k) for k in EXPORT_FIELDS if k in data},
+                    "options": dict(entry.options),
+                }
+            )
+
+        target = Path(path)
+        await hass.async_add_executor_job(
+            target.write_text, json.dumps(payload, indent=2)
+        )
+        _LOGGER.warning(
+            "[abb] Credentials exported to %s — file contains the SIP password, "
+            "private key, and gateway admin password. Treat as sensitive.",
+            target,
+        )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_EXPORT_CREDENTIALS,
+        _export_creds,
+        schema=vol.Schema(
+            {
+                vol.Optional("entry_id"): str,
+                vol.Optional("path"): str,
+            }
+        ),
+    )
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
