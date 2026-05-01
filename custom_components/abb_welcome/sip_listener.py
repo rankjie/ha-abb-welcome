@@ -65,7 +65,13 @@ FrameCallback = Callable[[dict[str, Any]], None]
 
 
 def _summarise_frame(frame: "_SipFrame") -> dict[str, Any]:
-    """Reduce a SIP frame to a JSON-serialisable dict for HA event payloads."""
+    """Convert a SIP frame to a JSON-serialisable dict for HA event payloads.
+
+    Lossless on purpose: every header is preserved (multi-valued ones as a
+    list), the full body is included as text (UTF-8 with replacement on
+    non-text), and the complete wire bytes are exposed as ``raw`` so the
+    event subscriber can rebuild the original frame byte-for-byte.
+    """
     summary: dict[str, Any] = {
         "start_line": frame.start_line,
         "is_response": frame.is_response,
@@ -77,27 +83,37 @@ def _summarise_frame(frame: "_SipFrame") -> dict[str, Any]:
         summary["request_uri"] = (
             frame.start_line.split(" ", 2)[1] if " " in frame.start_line else ""
         )
-    # Echo the headers most useful for debugging.  Multiple Vias kept as a list.
-    interesting = ("From", "To", "Call-ID", "CSeq", "Contact", "Content-Type",
-                   "User-Agent", "Expires", "WWW-Authenticate", "Proxy-Authenticate")
+
+    # Group headers preserving order; multi-valued headers (Via, Route, etc)
+    # become lists.  Header names are case-insensitive in SIP, so we
+    # canonicalise on first-seen capitalisation.
     headers: dict[str, Any] = {}
-    for name in interesting:
-        values = _all_headers(frame.headers, name)
-        if not values:
-            continue
-        headers[name] = values[0] if len(values) == 1 else values
-    headers["Via"] = _all_headers(frame.headers, "Via")
+    seen_case: dict[str, str] = {}
+    for key, value in frame.headers:
+        canonical = seen_case.setdefault(key.lower(), key)
+        if canonical in headers:
+            current = headers[canonical]
+            if isinstance(current, list):
+                current.append(value)
+            else:
+                headers[canonical] = [current, value]
+        else:
+            headers[canonical] = value
     summary["headers"] = headers
+
     body_bytes = frame.body
     if body_bytes:
-        try:
-            text = body_bytes.decode("utf-8", errors="replace")
-        except Exception:  # noqa: BLE001
-            text = repr(body_bytes)
-        if len(text) > 800:
-            text = text[:800] + f"…(+{len(text) - 800} more)"
-        summary["body"] = text
+        summary["body"] = body_bytes.decode("utf-8", errors="replace")
         summary["body_bytes"] = len(body_bytes)
+    else:
+        summary["body"] = ""
+        summary["body_bytes"] = 0
+
+    # Full wire bytes — handy when a future bug needs an exact byte-by-byte
+    # reproduction.  Decoded with replacement so the event payload stays
+    # JSON-safe.
+    summary["raw"] = frame.raw.decode("utf-8", errors="replace")
+    summary["raw_bytes"] = len(frame.raw)
     return summary
 
 

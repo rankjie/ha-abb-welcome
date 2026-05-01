@@ -1,7 +1,11 @@
 """ABB Welcome integration — LAN door unlock + cloud event history via SIP."""
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -48,6 +52,10 @@ EVENT_RING = f"{DOMAIN}_ring"
 # Useful for protocol investigation / debugging — subscribe in an
 # automation or via the Developer Tools "Events" listener.
 EVENT_SIP_FRAME = f"{DOMAIN}_sip_frame"
+
+# Bus event fired whenever the SIP listener transitions state
+# (stopped/connecting/registered/disconnected).
+EVENT_LISTENER_STATE = f"{DOMAIN}_listener_state"
 
 
 def _build_client(entry: ConfigEntry) -> SIPClient:
@@ -108,6 +116,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         def _on_frame(payload: dict) -> None:
             hass.bus.async_fire(EVENT_SIP_FRAME, payload)
+            sensor = entry_data.get("listener_state_sensor")
+            if sensor is not None:
+                is_invite = (
+                    payload.get("direction") == "in"
+                    and payload.get("method") == "INVITE"
+                )
+                sensor.record_frame(payload.get("direction", ""), is_invite)
+
+        def _on_state_change(new_state: str) -> None:
+            hass.bus.async_fire(
+                EVENT_LISTENER_STATE,
+                {"state": new_state, "at": _now_iso()},
+            )
+            sensor = entry_data.get("listener_state_sensor")
+            if sensor is not None:
+                sensor.update_state(new_state)
 
         listener = SipListener(
             host=gw_ip,
@@ -118,6 +142,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             transport="tls",
             on_ring=_on_ring,
             on_frame=_on_frame,
+            on_state_change=_on_state_change,
         )
         entry_data["sip_listener"] = listener
         listener.start()
