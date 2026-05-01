@@ -12,6 +12,9 @@ port 5060. Door unlocks typically complete in well under 100 ms.
 ## Features
 
 - One Home Assistant **button entity per outdoor station** (Outdoor 1 / Inner / Parking, etc.).
+- **Image entity** with the latest doorbell screenshot. The gateway only captures a frame when someone rings, so `image_last_updated` reflects the actual ring time, not a polling timestamp.
+- **Refresh Events** button — forces a portal poll if you don't want to wait for the next 30 s tick.
+- **Event entity** + **last-event sensor** for ring / call / door-open history.
 - LAN-only runtime: no internet round-trip when you press a button.
 - Fully automated pairing — fill in four fields, the integration does the rest.
 - Switchable unlock strategy if the default doesn't work on your gateway.

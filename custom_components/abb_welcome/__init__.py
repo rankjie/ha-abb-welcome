@@ -21,13 +21,13 @@ for _name in (
     "custom_components.abb_welcome.coordinator",
     "custom_components.abb_welcome.sip_client",
     "custom_components.abb_welcome.button",
-    "custom_components.abb_welcome.camera",
+    "custom_components.abb_welcome.image",
     "custom_components.abb_welcome.event",
     "custom_components.abb_welcome.sensor",
 ):
     logging.getLogger(_name).setLevel(logging.INFO)
 
-PLATFORMS = [Platform.BUTTON, Platform.CAMERA, Platform.EVENT, Platform.SENSOR]
+PLATFORMS = [Platform.BUTTON, Platform.IMAGE, Platform.EVENT, Platform.SENSOR]
 
 POLL_INTERVAL = timedelta(seconds=30)
 

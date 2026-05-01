@@ -4,12 +4,14 @@ import logging
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
+from .coordinator import ABBWelcomeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,13 +40,16 @@ async def async_setup_entry(
     """Set up ABB Welcome door buttons from a config entry."""
     data = hass.data[DOMAIN][entry.entry_id]
     sip_client = data["sip_client"]
+    coordinator: ABBWelcomeCoordinator | None = data.get("coordinator")
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
     doors = entry.data.get("doors", [])
 
-    entities = [
+    entities: list[ButtonEntity] = [
         ABBWelcomeDoorButton(sip_client, door, gateway_uuid, entry.entry_id)
         for door in doors
     ]
+    if coordinator is not None and coordinator.has_certs:
+        entities.append(ABBWelcomeRefreshButton(coordinator, gateway_uuid))
     async_add_entities(entities)
 
 
@@ -76,3 +81,31 @@ class ABBWelcomeDoorButton(ButtonEntity):
             raise HomeAssistantError(
                 f"Failed to unlock door: {self._attr_name}"
             )
+
+
+class ABBWelcomeRefreshButton(ButtonEntity):
+    """Force a portal poll for new events / screenshots.
+
+    The gateway only generates a new screenshot when the doorbell rings, so
+    this button cannot make a *fresher* screenshot appear — it just shortens
+    the wait between a ring and the entity reflecting it (otherwise the
+    coordinator polls every 30 seconds).
+    """
+
+    _attr_icon = "mdi:refresh"
+    _attr_has_entity_name = True
+    _attr_name = "Refresh Events"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: ABBWelcomeCoordinator, gateway_uuid: str) -> None:
+        self._coordinator = coordinator
+        self._attr_unique_id = f"{gateway_uuid}_refresh_events"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, gateway_uuid)},
+            name="ABB Welcome Gateway",
+            manufacturer="ABB / Busch-Jaeger",
+            model="IP Gateway (MRANGE)",
+        )
+
+    async def async_press(self) -> None:
+        await self._coordinator.async_request_refresh()
