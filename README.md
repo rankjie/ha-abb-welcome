@@ -2,21 +2,26 @@
 
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=rankjie&repository=ha-abb-welcome&category=integration)
 
-Local door-unlock buttons for ABB Welcome / Busch-Jaeger building intercoms backed
-by an **IP gateway** (system type `mrange`).
+Local controls and live camera streams for ABB Welcome / Busch-Jaeger building
+intercoms backed by an **IP gateway** (system type `mrange`).
 
 This integration is LAN-first: pairing goes through the ABB MyBuildings cloud portal
-once, and from then on every door unlock is a direct SIP request to your gateway on
-port 5060. Door unlocks typically complete in well under 100 ms.
+once, and from then on unlocks, realtime ring detection, and live intercom streams
+run directly against your gateway on the local network. Door unlocks typically
+complete in well under 100 ms.
 
 ## Features
 
 - One Home Assistant **button entity per outdoor station** (Outdoor 1 / Inner / Parking, etc.).
+- **WebRTC camera entities** for discovered outdoor stations, backed by HA's bundled go2rtc.
+- **LAN H.264 video + PCMA/G.711 audio** for live intercom streams. Audio is the door-station microphone downlink; two-way talkback is not implemented in this integration yet.
+- **Streaming enabled switch** to explicitly arm live streaming. Intercom video/audio is building-wide exclusive, so streams do not start accidentally from frontend prefetches or HomeKit probes.
+- **Auto-arm on ring** — when the SIP listener sees an incoming doorbell INVITE, streaming is enabled briefly so opening the camera from the notification can start immediately.
 - **Image entity** with the latest doorbell screenshot. The gateway only captures a frame when someone rings, so `image_last_updated` reflects the actual ring time, not a polling timestamp.
-- **Realtime ring binary_sensor** — passively listens on the gateway's local SIP port, fires within tens of milliseconds of someone pressing the doorbell. Also emits an `abb_welcome_ring` event on the HA bus with the caller URI and call_id for automations. Does not interfere with the indoor stations or the official ABB app.
+- **Realtime ring binary_sensor** — passively listens on the gateway's local SIP port and fires within tens of milliseconds of someone pressing the doorbell. Also emits an `abb_welcome_ring` event on the HA bus with caller URI, call id, station id, and configured station name for automations. Does not interfere with the indoor stations or the official ABB app.
 - **Refresh Events** button — forces a portal poll if you don't want to wait for the next 30 s tick.
-- **Event entity** + **last-event sensor** for ring / call / door-open history.
-- LAN-only runtime: no internet round-trip when you press a button.
+- **Event entity** + **last-event sensor** for ring / call / door-open history, including event ids, timestamps, sender, call grouping id, payload text, and station details when the gateway/cloud event provides them.
+- LAN-only runtime for unlocks, ring detection, and live streams after pairing.
 - Fully automated pairing — fill in four fields, the integration does the rest.
 - Switchable unlock strategy if the default doesn't work on your gateway.
 
@@ -87,7 +92,59 @@ target:
   entity_id: button.abb_welcome_outdoor_1
 ```
 
-All buttons share a single device entry.
+All entities share a single device entry.
+
+The integration also creates:
+
+- `camera.<gateway>_<door_name>` — live intercom stream for each discovered station.
+- `switch.<gateway>_streaming_enabled` — arms streaming for a short window; switching it off tears down any active stream.
+- `binary_sensor.<gateway>_intercom_ringing` — turns on briefly when a SIP INVITE/ring is observed.
+- `image.<gateway>_latest_screenshot` — latest gateway screenshot from the portal event history.
+- `event.<gateway>_intercom` — event entity for ring / call / door-open history.
+- `sensor.<gateway>_last_event` — latest non-screenshot portal event with detailed attributes.
+- `sensor.<gateway>_sip_listener` — diagnostic state for the realtime SIP listener.
+
+### Live camera streams
+
+Live camera streams are intentionally gated because opening an ABB intercom media
+session can lock the building intercom while the call is active.
+
+To view a stream manually:
+
+1. Turn on `switch.<gateway>_streaming_enabled`.
+2. Open the desired `camera.<gateway>_<door_name>` within the armed window.
+3. The integration dials the gateway locally and passes H.264 video plus PCMA audio to HA/go2rtc/WebRTC.
+
+When someone rings, the integration auto-arms streaming for a short window so a
+camera opened from the ring notification can start without a separate manual step.
+
+Current media support is one-way: door station → Home Assistant/browser video and
+audio. Browser/HomeKit talkback is not supported yet.
+
+### Realtime ring event payload
+
+Every incoming SIP ring fires `abb_welcome_ring` on the Home Assistant event bus.
+The payload includes both raw SIP caller fields and configured door mapping:
+
+```json
+{
+  "caller_uri": "sip:100000001@ipgw6cce7a2bb673;user=phone",
+  "caller_user": "100000001",
+  "station_id": "100000001",
+  "station": "Outdoor 1",
+  "station_name": "Outdoor 1",
+  "call_id": "1293890397@192.168.178.112",
+  "received_at": 1777723346.1623127
+}
+```
+
+Example automation condition:
+
+```yaml
+condition:
+  - condition: template
+    value_template: "{{ trigger.event.data.station_id == '100000001' }}"
+```
 
 ## Options
 
@@ -109,8 +166,7 @@ works with **Fast**, you can leave it there for the lowest-latency setup.
 
 ## Troubleshooting
 
-- **"Cannot reach the gateway on port 5060"** — Home Assistant must be on the same
-  LAN/VLAN as the gateway, and the gateway IP must be correct.
+- **"Cannot reach the gateway"** — Home Assistant must be on the same LAN/VLAN as the gateway, and the gateway IP must be correct. Unlocks use local SIP, while realtime ring detection and live streaming use the gateway's local SIP/TLS listener.
 - **"Invalid portal credentials"** — the MyBuildings portal rejected the
   username or password.
 - **"Gateway admin password is wrong"** — the local web admin login at
@@ -126,6 +182,9 @@ works with **Fast**, you can leave it there for the lowest-latency setup.
 - **A door doesn't open** — switch the unlock strategy (Options → Configure) to
   **Standard** and try again. Only outdoor stations of `type=1` are exported as
   buttons.
+- **WebRTC says `wrong response on DESCRIBE`** — make sure `Streaming enabled` is on, then open the camera within the armed window. Version 1.3.0+ also reconnects the SIP dialer automatically if the gateway has closed an idle TLS connection.
+- **Camera has video but no audio** — use version 1.2.0-dev15 / 1.3.0 or newer. The stream exposes the gateway's PCMA/G.711 audio track through go2rtc/WebRTC.
+- **The camera stops after a short time** — this is expected if the stream consumer closes or the armed switch is turned off. Streaming is deliberately short-lived to avoid holding the building intercom media session open.
 
 ## Tested hardware
 
