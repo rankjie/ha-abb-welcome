@@ -311,10 +311,47 @@ class IntercomDialer:
     def in_call(self) -> bool:
         return self._call is not None
 
+    def _connection_is_usable_locked(self) -> bool:
+        if self._writer is None or not self._registered:
+            return False
+        if self._writer.is_closing():
+            return False
+        if self._reader_task is None or self._reader_task.done():
+            return False
+        return True
+
+    async def _reset_connection_locked(self) -> None:
+        writer = self._writer
+        reader_task = self._reader_task
+        self._reader = None
+        self._writer = None
+        self._reader_task = None
+        self._registered = False
+        self._call = None
+        while True:
+            try:
+                self._inbound_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        if reader_task is not None:
+            reader_task.cancel()
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+        if reader_task is not None:
+            try:
+                await reader_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
     async def ensure_connected(self) -> None:
         async with self._lock:
-            if self._writer is not None and self._registered:
+            if self._connection_is_usable_locked():
                 return
+            await self._reset_connection_locked()
             await self._connect_locked()
 
     async def _connect_locked(self) -> None:
@@ -343,7 +380,7 @@ class IntercomDialer:
             await self._register(DEFAULT_REGISTER_EXPIRES)
             self._registered = True
         except Exception:
-            self._reader_task.cancel()
+            await self._reset_connection_locked()
             raise
 
     async def close(self) -> None:
@@ -353,27 +390,12 @@ class IntercomDialer:
                     await self._hangup_locked()
                 except Exception as err:  # noqa: BLE001
                     _LOGGER.debug("hangup during close failed: %s", err)
-            if self._writer is not None:
-                if self._registered:
-                    try:
-                        await asyncio.wait_for(self._register(0), timeout=2.0)
-                    except Exception:  # noqa: BLE001
-                        pass
+            if self._writer is not None and self._registered:
                 try:
-                    self._writer.close()
-                    await self._writer.wait_closed()
+                    await asyncio.wait_for(self._register(0), timeout=2.0)
                 except Exception:  # noqa: BLE001
                     pass
-            self._reader = None
-            self._writer = None
-            self._registered = False
-            if self._reader_task is not None:
-                self._reader_task.cancel()
-                try:
-                    await self._reader_task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
-                self._reader_task = None
+            await self._reset_connection_locked()
 
     async def _reader_loop(self) -> None:
         assert self._reader is not None
@@ -411,7 +433,8 @@ class IntercomDialer:
     async def _send_request(
         self, method: str, uri: str, headers: list[str], body: str = ""
     ) -> None:
-        assert self._writer is not None
+        writer = self._writer
+        assert writer is not None
         body_bytes = body.encode("utf-8")
         lines = [
             f"{method} {uri} SIP/2.0",
@@ -420,8 +443,12 @@ class IntercomDialer:
             "",
             body,
         ]
-        self._writer.write("\r\n".join(lines).encode("utf-8"))
-        await self._writer.drain()
+        try:
+            writer.write("\r\n".join(lines).encode("utf-8"))
+            await writer.drain()
+        except ConnectionError:
+            await self._reset_connection_locked()
+            raise
 
     async def _send_response(self, frame: SipFrame, code: int, reason: str) -> None:
         assert self._writer is not None
@@ -484,24 +511,39 @@ class IntercomDialer:
         self._cseq += 1
 
     async def dial(self, door: Door, *, audio_port: int, video_port: int) -> CallState:
-        await self.ensure_connected()
-        async with self._lock:
-            # The intercom is exclusive — we can't have two simultaneous
-            # calls to the gateway.  If a previous call is still active
-            # (e.g. another camera entity hasn't finished its grace-
-            # period teardown), bump it before opening the new one.  The
-            # old session's ``close()`` will see a stale call_id and
-            # become a no-op for the SIP layer.
-            if self._call is not None:
-                _LOGGER.info(
-                    "[abb] dialer: replacing active call %s with new dial to %s",
-                    self._call.call_id, door.name,
-                )
-                try:
-                    await self._hangup_locked()
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.debug("[abb] dialer replace-hangup failed: %s", err)
-            return await self._dial_locked(door, audio_port, video_port)
+        for attempt in range(2):
+            try:
+                await self.ensure_connected()
+                async with self._lock:
+                    # The intercom is exclusive — we can't have two simultaneous
+                    # calls to the gateway.  If a previous call is still active
+                    # (e.g. another camera entity hasn't finished its grace-
+                    # period teardown), bump it before opening the new one.  The
+                    # old session's ``close()`` will see a stale call_id and
+                    # become a no-op for the SIP layer.
+                    if self._call is not None:
+                        _LOGGER.info(
+                            "[abb] dialer: replacing active call %s with new dial to %s",
+                            self._call.call_id, door.name,
+                        )
+                        try:
+                            await self._hangup_locked()
+                        except ConnectionError:
+                            raise
+                        except Exception as err:  # noqa: BLE001
+                            _LOGGER.debug("[abb] dialer replace-hangup failed: %s", err)
+                    return await self._dial_locked(door, audio_port, video_port)
+            except ConnectionError as err:
+                async with self._lock:
+                    await self._reset_connection_locked()
+                if attempt == 0:
+                    _LOGGER.info(
+                        "[abb] dialer: SIP connection lost while dialing %s; reconnecting once (%s)",
+                        door.name, err,
+                    )
+                    continue
+                raise
+        raise RuntimeError("unreachable dial retry state")
 
     async def _dial_locked(
         self, door: Door, audio_port: int, video_port: int
