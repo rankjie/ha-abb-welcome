@@ -20,6 +20,7 @@ from .const import CONF_UNLOCK_STRATEGY, DEFAULT_UNLOCK_STRATEGY, DOMAIN, SIP_PO
 from .coordinator import ABBWelcomeCoordinator
 from .sip_client import SIPClient
 from .sip_listener import IncomingCall, SipListener
+from .streaming_state import ARM_REASON_RING, RING_ARM_SECONDS, arm
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,6 +36,9 @@ for _name in (
     "custom_components.abb_welcome.camera",
     "custom_components.abb_welcome.intercom_dialer",
     "custom_components.abb_welcome.media_pipeline",
+    "custom_components.abb_welcome.rtsp_server",
+    "custom_components.abb_welcome.streaming_state",
+    "custom_components.abb_welcome.switch",
     "custom_components.abb_welcome.image",
     "custom_components.abb_welcome.event",
     "custom_components.abb_welcome.sensor",
@@ -48,6 +52,7 @@ PLATFORMS = [
     Platform.IMAGE,
     Platform.EVENT,
     Platform.SENSOR,
+    Platform.SWITCH,
 ]
 
 POLL_INTERVAL = timedelta(seconds=30)
@@ -121,6 +126,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             sensor = entry_data.get("ringing_sensor")
             if sensor is not None:
                 sensor.trigger_ring(payload)
+            # Auto-arm streaming so the user can answer the ring within
+            # the next minute (clicking the camera or accepting a HomeKit
+            # doorbell notification triggers a stream straight away).
+            arm(
+                hass,
+                entry.entry_id,
+                reason=ARM_REASON_RING,
+                duration=RING_ARM_SECONDS,
+            )
 
         def _on_frame(payload: dict) -> None:
             hass.bus.async_fire(EVENT_SIP_FRAME, payload)

@@ -1,38 +1,76 @@
 """Camera entities for ABB Welcome outdoor stations.
 
-One Camera entity per door (outdoor station).  Calling
-:py:meth:`stream_source` triggers an outbound SIP INVITE to that station
-through the shared :class:`IntercomDialer`, allocates a UDP RTP receive
-socket, hands the resulting RTP feed to ``ffmpeg`` through a loopback
-port, and returns the ``tcp://127.0.0.1:<port>`` MPEG-TS URL HA's
-``stream`` component will consume.
+Each camera owns:
 
-Streams self-destruct after :data:`STREAM_MAX_SECONDS` to match the
-gateway's own no-answer timeout (~33 s) and avoid hogging the
-exclusive outdoor-station media slot.
+* a tiny RTSP server (per-entity, stable port for the entity's
+  lifetime) — go2rtc connects to it as a client when a downstream
+  WebRTC consumer wants the stream
+* a :class:`StreamSession` that SIP-dials the gateway and forwards
+  RTP packets via the RTSP server's TCP-interleaved framing
+
+Streaming is gated and lazy:
+
+* the per-gateway *armed* flag (see :mod:`streaming_state`) decides
+  whether streaming is permitted right now — accidentally opening the
+  intercom locks out the whole building, so it stays off by default
+* on the first RTSP DESCRIBE from go2rtc (which fires when a browser/
+  HomeKit consumer asks for the stream) we dial the gateway and
+  return the gateway's SDP
+* on PLAY we start forwarding RTP through the same TCP socket
+* on the *last* TEARDOWN (or connection close) we BYE the gateway
+  after a brief grace period so the building's intercom is freed
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from typing import Any
+from http import HTTPStatus
+from urllib.parse import urljoin
 
-from homeassistant.components.camera import Camera, CameraEntityFeature
-from homeassistant.components.ffmpeg import get_ffmpeg_manager
+from aiohttp import ClientError, ClientSession, ClientTimeout
+from go2rtc_client.ws import (
+    Go2RtcWsClient,
+    WebRTCAnswer as Go2RTCAnswer,
+    WebRTCCandidate as Go2RTCCandidate,
+    WebRTCOffer as Go2RTCOffer,
+    WsError as Go2RTCWsError,
+)
+from webrtc_models import RTCIceCandidateInit
+
+from homeassistant.components.camera import (
+    Camera,
+    CameraCapabilities,
+    CameraEntityFeature,
+    StreamType,
+    WebRTCAnswer,
+    WebRTCCandidate,
+    WebRTCError,
+    WebRTCSendMessage,
+)
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .intercom_dialer import Door, IntercomDialer
-from .media_pipeline import MediaPipeline
+from .media_pipeline import StreamSession
+from .rtsp_server import (
+    AUDIO_RTP_CHANNEL,
+    VIDEO_RTP_CHANNEL,
+    RtspServer,
+    RtspSession,
+)
+from .streaming_state import is_armed, signal_armed_changed
 
 _LOGGER = logging.getLogger(__name__)
 
-STREAM_MAX_SECONDS = 30
+_GO2RTC_DOMAIN = "go2rtc"
+_REQUEST_TIMEOUT = ClientTimeout(total=10)
+_TEARDOWN_GRACE_SECONDS = 2.0
 
 
 async def async_setup_entry(
@@ -40,7 +78,6 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up one camera per door if SIP creds + doors are present."""
     data = hass.data[DOMAIN][entry.entry_id]
     sip_user = entry.data.get("sip_username")
     sip_pass = entry.data.get("sip_password")
@@ -71,6 +108,7 @@ async def async_setup_entry(
         cameras.append(
             ABBWelcomeCamera(
                 hass=hass,
+                entry_id=entry.entry_id,
                 dialer=dialer,
                 door=Door(
                     name=raw.get("name") or addr,
@@ -84,183 +122,411 @@ async def async_setup_entry(
         async_add_entities(cameras)
 
 
+def _go2rtc_url(hass: HomeAssistant) -> str | None:
+    bucket = hass.data.get(_GO2RTC_DOMAIN)
+    url = getattr(bucket, "url", bucket)
+    if isinstance(url, str) and url:
+        return url.rstrip("/") + "/"
+    return None
+
+
+def _go2rtc_session(hass: HomeAssistant) -> ClientSession:
+    bucket = hass.data.get(_GO2RTC_DOMAIN)
+    session = getattr(bucket, "session", None)
+    if session is not None:
+        return session
+    return async_get_clientsession(hass)
+
+
 class ABBWelcomeCamera(Camera):
-    """Camera entity that dials the outdoor station on demand."""
+    """Camera entity backed by per-entity RTSP server + lazy SIP dial."""
 
     _attr_has_entity_name = True
     _attr_supported_features = CameraEntityFeature.STREAM
     _attr_icon = "mdi:doorbell-video"
-    # The intercom is exclusive — running multiple streams against one
-    # gateway concurrently is asking for trouble.  Cameras share a class-
-    # level lock to enforce serial usage.
-    _shared_lock: asyncio.Lock | None = None
 
     def __init__(
         self,
+        *,
         hass: HomeAssistant,
+        entry_id: str,
         dialer: IntercomDialer,
         door: Door,
         gateway_uuid: str,
     ) -> None:
         super().__init__()
         self.hass = hass
+        self._entry_id = entry_id
         self._dialer = dialer
         self._door = door
+        self._gateway_uuid = gateway_uuid
         self._attr_name = door.name
-        self._attr_unique_id = f"{gateway_uuid}_camera_{door.station_id or door.address}"
+        self._attr_unique_id = (
+            f"{gateway_uuid}_camera_{door.station_id or door.address}"
+        )
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, gateway_uuid)},
             name="ABB Welcome Gateway",
             manufacturer="ABB / Busch-Jaeger",
             model="IP Gateway (MRANGE)",
         )
-        self._pipeline: MediaPipeline | None = None
-        self._stream_url: str | None = None
-        self._stream_started_at: float = 0.0
-        self._auto_hangup_task: asyncio.Task | None = None
-        # HA's WebRTC provider system probes ``stream_source()`` at entity-add
-        # time.  We don't want that probe to dial the intercom (would block
-        # other cameras with a 403, since the gateway only allows one active
-        # call).  Skip until the entity is fully initialized.
-        self._added = False
-        # A non-routable but scheme-valid URL we hand the WebRTC provider
-        # probe so it registers without us dialing the gateway.  go2rtc
-        # only checks the URL's scheme to decide it can handle this
-        # camera; the real URL is generated on first user-initiated open.
-        slug = (door.station_id or door.address or door.name).replace("/", "_")
-        self._placeholder_url = f"http://127.0.0.1:65534/abb_probe/{slug}"
+        self._stream_name = (
+            f"abb_{(door.station_id or door.address).replace('/', '_').lower()}"
+        )
 
-    @classmethod
-    def _get_lock(cls) -> asyncio.Lock:
-        if cls._shared_lock is None:
-            cls._shared_lock = asyncio.Lock()
-        return cls._shared_lock
+        self._session = StreamSession(
+            dialer=dialer, door=door, gateway_host=dialer.host
+        )
+        self._rtsp = RtspServer(
+            host="127.0.0.1",
+            on_describe=self._on_rtsp_describe,
+            on_play=self._on_rtsp_play,
+            on_teardown=self._on_rtsp_teardown,
+        )
+
+        # WebRTC session bookkeeping (one Go2RtcWsClient per HA frontend
+        # session).
+        self._ws_clients: dict[str, Go2RtcWsClient] = {}
+        self._ws_pending_candidates: dict[str, list[str]] = {}
+
+        self._stream_lock = asyncio.Lock()
+        self._unsub_armed: callable | None = None
+
+    @property
+    def camera_capabilities(self) -> CameraCapabilities:
+        return CameraCapabilities(frontend_stream_types={StreamType.WEB_RTC})
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | int | bool]:
+        return {
+            "go2rtc_stream": self._stream_name,
+            "rtsp_url": self._rtsp.url if self._rtsp.port else "",
+            "armed": is_armed(self.hass, self._entry_id),
+            "ws_sessions": len(self._ws_clients),
+            "rtsp_sessions": self._rtsp.session_count,
+            "stream_active": self._session.active,
+        }
+
+    # ------------------------------------------------------------------ #
+    # entity lifecycle                                                   #
+    # ------------------------------------------------------------------ #
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
-        self._added = True
+        self._unsub_armed = async_dispatcher_connect(
+            self.hass,
+            signal_armed_changed(self._entry_id),
+            self._on_armed_changed,
+        )
+        await self._rtsp.start()
+        await self._register_with_go2rtc()
 
-    async def stream_source(self) -> str | None:
-        """Return a URL HA's stream component can read.
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub_armed is not None:
+            self._unsub_armed()
+            self._unsub_armed = None
 
-        Lazily dials the outdoor station + spawns ffmpeg.  Subsequent
-        calls within the active window return the same URL.
-
-        Note: HA's WebRTC provider system probes ``stream_source()`` at
-        entity-add time to decide which provider (go2rtc, etc.) handles
-        this camera.  The provider only inspects the URL scheme, so we
-        return a placeholder ``http://`` URL during that probe — this
-        lets go2rtc claim the camera without us dialing the gateway.
-        Once the user actually opens the camera, ``stream_source`` is
-        called again and we do the real dial.
-        """
-        if not self._added:
-            return self._placeholder_url
-        lock = self._get_lock()
-        async with lock:
-            now = time.monotonic()
-            if (
-                self._pipeline is not None
-                and self._stream_url is not None
-                and now - self._stream_started_at < STREAM_MAX_SECONDS - 2
-            ):
-                return self._stream_url
-            await self._teardown_locked()
+        for ws in list(self._ws_clients.values()):
             try:
-                self._stream_url = await self._setup_locked()
-                self._stream_started_at = now
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.exception("Failed to start stream for %s: %s", self._door.name, err)
-                await self._teardown_locked()
-                return None
-            self._auto_hangup_task = self.hass.async_create_background_task(
-                self._auto_hangup(), name=f"abb_camera_auto_hangup_{self._door.station_id}"
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._ws_clients.clear()
+        self._ws_pending_candidates.clear()
+
+        await self._rtsp.stop()
+        if self._session.active:
+            await self._session.close()
+        await self._unregister_from_go2rtc()
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def _on_armed_changed(self) -> None:
+        if not is_armed(self.hass, self._entry_id):
+            if self._rtsp.session_count or self._session.active:
+                _LOGGER.info(
+                    "[abb] camera %s: armed flipped off, force-closing",
+                    self._door.name,
+                )
+                self.hass.async_create_task(self._force_teardown())
+        self.async_write_ha_state()
+
+    async def _force_teardown(self) -> None:
+        await self._rtsp.stop()
+        async with self._stream_lock:
+            if self._session.active:
+                await self._session.close()
+        # Restart server so future connections still work.
+        await self._rtsp.start()
+        await self._register_with_go2rtc()
+
+    # ------------------------------------------------------------------ #
+    # go2rtc registration                                                #
+    # ------------------------------------------------------------------ #
+
+    async def _register_with_go2rtc(self) -> None:
+        base_url = _go2rtc_url(self.hass)
+        if base_url is None:
+            _LOGGER.warning(
+                "[abb] camera %s: HA-bundled go2rtc not available — WebRTC disabled",
+                self._door.name,
             )
-            return self._stream_url
-
-    async def _setup_locked(self) -> str:
-        ffmpeg_binary = "ffmpeg"
-        try:
-            ffmpeg_binary = get_ffmpeg_manager(self.hass).binary or "ffmpeg"
-        except Exception:  # noqa: BLE001
-            pass
-
-        pipeline = MediaPipeline(
-            gateway_host=self._dialer.host, ffmpeg_binary=ffmpeg_binary
+            return
+        session = _go2rtc_session(self.hass)
+        src = self._rtsp.url
+        attempts: tuple[tuple[str, dict[str, str]], ...] = (
+            ("put", {"name": self._stream_name, "src": src}),
+            ("patch", {"name": self._stream_name, "src": src}),
         )
-        audio_sock, video_sock = await pipeline.setup()
-        audio_port = audio_sock.getsockname()[1]
-        video_port = video_sock.getsockname()[1]
+        for method, params in attempts:
+            try:
+                request = getattr(session, method)
+                async with request(
+                    urljoin(base_url, "api/streams"),
+                    params=params,
+                    timeout=_REQUEST_TIMEOUT,
+                ) as resp:
+                    await resp.read()
+                    if resp.status in (
+                        HTTPStatus.OK,
+                        HTTPStatus.CREATED,
+                        HTTPStatus.NO_CONTENT,
+                    ):
+                        _LOGGER.info(
+                            "[abb] camera %s: registered go2rtc stream %s -> %s",
+                            self._door.name, self._stream_name, src,
+                        )
+                        return
+            except (ClientError, TimeoutError) as err:
+                _LOGGER.debug(
+                    "[abb] camera %s: go2rtc %s registration error: %s",
+                    self._door.name, method.upper(), err,
+                )
 
-        call = await self._dialer.dial(
-            self._door, audio_port=audio_port, video_port=video_port
-        )
+    async def _unregister_from_go2rtc(self) -> None:
+        base_url = _go2rtc_url(self.hass)
+        if base_url is None:
+            return
+        session = _go2rtc_session(self.hass)
+        for params in (
+            {"name": self._stream_name},
+            {"src": self._stream_name},
+        ):
+            try:
+                async with session.delete(
+                    urljoin(base_url, "api/streams"),
+                    params=params,
+                    timeout=_REQUEST_TIMEOUT,
+                ) as resp:
+                    await resp.read()
+                    if resp.status in (
+                        HTTPStatus.OK,
+                        HTTPStatus.NO_CONTENT,
+                    ):
+                        return
+            except (ClientError, TimeoutError) as err:
+                _LOGGER.debug(
+                    "[abb] camera %s: go2rtc DELETE %s failed: %s",
+                    self._door.name, params, err,
+                )
 
-        for _m in call.answer.medias:
+    # ------------------------------------------------------------------ #
+    # RTSP server callbacks                                              #
+    # ------------------------------------------------------------------ #
+
+    async def _on_rtsp_describe(self) -> str | None:
+        if not is_armed(self.hass, self._entry_id):
             _LOGGER.info(
-                "[abb] camera %s SDP answer media: media=%s port=%d "
-                "ip=%s pts=%s rtpmap=%s fmtp=%s direction=%s",
-                self._door.name, _m.media, _m.port, _m.connection_ip,
-                _m.payload_types, _m.rtpmap, _m.fmtp, _m.direction,
+                "[abb] camera %s: refusing DESCRIBE (not armed)",
+                self._door.name,
             )
+            return None
+        async with self._stream_lock:
+            if not self._session.active:
+                try:
+                    await self._session.open()
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.exception(
+                        "[abb] camera %s: failed to open stream session: %s",
+                        self._door.name, err,
+                    )
+                    return None
+        codec = self._session.video_codec or "H264/90000"
+        # WebRTC matcher needs a profile-level-id; ABB doesn't include
+        # one in its SDP answer (we'd just have packetization-mode), and
+        # without it go2rtc 1.9.9 logs "codecs not matched".  42e01f =
+        # Constrained Baseline @ Level 3.1 — a safe lowest-common-
+        # denominator that essentially all WebRTC clients accept.
+        fmtp = self._session.video_fmtp or "packetization-mode=1;profile-level-id=42e01f"
+        # Audio is intentionally omitted for now: ABB sends PCMA but
+        # WebRTC's downstream audio path is Opus-only, and go2rtc
+        # 1.9.9 doesn't transcode in the WebRTC pipeline — including
+        # the PCMA track here makes go2rtc bail out with "codecs not
+        # matched" even though the video would have negotiated fine.
+        sdp_lines = [
+            "v=0",
+            "o=- 0 0 IN IP4 127.0.0.1",
+            "s=ABB",
+            "c=IN IP4 127.0.0.1",
+            "t=0 0",
+            "a=control:*",
+            "m=video 0 RTP/AVP 96",
+            f"a=rtpmap:96 {codec}",
+            f"a=fmtp:96 {fmtp}",
+            "a=control:trackID=0",
+            "",
+        ]
+        return "\r\n".join(sdp_lines) + "\r\n"
 
-        gw_audio: tuple[str, int] | None = None
-        gw_video: tuple[str, int] | None = None
-        video_pt: int | None = None
-        video_codec: str | None = None
-        video_fmtp: str | None = None
-        for m in call.answer.medias:
-            if m.media == "audio" and m.connection_ip and m.port:
-                gw_audio = (m.connection_ip, m.port)
-            elif m.media == "video" and m.connection_ip and m.port:
-                gw_video = (m.connection_ip, m.port)
-                if m.payload_types:
-                    video_pt = m.payload_types[0]
-                    video_codec = m.rtpmap.get(video_pt)
-                    video_fmtp = m.fmtp.get(video_pt)
+    async def _on_rtsp_play(self, sess: RtspSession) -> None:
+        # Wire StreamSession's RTP packets to the RTSP TCP-interleaved push.
+        def _on_video(packet: bytes) -> None:
+            sess.push_rtp(VIDEO_RTP_CHANNEL, packet)
 
-        url = await pipeline.start(
-            gw_audio,
-            gw_video,
-            video_pt=video_pt,
-            video_codec=video_codec,
-            video_fmtp=video_fmtp,
+        def _on_audio(packet: bytes) -> None:
+            sess.push_rtp(AUDIO_RTP_CHANNEL, packet)
+
+        self._session.set_packet_handlers(on_video=_on_video, on_audio=_on_audio)
+        _LOGGER.info(
+            "[abb] camera %s: PLAY started, forwarding RTP to RTSP client",
+            self._door.name,
         )
-        self._pipeline = pipeline
-        _LOGGER.info("[abb] camera %s stream URL: %s", self._door.name, url)
-        return url
 
-    async def _auto_hangup(self) -> None:
+    async def _on_rtsp_teardown(self, sess: RtspSession) -> None:
+        if self._rtsp.session_count == 0:
+            self._session.set_packet_handlers(on_video=None, on_audio=None)
+            self.hass.async_create_task(self._delayed_session_close())
+
+    async def _delayed_session_close(self) -> None:
         try:
-            await asyncio.sleep(STREAM_MAX_SECONDS)
+            await asyncio.sleep(_TEARDOWN_GRACE_SECONDS)
         except asyncio.CancelledError:
             return
-        _LOGGER.info("[abb] camera %s auto-hangup safety net", self._door.name)
-        async with self._get_lock():
-            await self._teardown_locked()
+        if self._rtsp.session_count > 0:
+            return
+        async with self._stream_lock:
+            if self._rtsp.session_count > 0:
+                return
+            if self._session.active:
+                await self._session.close()
 
-    async def _teardown_locked(self) -> None:
-        if self._auto_hangup_task is not None:
-            self._auto_hangup_task.cancel()
-            self._auto_hangup_task = None
-        if self._pipeline is not None:
-            try:
-                await self._pipeline.stop()
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("pipeline stop failed: %s", err)
-            self._pipeline = None
-        if self._dialer.in_call:
-            try:
-                await self._dialer.hangup()
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("dialer hangup failed: %s", err)
-        self._stream_url = None
-        self._stream_started_at = 0.0
+    # ------------------------------------------------------------------ #
+    # stream_source for non-WebRTC consumers                             #
+    # ------------------------------------------------------------------ #
+
+    async def stream_source(self) -> str | None:
+        if _go2rtc_url(self.hass) is None:
+            return None
+        return f"rtsp://127.0.0.1:18554/{self._stream_name}"
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        # Snapshot would require a transient dial just to grab one keyframe.
-        # Skip for now — HA's stream component falls back to an HLS-derived
-        # snapshot once a stream has been live.
         return None
+
+    # ------------------------------------------------------------------ #
+    # WebRTC offer / candidate forwarding to go2rtc                      #
+    # ------------------------------------------------------------------ #
+
+    async def async_handle_async_webrtc_offer(
+        self,
+        offer_sdp: str,
+        session_id: str,
+        send_message: WebRTCSendMessage,
+    ) -> None:
+        if not is_armed(self.hass, self._entry_id):
+            send_message(
+                WebRTCError(
+                    code="abb_streaming_disarmed",
+                    message=(
+                        "ABB Welcome streaming is disarmed. "
+                        "Toggle the streaming switch on, or wait for an inbound ring."
+                    ),
+                )
+            )
+            return
+
+        base_url = _go2rtc_url(self.hass)
+        if base_url is None:
+            send_message(
+                WebRTCError(
+                    code="go2rtc_unavailable",
+                    message="HA-bundled go2rtc is not available",
+                )
+            )
+            return
+
+        # Refresh registration in case it got dropped (HA-managed go2rtc
+        # restarts may wipe streams).
+        await self._register_with_go2rtc()
+
+        ws = Go2RtcWsClient(
+            _go2rtc_session(self.hass),
+            base_url.rstrip("/"),
+            source=self._stream_name,
+        )
+
+        @callback
+        def _on_message(message) -> None:
+            match message:
+                case Go2RTCCandidate():
+                    send_message(
+                        WebRTCCandidate(RTCIceCandidateInit(message.candidate))
+                    )
+                case Go2RTCAnswer():
+                    send_message(WebRTCAnswer(message.sdp))
+                case Go2RTCWsError():
+                    send_message(
+                        WebRTCError(
+                            code="go2rtc_error",
+                            message=str(message.error),
+                        )
+                    )
+
+        ws.subscribe(_on_message)
+        self._ws_clients[session_id] = ws
+
+        try:
+            config = self.async_get_webrtc_client_configuration()
+            await ws.send(
+                Go2RTCOffer(offer_sdp, config.configuration.ice_servers)
+            )
+        except Exception as err:  # noqa: BLE001
+            self._ws_clients.pop(session_id, None)
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+            send_message(
+                WebRTCError(
+                    code="go2rtc_offer_failed", message=str(err),
+                )
+            )
+            return
+
+        for c in self._ws_pending_candidates.pop(session_id, []):
+            try:
+                await ws.send(Go2RTCCandidate(c))
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("[abb] queued candidate forward failed: %s", err)
+
+    async def async_on_webrtc_candidate(
+        self, session_id: str, candidate: RTCIceCandidateInit
+    ) -> None:
+        ws = self._ws_clients.get(session_id)
+        if ws is None:
+            self._ws_pending_candidates.setdefault(session_id, []).append(
+                candidate.candidate
+            )
+            return
+        try:
+            await ws.send(Go2RTCCandidate(candidate.candidate))
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("[abb] forward candidate failed: %s", err)
+
+    @callback
+    def close_webrtc_session(self, session_id: str) -> None:
+        ws = self._ws_clients.pop(session_id, None)
+        self._ws_pending_candidates.pop(session_id, None)
+        if ws is not None:
+            self.hass.async_create_task(ws.close())
