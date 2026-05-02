@@ -19,12 +19,6 @@ from .coordinator import ABBWelcomeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-STATION_NAMES = {
-    "100000001": "Outdoor 1",
-    "100000002": "Inner",
-    "100000003": "Parking Garage",
-}
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -39,7 +33,13 @@ async def async_setup_entry(
 
     coordinator: ABBWelcomeCoordinator = data.get("coordinator")
     if coordinator is not None and coordinator.has_certs:
-        sensors.append(ABBWelcomeLastEventSensor(coordinator, gateway_uuid))
+        sensors.append(
+            ABBWelcomeLastEventSensor(
+                coordinator,
+                gateway_uuid,
+                entry.data.get("doors", []) or [],
+            )
+        )
 
     if "sip_listener" in data:
         listener_sensor = ABBWelcomeListenerStateSensor(gateway_uuid)
@@ -61,8 +61,16 @@ class ABBWelcomeLastEventSensor(SensorEntity):
         self,
         coordinator: ABBWelcomeCoordinator,
         gateway_uuid: str,
+        doors: list[dict[str, Any]],
     ) -> None:
         self._coordinator = coordinator
+        self._station_names = {
+            str(door.get("station_id", "")).strip(): str(
+                door.get("name") or door.get("station_id") or ""
+            )
+            for door in doors
+            if str(door.get("station_id", "")).strip()
+        }
         self._attr_unique_id = f"{gateway_uuid}_last_event"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, gateway_uuid)},
@@ -86,7 +94,7 @@ class ABBWelcomeLastEventSensor(SensorEntity):
         if not data or not data.last_event:
             return None
         evt = data.last_event
-        station = STATION_NAMES.get(evt.station_id, evt.station_id)
+        station = evt.local_name or self._station_names.get(evt.station_id, evt.station_id)
         label = evt.event_type.replace("-", " ").title()
         return f"{label} — {station}" if station else label
 
@@ -96,14 +104,26 @@ class ABBWelcomeLastEventSensor(SensorEntity):
         if not data or not data.last_event:
             return None
         evt = data.last_event
-        return {
+        station_name = evt.local_name or self._station_names.get(evt.station_id, "")
+        attrs = {
             "event_type": evt.event_type,
+            "event_label": evt.event_type.replace("-", " ").title(),
             "station_id": evt.station_id,
-            "station_name": STATION_NAMES.get(evt.station_id, ""),
+            "station": station_name,
+            "station_name": station_name,
+            "local_id": evt.local_id,
+            "local_name": evt.local_name,
+            "sender": evt.sender,
+            "belongs_to": evt.belongs_to,
             "timestamp": evt.timestamp,
             "event_id": evt.event_id,
+            "has_image": evt.image_data is not None,
+            "image_bytes": len(evt.image_data) if evt.image_data else 0,
             "total_events_cached": len(data.events),
         }
+        if evt.payload_text:
+            attrs["payload_text"] = evt.payload_text
+        return attrs
 
 
 class ABBWelcomeListenerStateSensor(SensorEntity):

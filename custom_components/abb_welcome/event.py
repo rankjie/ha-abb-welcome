@@ -29,12 +29,6 @@ EVENT_TYPES = [
     "screenshot",
 ]
 
-STATION_NAMES = {
-    "100000001": "Outdoor 1",
-    "100000002": "Inner",
-    "100000003": "Parking Garage",
-}
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -47,7 +41,13 @@ async def async_setup_entry(
     if not coordinator or not coordinator.has_certs:
         return
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
-    async_add_entities([ABBWelcomeEventEntity(coordinator, gateway_uuid)])
+    async_add_entities([
+        ABBWelcomeEventEntity(
+            coordinator,
+            gateway_uuid,
+            entry.data.get("doors", []) or [],
+        )
+    ])
 
 
 class ABBWelcomeEventEntity(EventEntity):
@@ -62,8 +62,16 @@ class ABBWelcomeEventEntity(EventEntity):
         self,
         coordinator: ABBWelcomeCoordinator,
         gateway_uuid: str,
+        doors: list[dict],
     ) -> None:
         self._coordinator = coordinator
+        self._station_names = {
+            str(door.get("station_id", "")).strip(): str(
+                door.get("name") or door.get("station_id") or ""
+            )
+            for door in doors
+            if str(door.get("station_id", "")).strip()
+        }
         self._attr_unique_id = f"{gateway_uuid}_intercom_events"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, gateway_uuid)},
@@ -88,15 +96,21 @@ class ABBWelcomeEventEntity(EventEntity):
             if evt.event_type == "screenshot":
                 continue
 
-            station = ""
-            if evt.station_id:
-                station = STATION_NAMES.get(evt.station_id, f"Station {evt.station_id}")
+            station = evt.local_name or self._station_names.get(evt.station_id, "")
+            label = evt.event_type.replace("-", " ").title()
 
             self._trigger_event(
                 evt.event_type,
                 {
+                    "event_type": evt.event_type,
+                    "event_label": label,
                     "station": station,
+                    "station_name": station,
                     "station_id": evt.station_id,
+                    "local_id": evt.local_id,
+                    "local_name": evt.local_name,
+                    "sender": evt.sender,
+                    "belongs_to": evt.belongs_to,
                     "timestamp": evt.timestamp,
                     "event_id": evt.event_id,
                 },

@@ -115,10 +115,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     sip_domain = entry.data.get("sip_domain")
     gw_ip = entry.data.get("gateway_ip")
     if sip_user and sip_pass and sip_domain and gw_ip:
+        door_names = {
+            str(door.get("station_id", "")).strip(): str(
+                door.get("name") or door.get("station_id") or ""
+            )
+            for door in entry.data.get("doors", []) or []
+            if str(door.get("station_id", "")).strip()
+        }
+
         def _on_ring(call: IncomingCall) -> None:
+            station_id = call.caller_user
+            station = door_names.get(station_id, "")
             payload = {
                 "caller_uri": call.caller_uri,
                 "caller_user": call.caller_user,
+                "station_id": station_id,
+                "station": station,
+                "station_name": station,
                 "call_id": call.call_id,
                 "received_at": call.received_at,
             }

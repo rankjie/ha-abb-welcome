@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import tempfile
 import time
@@ -44,9 +45,12 @@ class IntercomEvent:
     event_type: str  # ring, screenshot, door-open, call-terminated, etc.
     timestamp: str
     sender: str
+    belongs_to: str = ""
     image_data: bytes | None = None
     payload_text: str = ""
     station_id: str = ""
+    local_id: str = ""
+    local_name: str = ""
 
 
 @dataclass
@@ -79,6 +83,13 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
         self._newest_id: str = ""
         self._data = ABBWelcomeData()
         self._has_certs = bool(self._cert_pem and self._key_pem)
+        self._station_names = {
+            str(door.get("station_id", "")).strip(): str(
+                door.get("name") or door.get("station_id") or ""
+            )
+            for door in entry.data.get("doors", []) or []
+            if str(door.get("station_id", "")).strip()
+        }
 
     @property
     def has_certs(self) -> bool:
@@ -143,6 +154,7 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
                     event_type=etype,
                     timestamp=evt.get("timestamp", ""),
                     sender=evt.get("sender", ""),
+                    belongs_to=evt.get("belongsTo", ""),
                 )
 
                 if payload_b64:
@@ -155,9 +167,18 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
                                 newest_screenshot = raw
                                 newest_screenshot_id = event_id
                         else:
-                            ie.payload_text = raw.decode("utf-8", "replace")[:200]
+                            ie.payload_text = raw.decode("utf-8", "replace")[:500]
+                            payload = json.loads(ie.payload_text)
+                            if isinstance(payload, dict):
+                                ie.local_id = str(payload.get("local_id", "")).strip()
+                                ie.local_name = str(payload.get("local_name", "")).strip()
+                                if ie.local_id:
+                                    ie.station_id = ie.local_id.split("@", 1)[0].removeprefix("sip:")
                     except Exception:
                         pass
+
+                if ie.station_id and not ie.local_name:
+                    ie.local_name = self._station_names.get(ie.station_id, "")
 
                 new_events.append(ie)
 
