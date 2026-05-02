@@ -30,8 +30,8 @@ _KEEPALIVE_INTERVAL = 1.0
 _RTCP_INTERVAL = 5.0
 
 
-def _build_rtp_keepalive(seq: int) -> bytes:
-    return struct.pack("!BBHII", 0x80, 0, seq & 0xFFFF, 0, 0xCAFEBABE)
+def _build_rtp_keepalive(seq: int, pt: int = 0) -> bytes:
+    return struct.pack("!BBHII", 0x80, pt & 0x7F, seq & 0xFFFF, 0, 0xCAFEBABE)
 
 
 def _build_rtcp_pli(reporter: int, media: int) -> bytes:
@@ -228,6 +228,11 @@ class StreamSession:
         self._call = call
 
         for m in call.answer.medias:
+            _LOGGER.info(
+                "[abb] media: %s SDP answer media=%s ip=%s port=%d pts=%s rtpmap=%s direction=%s",
+                self._door.name, m.media, m.connection_ip, m.port,
+                m.payload_types, m.rtpmap, m.direction,
+            )
             if m.media == "audio" and m.connection_ip and m.port:
                 self._endpoints = _MediaEndpoints(
                     audio=(m.connection_ip, m.port),
@@ -291,10 +296,13 @@ class StreamSession:
             lambda: self._audio_proto, sock=self._audio_sock
         )
 
+        # Punch audio with PCMA PT (8) and video with H.264 PT (102) so
+        # the gateway recognises them as legitimate media flows.
+        # Keepalives later in ``_keepalive_loop`` use the same PTs.
         if self._endpoints.audio:
-            await self._punch(self._audio_transport, self._endpoints.audio)
+            await self._punch(self._audio_transport, self._endpoints.audio, pt=8)
         if self._endpoints.video:
-            await self._punch(self._video_transport, self._endpoints.video)
+            await self._punch(self._video_transport, self._endpoints.video, pt=102)
 
         self._stop.clear()
         self._keepalive_task = asyncio.create_task(
@@ -351,11 +359,15 @@ class StreamSession:
         self._endpoints = _MediaEndpoints(None, None)
 
     async def _punch(
-        self, transport: asyncio.DatagramTransport, dest: tuple[str, int]
+        self,
+        transport: asyncio.DatagramTransport,
+        dest: tuple[str, int],
+        *,
+        pt: int = 0,
     ) -> None:
         for i in range(6):
             try:
-                transport.sendto(_build_rtp_keepalive(i), dest)
+                transport.sendto(_build_rtp_keepalive(i, pt=pt), dest)
             except OSError:
                 break
 
@@ -367,14 +379,14 @@ class StreamSession:
                 return
             except asyncio.TimeoutError:
                 pass
-            for transport, dest in (
-                (self._audio_transport, self._endpoints.audio),
-                (self._video_transport, self._endpoints.video),
+            for transport, dest, pt in (
+                (self._audio_transport, self._endpoints.audio, 8),
+                (self._video_transport, self._endpoints.video, 102),
             ):
                 if transport is None or dest is None:
                     continue
                 try:
-                    transport.sendto(_build_rtp_keepalive(seq), dest)
+                    transport.sendto(_build_rtp_keepalive(seq, pt=pt), dest)
                 except OSError:
                     pass
                 seq = (seq + 1) & 0xFFFF

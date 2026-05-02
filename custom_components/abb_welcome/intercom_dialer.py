@@ -28,7 +28,7 @@ from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
-USER_AGENT = "ABB-Welcome-HA-Dialer/1.0"
+USER_AGENT = "LinphoneAndroid/3.10.9"
 DEFAULT_REGISTER_EXPIRES = 600
 
 
@@ -234,24 +234,41 @@ def _ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-def _build_offer_sdp(media_ip: str, audio_port: int, video_port: int) -> str:
+def _build_offer_sdp(
+    media_ip: str, audio_port: int, video_port: int, user: str
+) -> str:
+    """Build a Linphone-like audio+video SDP offer."""
     sid = int(time.time() * 1000)
     return "\r\n".join(
         [
             "v=0",
-            f"o=- {sid} 1 IN IP4 {media_ip}",
-            "s=ABB Welcome HA",
+            f"o={user} {sid} {sid} IN IP4 {media_ip}",
+            "s=Talk",
             f"c=IN IP4 {media_ip}",
+            "b=AS:380",
             "t=0 0",
-            f"m=audio {audio_port} RTP/AVP 0 8 101",
-            "a=rtpmap:0 PCMU/8000",
+            f"m=audio {audio_port} RTP/AVPF 96 9 8 0 18 101",
+            "a=rtpmap:96 opus/48000/2",
+            "a=fmtp:96 useinbandfec=1",
+            "a=rtpmap:9 G722/8000",
             "a=rtpmap:8 PCMA/8000",
+            "a=rtpmap:0 PCMU/8000",
+            "a=rtpmap:18 G729/8000",
+            "a=fmtp:18 annexb=yes",
             "a=rtpmap:101 telephone-event/8000",
             "a=fmtp:101 0-16",
-            "a=sendrecv",
-            f"m=video {video_port} RTP/AVP 96",
+            "a=rtcp-fb:* trr-int 1000",
+            "a=rtcp-fb:* ccm tmmbr",
+            f"m=video {video_port} RTP/AVPF 96 97",
             "a=rtpmap:96 H264/90000",
-            "a=sendrecv",
+            "a=fmtp:96 profile-level-id=42801F",
+            "a=rtcp-fb:96 nack pli",
+            "a=rtcp-fb:96 ccm fir",
+            "a=rtcp-fb:96 ccm tmmbr",
+            "a=rtpmap:97 VP8/90000",
+            "a=rtcp-fb:97 nack pli",
+            "a=rtcp-fb:97 ccm fir",
+            "a=rtcp-fb:97 ccm tmmbr",
             "",
         ]
     )
@@ -489,7 +506,10 @@ class IntercomDialer:
     async def _dial_locked(
         self, door: Door, audio_port: int, video_port: int
     ) -> CallState:
-        request_uri = door.address
+        base_addr = door.address
+        request_uri = (
+            base_addr if ";user=phone" in base_addr else base_addr + ";user=phone"
+        )
         local_tag = uuid.uuid4().hex[:8]
         call_id = uuid.uuid4().hex[:16] + "@" + self.domain
         invite_branch = "z9hG4bK-" + uuid.uuid4().hex[:12]
@@ -497,7 +517,7 @@ class IntercomDialer:
         to_header = f"<{request_uri}>"
         local_contact = f"<sip:{self.username}@{self._local_ip}:{self._local_port};transport=tls>"
 
-        sdp = _build_offer_sdp(self.media_ip, audio_port, video_port)
+        sdp = _build_offer_sdp(self.media_ip, audio_port, video_port, self.username)
         invite_cseq = self._cseq
         headers = [
             f"Via: SIP/2.0/TLS {self._local_ip}:{self._local_port};branch={invite_branch};rport",
@@ -508,8 +528,8 @@ class IntercomDialer:
             f"CSeq: {invite_cseq} INVITE",
             f"Contact: {local_contact}",
             f"User-Agent: {USER_AGENT}",
-            "Allow: INVITE, ACK, CANCEL, BYE, MESSAGE, OPTIONS",
-            "Accept: application/sdp",
+            "Allow: INVITE, ACK, CANCEL, OPTIONS, MESSAGE, INFO, REFER, BYE, NOTIFY, PRACK, UPDATE, SUBSCRIBE",
+            "Supported: replaces, outbound",
             "Content-Type: application/sdp",
         ]
         await self._send_request("INVITE", request_uri, headers, sdp)
@@ -565,7 +585,11 @@ class IntercomDialer:
             f"Contact: {local_contact}",
             f"User-Agent: {USER_AGENT}",
         ]
-        await self._send_request("ACK", request_uri, ack_headers)
+        # ACK for a 2xx INVITE response is a separate in-dialog request
+        # and must be sent to the remote Contact. The gateway starts video
+        # even when ACK is routed via the original URI, but it only opens
+        # the audio leg after the Contact-targeted ACK.
+        await self._send_request("ACK", remote_contact or request_uri, ack_headers)
 
         try:
             answer = parse_sdp(frame.body)

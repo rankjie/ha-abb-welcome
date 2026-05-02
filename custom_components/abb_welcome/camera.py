@@ -358,11 +358,11 @@ class ABBWelcomeCamera(Camera):
         # Constrained Baseline @ Level 3.1 — a safe lowest-common-
         # denominator that essentially all WebRTC clients accept.
         fmtp = self._session.video_fmtp or "packetization-mode=1;profile-level-id=42e01f"
-        # Audio is intentionally omitted for now: ABB sends PCMA but
-        # WebRTC's downstream audio path is Opus-only, and go2rtc
-        # 1.9.9 doesn't transcode in the WebRTC pipeline — including
-        # the PCMA track here makes go2rtc bail out with "codecs not
-        # matched" even though the video would have negotiated fine.
+        # PCMA is one of the codecs WebRTC keeps in its standard menu
+        # (RFC 7874) so browsers offer it alongside Opus — verified
+        # locally with go2rtc 1.9.9: it passthroughs PCMA in the
+        # WebRTC answer when the browser advertises it (no transcode
+        # needed).  We expose it as a separate track here.
         sdp_lines = [
             "v=0",
             "o=- 0 0 IN IP4 127.0.0.1",
@@ -374,6 +374,9 @@ class ABBWelcomeCamera(Camera):
             f"a=rtpmap:96 {codec}",
             f"a=fmtp:96 {fmtp}",
             "a=control:trackID=0",
+            "m=audio 0 RTP/AVP 8",
+            "a=rtpmap:8 PCMA/8000",
+            "a=control:trackID=1",
             "",
         ]
         return "\r\n".join(sdp_lines) + "\r\n"
