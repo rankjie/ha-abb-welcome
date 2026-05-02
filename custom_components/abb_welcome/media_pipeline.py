@@ -338,7 +338,12 @@ class StreamSession:
 
         if self._call is not None:
             try:
-                await self._dialer.hangup()
+                # Scope the hangup to *our* call_id.  Another camera
+                # may have replaced the dialer's call between when we
+                # dialed and now (the dialer auto-bumps the previous
+                # call); without this scope our close() would BYE the
+                # successor's call by accident.
+                await self._dialer.hangup(call_id=self._call.call_id)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("[abb] media: hangup failed: %s", err)
             self._call = None

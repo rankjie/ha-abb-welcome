@@ -469,8 +469,21 @@ class IntercomDialer:
     async def dial(self, door: Door, *, audio_port: int, video_port: int) -> CallState:
         await self.ensure_connected()
         async with self._lock:
+            # The intercom is exclusive — we can't have two simultaneous
+            # calls to the gateway.  If a previous call is still active
+            # (e.g. another camera entity hasn't finished its grace-
+            # period teardown), bump it before opening the new one.  The
+            # old session's ``close()`` will see a stale call_id and
+            # become a no-op for the SIP layer.
             if self._call is not None:
-                raise RuntimeError("a call is already active; hangup() first")
+                _LOGGER.info(
+                    "[abb] dialer: replacing active call %s with new dial to %s",
+                    self._call.call_id, door.name,
+                )
+                try:
+                    await self._hangup_locked()
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug("[abb] dialer replace-hangup failed: %s", err)
             return await self._dial_locked(door, audio_port, video_port)
 
     async def _dial_locked(
@@ -612,8 +625,25 @@ class IntercomDialer:
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("best-effort BYE failed: %s", err)
 
-    async def hangup(self) -> None:
+    async def hangup(self, *, call_id: str | None = None) -> None:
+        """Hang up the active call.
+
+        ``call_id`` lets a caller scope the hangup to a specific call
+        — useful when the dialer has been "replaced" by a newer dial:
+        the previous session can pass its known call_id, and we'll
+        skip the BYE if the active call is somebody else's.
+        """
         async with self._lock:
+            if (
+                call_id is not None
+                and self._call is not None
+                and self._call.call_id != call_id
+            ):
+                _LOGGER.debug(
+                    "[abb] dialer: hangup(call_id=%s) skipped — active call is %s",
+                    call_id, self._call.call_id,
+                )
+                return
             await self._hangup_locked()
 
     async def _hangup_locked(self) -> None:
