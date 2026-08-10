@@ -156,6 +156,7 @@ class MediaDescription:
     rtpmap: dict[int, str] = field(default_factory=dict)
     fmtp: dict[int, str] = field(default_factory=dict)
     direction: str = ""  # sendrecv | sendonly | recvonly | inactive
+    crypto: list[str] = field(default_factory=list)  # raw a=crypto: lines
 
 
 @dataclass
@@ -194,6 +195,8 @@ def parse_sdp(body: bytes | str) -> ParsedSdp:
                 current.rtpmap[int(pt_str)] = enc.strip()
             except ValueError:
                 continue
+        elif current is not None and line.startswith("a=crypto:"):
+            current.crypto.append(line[len("a=crypto:"):].strip())
         elif current is not None and line.startswith("a=fmtp:"):
             rest = line[len("a=fmtp:"):]
             try:

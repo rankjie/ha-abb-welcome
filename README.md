@@ -1,420 +1,309 @@
-# ABB Welcome - Home Assistant integration
+# ABB Welcome para Home Assistant — con soporte para paneles WiFi
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=rankjie&repository=ha-abb-welcome&category=integration)
+Integración de Home Assistant para videoporteros **ABB Welcome / Busch-Jaeger**
+que añade compatibilidad con los **paneles interiores WiFi**: vídeo, audio de
+bajada y audio de subida (talkback) sobre la conexión SIP/RTP local del
+portero, sin nube.
 
-Local controls, ring detection, and live intercom streams for ABB Welcome /
-Busch-Jaeger building intercoms backed by an **IP gateway** (system type
-`mrange`).
+> Esta es una versión modificada del proyecto original
+> [rankjie/ha-abb-welcome](https://github.com/rankjie/ha-abb-welcome).
+> Los cambios se limitan a la ruta de medios de los paneles WiFi.
 
-This integration is LAN-first. Pairing uses the ABB MyBuildings cloud portal
-once, then unlocks, realtime ring detection, and live video/audio run directly
-against the gateway on your local network.
+---
 
-For Apple Home / HomeKit, use the companion
-[ABB HA Doorbell Scrypted plugin][scrypted-bridge]. The Scrypted plugin imports
-ABB Welcome stations into Apple Home as full HomeKit doorbells with live video,
-doorbell notifications, and two-way audio.
+## Por qué existe esta versión
 
-> [!IMPORTANT]
-> **Want ABB Welcome in Apple Home? Use Scrypted.**
->
-> HA's native HomeKit bridge can expose a basic camera/ring sensor, but it does
-> not provide the full HomeKit doorbell experience. For Apple Home notifications,
-> live video, audio, talkback, and safer pickup handling, install this HA
-> integration first, then add the companion
-> [ABB HA Doorbell Scrypted plugin][scrypted-bridge].
+Los paneles WiFi de ABB anuncian su flujo como `RTP/AVP` normal en el SDP,
+pero **no envían RTP en claro**. Cada carga útil RTP va así:
 
-## Features
+```
+[2 bytes big-endian: longitud real][AES-128-ECB, relleno con ceros a múltiplo de 16]
+```
 
-- One Home Assistant **button entity per unlock-capable outdoor station**.
-- **Camera entities** for discovered door stations, backed by HA's bundled
-  go2rtc/WebRTC path.
-- **LAN H.264 video + PCMA/G.711 audio** for live intercom streams.
-- **Talkback services** for the active stream. The Scrypted plugin uses these to
-  provide HomeKit microphone audio.
-- **Streaming enabled switch** to explicitly arm live streaming. Turning it off
-  tears down active streams and hangs up active calls.
-- **Allow pickup switch** for incoming doorbell calls. When disabled, HA will not
-  accept the ringing INVITE, leaving phones and indoor stations free to answer.
-- **Realtime ring binary sensor** that listens for local SIP INVITE packets and
-  fires quickly when someone presses the doorbell.
-- `abb_welcome_ring` Home Assistant event with station id, station name, caller
-  URI, call id, and timestamp.
-- **Image entity** with the latest gateway screenshot from event history.
-- **Event entity** and **last-event sensor** for ring / call / door-open history.
-- **Refresh Events** button for a manual portal event poll.
-- **Refresh outdoor stations** service for re-reading the gateway door list.
-- Switchable unlock strategy for gateways that need a different SIP unlock path.
-- LAN RTSP proxy for Scrypted/HomeKit, with automatic free-port selection and
-  discovery refresh events.
+La clave son los bytes en crudo del `a=crypto` del SDP:
 
-## Requirements
+```
+a=crypto:1 AES_CM_128_HMAC_SHA1_32 inline:WERYelBoeWxkbTRrdUtneA==
+```
 
-- An ABB Welcome **IP gateway** reachable on your local network, such as ABB
-  **83342** or another `mrange` IP gateway.
-- An **ABB-Welcome / Busch-Jaeger MyBuildings** account already linked to that
-  gateway.
-- The gateway **web admin password** used at `https://<gateway-ip>/`.
-- For Apple Home: a working Scrypted installation and the
-  [ABB HA Doorbell Scrypted plugin][scrypted-bridge].
+Ese base64 decodifica a exactamente 16 bytes ASCII y se usa **tal cual** como
+clave AES-128. No es SRTP: no hay keystream AES-CM, ni salt, ni etiqueta de
+autenticación, ni ROC.
 
-## Installation
+Esto afecta **igual al audio y al vídeo**, y explica por qué los decodificadores
+convencionales no encuentran SPS/PPS en el flujo: sí están, pero cifrados. Lo
+que parecían cabeceras NAL con tipos imposibles (0, 2, 3, 4 con `nri=0`) era en
+realidad el byte alto del prefijo de longitud — un paquete de 802 bytes empieza
+por `0x03 0x13` porque la longitud real es `0x0313` = 787.
 
-### HACS
+El mismo esquema, aplicado a la inversa, es lo que permite **enviar** audio al
+portero.
 
-Click the badge to add this repository to HACS:
+---
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=rankjie&repository=ha-abb-welcome&category=integration)
+## Qué funciona
 
-Then install **ABB Welcome** from HACS and restart Home Assistant.
+| Función | Estado |
+|---|---|
+| Vídeo H.264 del panel WiFi | Funciona (640x480, Constrained Baseline) |
+| Audio del portero hacia HA | Funciona (PCMA/8000) |
+| Talkback desde HA hacia el portero | Funciona (vía servicios) |
+| Backchannel ONVIF para WebRTC | Implementado; requiere HTTPS y tarjeta compatible |
+| Apertura de puerta, timbre, sensores | Del proyecto original |
 
-If the badge does not work, open HACS -> **Custom repositories**, add
-`https://github.com/rankjie/ha-abb-welcome` as an *Integration*, and install it.
+---
+
+## Requisitos
+
+- Home Assistant **2024.11 o superior** (usa la API WebRTC nativa y el go2rtc
+  integrado).
+- Un gateway ABB Welcome accesible en la red local/ Panel interior wifi.
+- Las dependencias `cryptography` y `requests` las instala Home Assistant
+  automáticamente desde el manifiesto.
+
+---
+
+## Instalación
 
 ### Manual
 
-Copy `custom_components/abb_welcome/` into Home Assistant's
-`config/custom_components/` directory and restart Home Assistant.
+1. Copia la carpeta `custom_components/abb_welcome/` dentro de tu
+   `config/custom_components/` de Home Assistant.
+2. Reinicia Home Assistant.
+3. Ve a **Ajustes → Dispositivos y servicios → Añadir integración** y busca
+   **ABB Welcome**.
 
-## Home Assistant Setup
+### HACS (repositorio personalizado)
 
-Open Settings -> **Devices & Services** -> **Add Integration** -> **ABB Welcome**.
+1. En HACS, menú de tres puntos → **Repositorios personalizados**.
+2. Añade la URL de tu repositorio con categoría **Integración**.
+3. Instala **ABB Welcome** y reinicia.
 
-Fill in:
+---
 
-- MyBuildings portal **username**
-- MyBuildings portal **password**
-- Gateway local **IP address**
-- Gateway **web admin password**
+## Configuración
 
-Optional: if automatic setup cannot read the gateway UUID from the local
-`portalclient.cgi` endpoint, fill in **Gateway Portal UUID** from the gateway web
-admin Portal page or ABB Welcome mobile app, then retry.
+Durante el alta se piden la IP del gateway/panel wifi y las credenciales. Después, en
+**Configurar**, están las opciones relevantes para paneles WiFi:
 
-The integration then:
-
-1. Generates a fresh RSA keypair and requests a client certificate from the
-   MyBuildings portal.
-2. Reads the gateway UUID from the local gateway admin API.
-3. Computes the gateway integrity code from the certificate fingerprint.
-4. Sends a `welcome.connect` event so the gateway sees a pending pairing entry.
-5. Logs into the gateway admin API, finds that pending entry, sets permissions,
-   and submits the integrity code.
-6. Polls for the gateway ACL update, decrypts the SIP password, reads the door
-   list, and creates HA entities.
-
-A successful pairing typically completes in under 15 seconds.
-
-## Apple Home / HomeKit
-
-> [!IMPORTANT]
-> **Full Apple Home doorbell = HA integration + Scrypted plugin.**
->
-> Do **not** rely on HA's native HomeKit bridge if you want a real Apple Home
-> doorbell. HA can expose a one-way camera and ring sensor, but the usable
-> HomeKit microphone path, Apple Home doorbell accessory, and pickup-safety
-> controls are provided by the companion
-> [ABB HA Doorbell Scrypted plugin][scrypted-bridge].
-
-| Goal | Use |
-|---|---|
-| Door buttons, HA cameras, ring events, SIP/RTP media, talkback services | This Home Assistant integration |
-| Import ABB stations into Apple Home as full HomeKit doorbells | [ABB HA Doorbell Scrypted plugin][scrypted-bridge] |
-| HomeKit microphone / two-way audio | Scrypted plugin, backed by HA talkback services |
-| Apple TV/Home Hub preview blocking | Scrypted plugin **HomeKit Pickup Safety** |
-| Basic one-way HomeKit camera only | HA native HomeKit bridge, if you do not need talkback |
-
-```mermaid
-flowchart LR
-    Door[ABB Welcome door station] -->|SIP INVITE ring| HA[Home Assistant integration]
-    HA -->|ring event + camera entities + talkback services| Scrypted[Scrypted plugin]
-    Scrypted -->|Doorbell accessory| HomeKit[Apple Home]
-    HomeKit -->|live view + microphone| Scrypted
-    Scrypted -->|PCM talkback services| HA
-    HA -->|PCMA/G.711 RTP| Door
-
-    TV[Apple TV / Home Hub preview] -. optional local preview .-> Scrypted
-    Scrypted -. HomeKit Pickup Safety can block local preview .-> TV
-```
-
-Recommended setup:
-
-1. Install and configure this HA integration.
-2. Confirm the HA camera stream works by turning on
-   `switch.<gateway>_streaming_enabled` and opening a camera.
-3. Install the [Scrypted plugin][scrypted-bridge].
-4. In the Scrypted plugin settings, enter:
-   - **Home Assistant URL**
-   - **Home Assistant Token** (a long-lived access token)
-5. Leave **Primary Door Station** blank unless you want a specific station to
-   keep the existing `front-door` HomeKit identity.
-6. Add the Scrypted doorbells to Scrypted's HomeKit plugin.
-7. Keep Scrypted HomeKit **Transcode Video** and **Transcode Audio** enabled.
-   The plugin enables them automatically, but they should stay on for reliable
-   Home app video and audio.
-
-The Scrypted plugin discovers HA camera entities, station ids, ring state,
-snapshot image data, the streaming switch, and each camera's `lan_rtsp_url`.
-When HA reloads or moves the LAN RTSP proxy to another port, it fires
-`abb_welcome_discovery_changed`; Scrypted listens for that event and refreshes
-without subscribing to every HA entity.
-
-### Doorbell Ring Flow
-
-The intended Apple Home flow is:
-
-1. Someone presses a door station.
-2. HA receives the local SIP `INVITE`.
-3. HA fires `abb_welcome_ring` and updates the ring binary sensor.
-4. Scrypted turns that into a HomeKit doorbell notification.
-5. If the user opens the Home notification or live view, Scrypted asks HA for the
-   matching stream.
-6. HA accepts the pending incoming call for that station, or proactively dials
-   the station for manual live view.
-7. HomeKit receives video/audio, and HomeKit microphone audio is sent back
-   through HA talkback services.
-
-Receiving the ring does **not** answer the intercom by itself. HA only arms the
-stream. The call is accepted when a real stream consumer opens the camera.
-
-### Allow Pickup
-
-`switch.<gateway>_allow_pickup` controls whether HA/Scrypted/HomeKit may answer
-an incoming ringing call.
-
-- **On**: an incoming ring arms streaming for that station. Opening the matching
-  camera from HomeKit can pick up the ringing call.
-- **Off**: an incoming ring force-disarms streaming. HA still reports the ring,
-  but it refuses HomeKit/Scrypted pickup so phones and indoor stations can
-  answer safely.
-
-This is independent from manual proactive streaming. You can still turn on
-`Streaming enabled` and open a camera outside a ring.
-
-### Apple TV / Home Hub Preview
-
-Apple TV and some Home Hubs may open a local preview immediately after a
-doorbell ring. ABB Welcome intercom media is exclusive, so an automatic preview
-can occupy the call before a person answers.
-
-If Apple Home uses an Apple TV or Home Hub:
-
-- Configure **HomeKit Pickup Safety** in the Scrypted plugin.
-- Assign the Apple TV/Home Hub a fixed LAN IP if possible.
-- Enter that IP in Scrypted's **Apple TV / Home Hub IPs** setting if you want
-  automatic local previews blocked.
-- Leave the IP field blank if you do not want preview blocking.
-- Do not enable Scrypted Rebroadcast or Prebuffer for ABB doorbells.
-
-The Scrypted block only rejects matching **local** HomeKit preview requests
-during the ring window. Manual Home app viewing and remote viewing through the
-same Home Hub remain allowed.
-
-## Entities
-
-The integration creates one HA device for the gateway.
-
-For each unlock-capable outdoor station:
-
-- `button.<gateway>_<door_name>` - unlocks that station.
-- `camera.<gateway>_<door_name>` - live intercom stream for that station.
-
-Gateway-level entities:
-
-- `switch.<gateway>_streaming_enabled` - arms stream startup for a short window.
-  Turning it off tears down active streams/calls.
-- `switch.<gateway>_allow_pickup` - allows or refuses incoming-call pickup.
-- `binary_sensor.<gateway>_intercom_ringing` - turns on briefly when a SIP ring
-  is observed.
-- `image.<gateway>_latest_screenshot` - latest gateway screenshot from event
-  history.
-- `event.<gateway>_intercom` - ring / call / door-open event entity.
-- `sensor.<gateway>_last_event` - latest non-screenshot portal event.
-- `sensor.<gateway>_sip_listener` - diagnostic state for the realtime SIP
-  listener.
-- `button.<gateway>_refresh_events` - manually poll portal event history.
-
-Unlock example:
-
-```yaml
-service: button.press
-target:
-  entity_id: button.abb_welcome_outdoor_1
-```
-
-## Streaming
-
-ABB intercom media is exclusive, so live streams are gated.
-
-Manual stream:
-
-1. Turn on `switch.<gateway>_streaming_enabled`.
-2. Open the desired `camera.<gateway>_<door_name>` within the armed window.
-3. HA dials the selected station and passes H.264 video plus PCMA/G.711 audio to
-   go2rtc/WebRTC and to Scrypted/HomeKit.
-
-Turning off `switch.<gateway>_streaming_enabled` immediately disarms streaming
-and closes active stream sessions.
-
-The switch exposes useful attributes:
-
-- `reason`: why streaming is armed (`manual`, `ring`, etc.).
-- `target_station_id`: station id allowed during a ring-scoped arm.
-- `remaining_seconds`: time left in the arm window.
-
-You can also arm streaming from an automation:
-
-```yaml
-service: abb_welcome.arm_streaming
-data:
-  station_id: "100000001"
-  duration: 60
-```
-
-## Talkback
-
-HA exposes talkback as services for the currently active stream. These services
-are mainly intended for the Scrypted plugin.
-
-- `abb_welcome.talk_start`
-- `abb_welcome.talk_stop`
-- `abb_welcome.talk_pcm16le`
-- `abb_welcome.talk_tone`
-
-The audio format for `talk_pcm16le` is base64-encoded 8 kHz mono signed 16-bit
-little-endian PCM. HA converts it to continuous PCMA/G.711 A-law RTP on the
-active call's audio leg. Idle talkback sends silence continuously, and voice
-frames are queued into the same RTP sequence.
-
-Scrypted assigns a per-client `talkback_session_id` so stale clients cannot stop
-or overwrite a newer microphone session.
-
-## Scrypted RTSP Endpoint
-
-Scrypted needs a LAN-reachable RTSP URL. HA's bundled go2rtc RTSP listener is
-localhost-only, so this integration exposes it through a small LAN TCP proxy.
-
-Port selection starts at:
-
-```text
-rtsp://<home-assistant-lan-ip>:18556/<go2rtc_stream>
-```
-
-Each camera exposes:
-
-- `go2rtc_stream`: the stream name, such as `abb_100000001`.
-- `lan_rtsp_url`: the complete URL Scrypted should use.
-- `lan_rtsp_proxy_port`: the selected proxy port.
-- `lan_rtsp_proxy_running`: whether the proxy is running.
-
-On setup/reload, the integration tries the saved preferred port first. If that
-port is occupied, it scans upward from `18556`, starts on the first free port,
-and persists the new port in the config entry options. This avoids requiring a
-hard-coded reserved port.
-
-After camera entities load, HA fires `abb_welcome_discovery_changed` with the
-current proxy host, port, running state, and change reason. The Scrypted plugin
-uses that event to refresh its station list and RTSP URLs.
-
-## Services
-
-- `abb_welcome.refresh_doors` - re-read outdoor stations from the gateway admin
-  CGI and reload the entry if the list changed.
-- `abb_welcome.arm_streaming` - arm streaming for all stations or one
-  `station_id`.
-- `abb_welcome.talk_start` - start sending queued microphone audio on the active
-  stream.
-- `abb_welcome.talk_stop` - stop voice audio and return the talkback leg to
-  silence.
-- `abb_welcome.talk_pcm16le` - queue base64 PCM16LE microphone audio.
-- `abb_welcome.talk_tone` - send a short generated tone for testing.
-- `abb_welcome.export_credentials` - export stored SIP/gateway credentials to a
-  JSON file for local debugging. This output contains secrets.
-
-## Realtime Ring Event
-
-Every incoming SIP ring fires `abb_welcome_ring` on the Home Assistant event bus.
-
-Example payload:
-
-```json
-{
-  "caller_uri": "sip:100000001@ipgw6cce7a2bb673;user=phone",
-  "caller_user": "100000001",
-  "station_id": "100000001",
-  "station": "Outdoor 1",
-  "station_name": "Outdoor 1",
-  "call_id": "1293890397@192.168.178.112",
-  "received_at": 1777723346.1623127
-}
-```
-
-Automation example:
-
-```yaml
-condition:
-  - condition: template
-    value_template: "{{ trigger.event.data.station_id == '100000001' }}"
-```
-
-## Options
-
-Open the integration's **Configure** menu to change behavior after setup.
-
-Options:
-
-- **Unlock strategy**
-- **Advertised Home Assistant LAN host**: blank means auto-detect.
-- **Preferred LAN RTSP proxy port**: tried first; HA falls back to another free
-  port if it is occupied.
-- **Allow pickup from streams**: default for the `Allow pickup` switch.
-
-### Unlock Strategy
-
-| Strategy | What it does | When to use |
+| Opción | Por defecto | Para qué sirve |
 |---|---|---|
-| **Hybrid** *(default)* | Plain SIP `MESSAGE` for the first outdoor station, `INVITE`-then-`MESSAGE` for the rest. | Best of both worlds on most setups. |
-| **Fast** | Plain SIP `MESSAGE` for every door. | Lowest latency. Some gateways do not accept a `MESSAGE` without an active call session. |
-| **Standard** | `INVITE` to bring the call up, then `MESSAGE`, then `BYE`. | Most compatible. Adds roughly 1-2 seconds per unlock. |
+| `panel_audio` | Activado | Publica el audio del portero en el flujo local. Desactívalo si go2rtc se comporta mal con el audio y prefieres vídeo solo. |
+| `device_type` | Autodetectado | Marca la estación como panel WiFi, lo que activa la ruta de descifrado. |
+| `allow_pickup` | — | Permite descolgar la llamada desde HA. |
+| `lan_rtsp_host` / `lan_rtsp_port` | — | Proxy RTSP en la LAN para Scrypted, HomeKit o un NVR. |
 
-If a door does not open with Hybrid, switch to **Standard** first. If every door
-works with **Fast**, you can leave it there for the lowest-latency setup.
+---
 
-## Troubleshooting
+## Uso
 
-- **Cannot reach the gateway web admin on HTTPS port 443**: check the gateway IP
-  and that Home Assistant can route to it.
-- **Invalid portal credentials**: the MyBuildings portal rejected the username or
-  password.
-- **Gateway admin password is wrong**: log into `https://<gateway-ip>/` manually
-  as `admin` to confirm the password.
-- **Could not read the gateway's portal UUID**: fill in **Gateway Portal UUID**
-  manually and retry.
-- **The gateway did not see our pairing request**: retry pairing; the
-  portal-to-gateway link may have been briefly delayed.
-- **A door does not open**: try **Standard** unlock strategy.
-- **WebRTC says `wrong response on DESCRIBE`**: turn on `Streaming enabled` and
-  open the camera within the armed window.
-- **Camera has video but no audio**: confirm you are on a current version and
-  that the stream includes the PCMA/G.711 audio track.
-- **HomeKit has video but no microphone**: add the doorbells through the
-  [Scrypted plugin][scrypted-bridge], not only through HA's native HomeKit
-  bridge.
-- **Apple TV opens a preview by itself**: configure Scrypted **HomeKit Pickup
-  Safety**, enter the Apple TV/Home Hub fixed LAN IP, and keep
-  Rebroadcast/Prebuffer disabled for ABB doorbells.
-- **Scrypted cannot load stream after HA reload**: click **Refresh Discovery** in
-  the Scrypted plugin, or check the camera `lan_rtsp_url` attribute.
+### Ver la cámara
 
-## Tested Hardware
+La entidad de cámara aparece como `camera.puerta_<id_estacion>`. El flujo se
+abre bajo demanda: cuando llaman al timbre, o cuando armas el streaming
+manualmente con el interruptor de la estación o con el servicio
+`abb_welcome.arm_streaming`.
 
-- **ABB 83342 IP Gateway**, firmware `ASM04_GW_V6.25_20250513_MP_TIDM365`,
-  system type `mrange`, 3 outdoor stations.
+### Abrir la puerta
 
-Reports for other models and firmware versions are welcome.
+**El botón de abrir puerta no funciona hasta que suene el timbre por primera
+vez.** Esto es esperado, no es un fallo de configuración.
 
-## License
+Los gateways IP normales publican la lista de estaciones exteriores, pero los
+paneles WiFi no exponen las secciones `outdoorstation_*`, así que la
+integración no tiene forma de saber a qué dirección SIP hay que mandar la orden
+de apertura hasta que el propio panel se identifica.
 
-MIT - see [LICENSE](LICENSE).
+Qué ocurre exactamente:
 
-[scrypted-bridge]: https://github.com/rankjie/abb-ha-doorbell
+1. Tras el alta, aparece un botón **Abrir puerta** provisional. Si lo pulsas,
+   no abre nada: lanza un aviso pidiéndote que toques el timbre primero.
+2. En la primera llamada entrante, la integración lee la dirección SIP de la
+   estación de la cabecera `From` del INVITE y la guarda de forma permanente.
+3. Cinco segundos después termina la llamada, la integración se recarga sola y
+   el botón provisional se sustituye por el definitivo, ya con el nombre real
+   de la estación: **Puerta (100000001)**.
+
+La espera de cinco segundos es deliberada, para no cortar el vídeo ni el audio
+en mitad de la llamada que acaba de disparar el descubrimiento.
+
+A partir de ahí el botón queda operativo para siempre, también fuera de
+llamada. El dato sobrevive a reinicios; solo se volvería a perder si eliminas y
+vuelves a añadir la integración.
+
+En el registro lo confirmas con:
+
+```
+WiFi panel: discovered outdoor station from incoming call: uri=... user=100000001 clean_address=sip:100000001@...
+```
+
+### Hablar por el portero (sin HTTPS)
+
+Esta es la ruta que funciona en cualquier instalación, incluida HTTP. Requiere
+que el flujo de la cámara esté abierto.
+
+**Tono de prueba** — lo más rápido para verificar que el altavoz responde:
+
+```yaml
+service: abb_welcome.talk_tone
+data:
+  entity_id: camera.puerta_100000001
+  duration_ms: 1200
+  frequency_hz: 880
+  amplitude: 0.35
+```
+
+**Enviar audio propio** (por ejemplo, un mensaje de TTS):
+
+```yaml
+- service: abb_welcome.talk_start
+  data:
+    entity_id: camera.puerta_100000001
+
+- service: abb_welcome.talk_pcm16le
+  data:
+    entity_id: camera.puerta_100000001
+    pcm16le: !secret audio_en_base64   # PCM 16 bits little-endian, 8 kHz mono
+
+- service: abb_welcome.talk_stop
+  data:
+    entity_id: camera.puerta_100000001
+```
+
+El audio debe ser **PCM 16 bits little-endian, mono, 8000 Hz**, codificado en
+base64. Para convertir un fichero:
+
+```bash
+ffmpeg -i mensaje.mp3 -ar 8000 -ac 1 -f s16le - | base64 -w0
+```
+
+### Hablar desde la tarjeta de cámara (requiere HTTPS)
+
+La integración expone un **backchannel ONVIF** (`Require:
+www.onvif.org/ver20/backchannel`) en su servidor RTSP interno, que es
+exactamente lo que go2rtc espera para el audio bidireccional. Cuando un cliente
+lo pide, el SDP incluye una tercera sección de medios marcada `a=sendonly`.
+
+Para usarlo hacen falta dos cosas que **no dependen de esta integración**:
+
+1. **Acceso a Home Assistant por HTTPS.** Los navegadores no dan acceso al
+   micrófono en conexiones sin cifrar, y esto incluye la aplicación móvil. Es
+   una restricción del navegador, no hay forma de saltársela.
+2. **Una tarjeta con botón de micrófono.** Las tarjetas nativas de Home
+   Assistant no soportan audio bidireccional. Opciones conocidas:
+
+```yaml
+# Opción A: WebRTC Camera (AlexxIT), vía HACS
+type: custom:webrtc-camera
+url: abb_100000001        # nombre del stream en go2rtc, NO la entidad
+mode: webrtc
+media: video,audio,microphone
+ui: true
+```
+
+```yaml
+# Opción B: Advanced Camera Card
+type: custom:advanced-camera-card
+cameras:
+  - camera_entity: camera.puerta_100000001
+live_provider: go2rtc
+go2rtc:
+  modes: [webrtc]
+menu:
+  buttons:
+    microphone:
+      enabled: true
+```
+
+El nombre del stream en go2rtc es `abb_<id_estacion>`; aparece en el registro
+como `registered go2rtc stream abb_100000001`.
+
+---
+
+## Servicios disponibles
+
+| Servicio | Descripción |
+|---|---|
+| `abb_welcome.talk_start` | Abre el canal de subida hacia el portero. |
+| `abb_welcome.talk_stop` | Cierra el canal de subida. |
+| `abb_welcome.talk_pcm16le` | Envía audio PCM 16 bits LE, 8 kHz mono, en base64. |
+| `abb_welcome.talk_tone` | Envía un tono generado, para pruebas. |
+| `abb_welcome.arm_streaming` | Arma el streaming durante una ventana de tiempo. |
+| `abb_welcome.refresh_doors` | Relee la lista de estaciones desde el gateway. |
+| `abb_welcome.export_credentials` | Vuelca credenciales a un JSON. **Contiene secretos.** |
+
+---
+
+## Diagnóstico
+
+Activa el registro detallado:
+
+```yaml
+logger:
+  logs:
+    custom_components.abb_welcome: debug
+```
+
+Líneas que confirman que todo va bien:
+
+```
+video payload decryption active
+audio leg pt=8 codec=PCMA/8000 encrypted=True
+talkback RTP leg ready -> 192.168.1.16:50688 pt=8 encrypted=True
+media stats ... audio pkts=10973 pts={8: 10973} decrypted=10973 dropped_pts={}
+NAL summary ... SPS=True PPS=True IDR=True decrypted=3880 decrypt_failed=0
+```
+
+Y para el backchannel:
+
+```
+DESCRIBE returning SDP ... backchannel_requested=True backchannel_offered=True
+SETUP ... url=.../trackID=2 backchannel=True bc_channel=4
+backchannel audio started pt=8
+```
+
+Si ves `backchannel_offered=True` pero nunca un `SETUP` del `trackID=2`,
+significa que el cliente no pidió el canal: casi siempre porque el navegador no
+tiene micrófono disponible por falta de HTTPS.
+
+### Problemas frecuentes
+
+**El botón de abrir puerta da error.** Si el mensaje dice que no se ha
+descubierto la estación exterior, toca el timbre una vez y espera unos segundos
+a que la integración se recargue sola. Ver la sección «Abrir la puerta».
+
+**No hay imagen y `decrypt_failed` es alto.** La clave del SDP no coincide.
+Revisa la línea `a=crypto` en el registro.
+
+**El audio se oye acelerado o entrecortado.** Comprueba `dropped_pts` en las
+estadísticas: si aparecen tipos distintos del negociado, el panel está
+intercalando otro códec.
+
+**Chasquido al inicio del talkback.** Son los `underrun_packets` mientras se
+llena el búfer. Es normal en los primeros paquetes.
+
+---
+
+## Limitaciones conocidas
+
+- El talkback se probó con tono generado y con PCM corto. La voz continua puede
+  comportarse distinto; los contadores `underrun_packets` y `dropped_frames` de
+  `talkback stats` son el sitio donde mirar.
+- El backchannel ONVIF está verificado contra un cliente RTSP simulado que
+  reproduce la secuencia de go2rtc, pero no contra un navegador real con
+  micrófono.
+- El descubrimiento del cifrado se validó en un panel concreto. Otros modelos
+  podrían usar una variante distinta.
+
+---
+
+## Créditos
+
+Trabajo original de [@rankjie](https://github.com/rankjie/ha-abb-welcome). El
+análisis del cifrado RTP de los paneles WiFi y la ruta de audio bidireccional
+son añadidos de esta versión.
+
+## Licencia
+
+MIT, la misma que el proyecto original. El fichero `LICENSE` conserva el aviso
+de copyright de rankjie, como exige la propia licencia.

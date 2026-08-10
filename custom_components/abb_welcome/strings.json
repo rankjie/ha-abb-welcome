@@ -3,6 +3,13 @@
     "step": {
       "user": {
         "title": "ABB Welcome",
+        "description": "Select your ABB Welcome device type.",
+        "data": {
+          "device_type": "Device Type"
+        }
+      },
+      "ip_gateway": {
+        "title": "ABB Welcome IP Gateway",
         "description": "Pair this Home Assistant instance with your ABB Welcome IP gateway.\n\nRequired fields:\n• MyBuildings portal username and password (same as the official ABB Welcome mobile app).\n• Gateway local IP address.\n• Gateway web admin password (the one used at https://gateway-ip/).\n\nOptional:\n• Gateway Portal UUID — only fill this in if the automatic setup fails (some firmware versions have a broken portal-client endpoint). You can find this value in the gateway web admin under the Portal page (label “Portal Client UUID”), or in the ABB Welcome mobile app settings. Leave blank otherwise.\n\nAfter you submit, the integration finishes pairing automatically — no need to open the gateway web admin yourself.",
         "data": {
           "abb_username": "Portal Username",
@@ -11,6 +18,20 @@
           "gateway_password": "Gateway Admin Password",
           "gateway_uuid_override": "Gateway Portal UUID (optional)"
         }
+      },
+      "wifi_panel": {
+        "title": "ABB Welcome 4.3 WiFi Panel",
+        "description": "Pair this Home Assistant instance with your ABB Welcome 4.3 WiFi panel (experimental).\n\nThe WiFi panel has no web admin interface. Pairing is completed on the panel's touchscreen.\n\nRequired fields:\n• MyBuildings portal username and password (same as the official ABB Welcome mobile app).\n• WiFi panel local IP address.\n\nOptional:\n• Gateway Portal UUID — only fill this in if the automatic discovery fails. You can find this value in the ABB Welcome mobile app settings or in the panel's system settings. Leave blank to auto-detect.\n\nAfter you submit, the integration will send a pairing request. You will then need to approve it on the WiFi panel touchscreen.",
+        "data": {
+          "abb_username": "Portal Username",
+          "abb_password": "Portal Password",
+          "gateway_ip": "WiFi Panel IP Address",
+          "gateway_uuid_override": "Gateway Portal UUID (optional)"
+        }
+      },
+      "wifi_approve": {
+        "title": "Approve pairing on the WiFi panel",
+        "description": "A pairing request has been sent to your ABB Welcome WiFi panel at {gateway_ip}.\n\nPlease approve the pairing on the panel touchscreen:\n\n1. On the WiFi panel, go to **System Settings** → **APP Settings**.\n2. Find the pending app named:\n\n    **{client_name}**\n\n3. Select it and enter the integrity code when prompted:\n\n    **{integrity_code}**\n\n4. Confirm / Approve on the panel.\n5. Click **Submit** below to continue.\n\nHome Assistant will wait up to 5 minutes for the panel to confirm the pairing."
       },
       "manual_authorize": {
         "title": "Approve pairing on the gateway",
@@ -24,7 +45,7 @@
     "error": {
       "cannot_connect": "Cannot reach the gateway web admin on HTTPS port 443. Check the IP address and that Home Assistant is on the same network.",
       "invalid_auth": "Invalid portal credentials.",
-      "gateway_not_found": "No IP gateway is visible to this portal account.",
+      "gateway_not_found": "No gateway is visible to this portal account. If using a WiFi panel, ensure the panel is connected to MyBuildings.",
       "gateway_admin_auth_failed": "Gateway admin password is wrong (login at https://gateway-ip/ as `admin` failed).",
       "no_pending_app": "The gateway did not see our pairing request. Try again or check that the portal account is linked to this gateway.",
       "integrity_code_rejected": "The gateway rejected the integrity code we computed. Open an issue with your gateway firmware version.",
@@ -35,8 +56,8 @@
     },
     "abort": {
       "already_configured": "This gateway is already configured.",
-      "acl_timeout": "The gateway did not push a configuration after pairing. Try again.",
-      "acl_parse_failed": "The gateway sent a configuration but it could not be parsed. Check the Home Assistant log.",
+      "acl_timeout": "The device did not push a configuration after pairing. Try again. If using a WiFi panel, make sure you approved the pairing on the panel touchscreen.",
+      "acl_parse_failed": "The device sent a configuration but it could not be parsed. Check the Home Assistant log.",
       "unknown": "Unexpected error during ACL polling — see the Home Assistant log."
     }
   },
@@ -49,12 +70,19 @@
           "unlock_strategy": "Unlock strategy",
           "lan_rtsp_host": "Advertised Home Assistant LAN host (blank = auto)",
           "lan_rtsp_port": "Preferred LAN RTSP proxy port",
-          "allow_pickup": "Allow pickup from streams"
+          "allow_pickup": "Allow pickup from streams",
+          "panel_audio": "Publish door station audio on the local stream"
         }
       }
     }
   },
   "selector": {
+    "device_type": {
+      "options": {
+        "ip_gateway": "IP Gateway (ABB 83342 or similar, with web admin)",
+        "wifi_panel": "WiFi Panel 4.3\" (M22401-W, no web admin) — experimental"
+      }
+    },
     "unlock_strategy": {
       "options": {
         "hybrid": "Hybrid (fast for first door, standard for others) — recommended",

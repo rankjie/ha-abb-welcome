@@ -1,7 +1,5 @@
 {
-  "name": "ABB Welcome",
+  "name": "ABB Welcome (WiFi panel support)",
   "render_readme": true,
-  "country": ["DE", "NL", "BE", "FR", "IT", "ES", "GB"],
-  "homeassistant": "2024.1.0",
-  "zip_release": false
+  "homeassistant": "2024.11.0"
 }

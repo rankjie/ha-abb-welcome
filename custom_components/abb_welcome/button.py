@@ -10,7 +10,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import CONF_DEVICE_TYPE, DEVICE_TYPE_WIFI_PANEL, DOMAIN
 from .coordinator import ABBWelcomeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -51,12 +51,47 @@ async def async_setup_entry(
     coordinator: ABBWelcomeCoordinator | None = data.get("coordinator")
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
     doors = entry.data.get("doors", [])
+    device_type = entry.data.get(CONF_DEVICE_TYPE, "ip_gateway")
 
     entities: list[ButtonEntity] = [
         ABBWelcomeDoorButton(sip_client, door, gateway_uuid, entry.entry_id)
         for door in doors
         if _door_can_unlock(door)
     ]
+
+    # WiFi panels without outdoorstation_* sections get a generic
+    # door-open button.  The outdoor station SIP URI is discovered
+    # dynamically from the first incoming call (see __init__.py).
+    if device_type == DEVICE_TYPE_WIFI_PANEL and not entities:
+        discovered_station = entry.data.get("discovered_outdoor_station")
+        if discovered_station and discovered_station.get("address"):
+            # Reconstruct a clean SIP address without ;user=phone or
+            # ;transport=tls parameters that may have come from the
+            # incoming INVITE From header.
+            station_id = discovered_station.get("station_id", "")
+            sip_domain = entry.data.get("sip_domain", "")
+            if station_id and sip_domain:
+                clean_address = f"sip:{station_id}@{sip_domain}"
+            else:
+                clean_address = discovered_station["address"]
+            door = {
+                "name": discovered_station.get("name", "Abrir puerta"),
+                "address": clean_address,
+                "station_id": station_id,
+                "body": "1",
+                # No index: let hybrid strategy use the invite/standard
+                # flow (TLS) instead of fast TCP MESSAGE, which is safer
+                # for WiFi panels.
+            }
+            entities.append(
+                ABBWelcomeDoorButton(sip_client, door, gateway_uuid, entry.entry_id)
+            )
+        else:
+            # Show a placeholder button that will work once a call is received
+            entities.append(
+                ABBWelcomeWifiDoorButton(sip_client, gateway_uuid, entry.entry_id)
+            )
+
     if coordinator is not None and coordinator.has_certs:
         entities.append(ABBWelcomeRefreshButton(coordinator, gateway_uuid))
     async_add_entities(entities)
@@ -90,6 +125,44 @@ class ABBWelcomeDoorButton(ButtonEntity):
             raise HomeAssistantError(
                 f"Failed to unlock door: {self._attr_name}"
             )
+
+
+class ABBWelcomeWifiDoorButton(ButtonEntity):
+    """Generic door-open button for WiFi panels.
+
+    Shown when no outdoor station has been discovered yet.  Once a call
+    is received from the outdoor station, the config entry is updated
+    with the discovered SIP URI and this button is replaced by a
+    standard ABBWelcomeDoorButton.
+    """
+
+    _attr_icon = "mdi:door-open"
+    _attr_has_entity_name = True
+    _attr_name = "Abrir puerta"
+
+    def __init__(self, sip_client, gateway_uuid: str, entry_id: str) -> None:
+        self._sip_client = sip_client
+        self._entry_id = entry_id
+        self._attr_unique_id = f"{gateway_uuid}_wifi_door_open"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, gateway_uuid)},
+            name="ABB Welcome Gateway",
+            manufacturer="ABB / Busch-Jaeger",
+            model="WiFi Panel 4.3\"",
+        )
+
+    async def async_press(self) -> None:
+        """Try to unlock the door using any discovered station."""
+        _LOGGER.warning(
+            "[abb] WiFi door button pressed but no outdoor station discovered "
+            "yet. Ring the doorbell first so the panel can learn the outdoor "
+            "station SIP address, then press this button again."
+        )
+        raise HomeAssistantError(
+            "Aún no se ha descubierto la estación exterior. Toca el timbre "
+            "primero para que el panel aprenda la dirección SIP del portero, "
+            "luego vuelve a pulsar este botón."
+        )
 
 
 class ABBWelcomeRefreshButton(ButtonEntity):

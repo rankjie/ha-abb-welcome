@@ -369,11 +369,44 @@ def discover_gateway(
         except (ValueError, UnicodeDecodeError) as err:
             raise PortalError(f"Could not decode discovery payload: {err}") from err
 
+        # Log all discovered entries for diagnostics (especially useful for
+        # WiFi panel support where the device type may differ).
+        for uid, info in entries.items():
+            _log(logging.DEBUG,
+                "Discovery entry: uid=%s type=%s name=%s",
+                uid, info.get("type"), info.get("name"),
+            )
+
+        # Prefer the known gateway type, but fall back to any entry that
+        # looks like a gateway/controller (WiFi panels may use a different
+        # type string).
         for uid, info in entries.items():
             if info.get("type") == GATEWAY_CLIENT_TYPE:
                 return uid, repair_utf8_mojibake(
                     str(info.get("name") or "ABB Welcome Gateway")
                 )
+        # Fallback: if there is exactly one non-client entry, use it.
+        # If there are multiple, we cannot safely pick one.
+        non_client = [
+            (uid, info)
+            for uid, info in entries.items()
+            if info.get("type") != CLIENT_TYPE
+        ]
+        if len(non_client) == 1:
+            uid, info = non_client[0]
+            return uid, repair_utf8_mojibake(
+                str(info.get("name") or "ABB Welcome Gateway")
+            )
+        if len(non_client) > 1:
+            details = "; ".join(
+                f"{uid} (type={info.get('type')}, name={info.get('name')})"
+                for uid, info in non_client
+            )
+            raise PortalError(
+                "Multiple gateway candidates found in discovery event. "
+                f"Please specify the Gateway Portal UUID manually. "
+                f"Candidates: {details}"
+            )
         raise PortalError(
             "Discovery event has no gateway entry "
             f"(type={GATEWAY_CLIENT_TYPE} not found)"
@@ -491,13 +524,21 @@ def parse_acl_update(
     ``name``, ``address``, ``station_id``, and optional station metadata.
     """
     _log(logging.INFO, "Parsing ACL-update payload (%d bytes)", len(payload))
+    # Log the raw payload content at DEBUG level for protocol debugging,
+    # especially for WiFi panel support where the format may differ.
+    _log(logging.DEBUG, "ACL-update raw payload (first 2000 chars):\n%s", payload[:2000])
     lines = payload.splitlines()
     if not lines:
         raise PortalError("Empty ACL-update payload")
 
+    _log(logging.DEBUG, "ACL-update payload has %d lines", len(lines))
+    _log(logging.DEBUG, "ACL-update line[0] (encrypted_b64, first 100 chars): %s", lines[0][:100])
+
     encrypted_b64 = lines[0].strip()
     # The gateway pads the payload with NUL bytes — strip them before parsing.
     rest = "\n".join(lines[1:]).replace("\x00", "").rstrip()
+
+    _log(logging.DEBUG, "ACL-update INI body (first 2000 chars):\n%s", rest[:2000])
 
     priv = serialization.load_pem_private_key(private_key_pem, password=None)
     try:
@@ -505,6 +546,8 @@ def parse_acl_update(
             base64.b64decode(encrypted_b64), padding.PKCS1v15()
         ).decode().strip()
     except Exception as err:  # noqa: BLE001
+        _log(logging.ERROR, "SIP password decryption failed: %s", err)
+        _log(logging.DEBUG, "First 200 chars of line[0] that failed decryption: %s", lines[0][:200])
         raise PortalError(f"SIP password decryption failed: {err}") from err
     _log(logging.INFO, "SIP password decrypted (%d chars; value redacted)", len(sip_password))
 
@@ -512,13 +555,19 @@ def parse_acl_update(
     try:
         config.read_string(rest)
     except configparser.Error as err:
+        _log(logging.ERROR, "Could not parse ACL-update INI body: %s", err)
+        _log(logging.DEBUG, "INI body that failed to parse (first 2000 chars):\n%s", rest[:2000])
         raise PortalError(f"Could not parse ACL-update INI body: {err}") from err
+
+    _log(logging.DEBUG, "ACL-update INI sections found: %s", config.sections())
 
     sip_domain = (
         config.get("network", "domain", fallback="")
         if config.has_section("network")
         else ""
     )
+
+    _log(logging.DEBUG, "ACL-update sip_domain=%r, has network section=%s", sip_domain, config.has_section("network"))
 
     doors: list[dict[str, Any]] = []
     for sec in config.sections():
@@ -546,8 +595,23 @@ def parse_acl_update(
     for d in doors:
         _log(logging.DEBUG, "  door: %s -> %s", d["name"], d["address"])
 
-    if not sip_domain or not doors:
-        raise PortalError("ACL-update payload missing network domain or doors")
+    if not sip_domain:
+        _log(logging.WARNING,
+            "ACL-update missing network domain. "
+            "All INI sections: %s. INI body (first 2000 chars): %.2000s",
+            config.sections(), rest,
+        )
+        raise PortalError("ACL-update payload missing network domain")
+    if not doors:
+        # WiFi panels may not include outdoorstation_* sections in the
+        # ACL-update payload.  Log the full INI so we can see what sections
+        # are present, and return an empty door list instead of failing.
+        _log(logging.WARNING,
+            "ACL-update has no outdoorstation_* sections (0 doors). "
+            "This may be normal for WiFi panels. "
+            "All INI sections: %s. Full INI body:\n%s",
+            config.sections(), rest[:3000],
+        )
     return sip_password, sip_domain, doors
 
 

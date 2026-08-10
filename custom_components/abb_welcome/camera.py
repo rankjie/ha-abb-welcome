@@ -56,11 +56,20 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, GO2RTC_RTSP_HOST, GO2RTC_RTSP_PORT
+from .const import (
+    CONF_DEVICE_TYPE,
+    CONF_PANEL_AUDIO,
+    DEFAULT_PANEL_AUDIO,
+    DEVICE_TYPE_WIFI_PANEL,
+    DOMAIN,
+    GO2RTC_RTSP_HOST,
+    GO2RTC_RTSP_PORT,
+)
 from .intercom_dialer import Door, IntercomDialer
-from .media_pipeline import StreamSession
+from .media_pipeline import StreamSession, rtp_header_length
 from .rtsp_server import (
     AUDIO_RTP_CHANNEL,
+    BACKCHANNEL_TRACK,
     VIDEO_RTP_CHANNEL,
     RtspServer,
     RtspSession,
@@ -75,9 +84,13 @@ from .streaming_state import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# How long the uplink keeps 'talking' after the last backchannel packet.
+_BACKCHANNEL_IDLE_SECONDS = 1.0
+
 _GO2RTC_DOMAIN = "go2rtc"
 _REQUEST_TIMEOUT = ClientTimeout(total=10)
 _TEARDOWN_GRACE_SECONDS = 2.0
+_WIFI_TEARDOWN_GRACE_SECONDS = 120.0
 
 
 def _safe_key(value: str) -> str:
@@ -121,7 +134,26 @@ async def async_setup_entry(
     sip_pass = entry.data.get("sip_password")
     sip_domain = entry.data.get("sip_domain")
     gw_ip = entry.data.get("gateway_ip")
-    raw_doors = entry.data.get("doors", []) or []
+    raw_doors = list(entry.data.get("doors", []) or [])
+
+    # WiFi panel: if no doors from ACL-update, use the discovered
+    # outdoor station (captured from the first incoming call).
+    if not raw_doors and entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_WIFI_PANEL:
+        discovered = entry.data.get("discovered_outdoor_station")
+        if discovered and discovered.get("address"):
+            station_id = discovered.get("station_id", "")
+            # Reconstruct clean address without ;user=phone etc.
+            if station_id and sip_domain:
+                clean_addr = f"sip:{station_id}@{sip_domain}"
+            else:
+                clean_addr = discovered["address"]
+            raw_doors = [{
+                "name": discovered.get("name", "Portero"),
+                "address": clean_addr,
+                "station_id": station_id,
+                "body": "1",
+            }]
+
     if not (sip_user and sip_pass and sip_domain and gw_ip and raw_doors):
         return
 
@@ -154,6 +186,10 @@ async def async_setup_entry(
                 incoming_listener=data.get("sip_listener"),
                 door=door,
                 camera_index=exposed_index,
+                wifi_panel=entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_WIFI_PANEL,
+                panel_audio=bool(
+                    entry.options.get(CONF_PANEL_AUDIO, DEFAULT_PANEL_AUDIO)
+                ),
             )
             stream_coordinators[coordinator_key] = coordinator
         camera = ABBWelcomeCamera(
@@ -345,11 +381,15 @@ class StationStreamCoordinator:
         incoming_listener: object | None,
         door: Door,
         camera_index: int | None,
+        wifi_panel: bool = False,
+        panel_audio: bool = True,
     ) -> None:
         self.hass = hass
         self.entry_id = entry_id
         self.door = door
         self.camera_index = camera_index
+        self._wifi_panel = wifi_panel
+        self._panel_audio = panel_audio
         self._stream_lock = asyncio.Lock()
         self._rtsp_play_sessions: list[RtspSession] = []
         self._close_task: asyncio.Task | None = None
@@ -363,7 +403,21 @@ class StationStreamCoordinator:
             incoming_listener=incoming_listener,
             pickup_allowed=lambda: is_pickup_allowed(self.hass, self.entry_id),
             on_call_ended=self._on_gateway_call_ended,
+            wifi_panel=wifi_panel,
         )
+
+    @property
+    def panel_audio(self) -> bool:
+        """Whether the door station's audio is published on local RTSP."""
+        return self._panel_audio
+
+    @property
+    def audio_pt(self) -> int:
+        return self.session.audio_pt
+
+    @property
+    def audio_codec(self) -> str:
+        return self.session.audio_codec
 
     @property
     def active(self) -> bool:
@@ -505,8 +559,9 @@ class StationStreamCoordinator:
         )
 
     async def _delayed_close(self) -> None:
+        grace = _WIFI_TEARDOWN_GRACE_SECONDS if self._wifi_panel else _TEARDOWN_GRACE_SECONDS
         try:
-            await asyncio.sleep(_TEARDOWN_GRACE_SECONDS)
+            await asyncio.sleep(grace)
         except asyncio.CancelledError:
             return
         if self._rtsp_play_sessions:
@@ -515,6 +570,12 @@ class StationStreamCoordinator:
             if self._rtsp_play_sessions:
                 return
             if self.session.active:
+                _LOGGER.info(
+                    "[abb] stream coordinator: delayed close after %.1fs grace "
+                    "station=%s (wifi=%s)",
+                    grace, self.door.station_id or self.door.address,
+                    self._wifi_panel,
+                )
                 await self.session.close()
         self._talkback_owner = ""
         self._notify_state()
@@ -539,6 +600,12 @@ class StationStreamCoordinator:
             self._notify_state()
 
     def _forward_audio(self, packet: bytes) -> None:
+        # WiFi panel audio used to be dropped here because the encrypted
+        # payload was unusable.  It is decrypted upstream now, so it is
+        # forwarded like any other station's audio unless the user turned
+        # the panel audio track off.
+        if self._wifi_panel and not self._panel_audio:
+            return
         for client in list(self._rtsp_play_sessions):
             if not client.push_rtp(AUDIO_RTP_CHANNEL, packet):
                 self._discard_rtsp_play_session(client)
@@ -574,6 +641,23 @@ class StationStreamCoordinator:
         stats["owner"] = self._talkback_owner
         self._notify_state()
         return stats
+
+    def feed_talkback_pcma(self, pcma: bytes) -> int:
+        """Feed PCMA arriving on the ONVIF backchannel.
+
+        A service-call talkback session takes precedence: if someone claimed
+        talkback through `abb_welcome.talkback_start`, we don't let the
+        WebRTC mic scribble over it.
+        """
+        if self._talkback_owner:
+            return 0
+        return self.session.feed_talkback_pcma(pcma)
+
+    def backchannel_idle(self) -> None:
+        """Stop talking when the backchannel goes quiet."""
+        if self._talkback_owner:
+            return
+        self.session.backchannel_idle()
 
     def feed_talkback_pcm16le(
         self,
@@ -682,7 +766,12 @@ class ABBWelcomeCamera(Camera):
             on_describe=self._on_rtsp_describe,
             on_play=self._on_rtsp_play,
             on_teardown=self._on_rtsp_teardown,
+            on_backchannel=self._on_rtsp_backchannel,
         )
+        self._bc_packets = 0
+        self._bc_bad = 0
+        self._bc_last_pt: int | None = None
+        self._bc_watchdog: asyncio.TimerHandle | None = None
 
         # WebRTC session bookkeeping (one Go2RtcWsClient per HA frontend
         # session).
@@ -957,7 +1046,7 @@ class ABBWelcomeCamera(Camera):
     # RTSP server callbacks                                              #
     # ------------------------------------------------------------------ #
 
-    async def _on_rtsp_describe(self) -> str | None:
+    async def _on_rtsp_describe(self, backchannel: bool = False) -> str | None:
         armed_state = get_state(self.hass, self._entry_id)
         _LOGGER.info(
             "[abb] camera %s: DESCRIBE armed=%s target_station=%s "
@@ -993,11 +1082,18 @@ class ABBWelcomeCamera(Camera):
             self._coordinator.video_fmtp
             or "packetization-mode=1;profile-level-id=42e01f"
         )
-        # PCMA is one of the codecs WebRTC keeps in its standard menu
-        # (RFC 7874) so browsers offer it alongside Opus — verified
-        # locally with go2rtc 1.9.9: it passthroughs PCMA in the
-        # WebRTC answer when the browser advertises it (no transcode
-        # needed).  We expose it as a separate track here.
+        # The audio track is advertised whenever we can actually deliver
+        # usable audio.  For WiFi panels that now means "always, unless the
+        # user disabled it" — the payload is decrypted and the receiver
+        # drops any payload type other than the negotiated one, so go2rtc
+        # never sees the stray G729/G723/telephone-event PTs that used to
+        # make it tear the producer down.
+        wifi_panel = getattr(self._coordinator, "_wifi_panel", False)
+        audio_pt = getattr(self._coordinator, "audio_pt", 8) or 8
+        audio_codec = getattr(self._coordinator, "audio_codec", None) or "PCMA/8000"
+        skip_audio = wifi_panel and not getattr(
+            self._coordinator, "panel_audio", True
+        )
         sdp_lines = [
             "v=0",
             "o=- 0 0 IN IP4 127.0.0.1",
@@ -1009,18 +1105,119 @@ class ABBWelcomeCamera(Camera):
             f"a=rtpmap:96 {codec}",
             f"a=fmtp:96 {fmtp}",
             "a=control:trackID=0",
-            "m=audio 0 RTP/AVP 8",
-            "a=rtpmap:8 PCMA/8000",
-            "a=control:trackID=1",
-            "",
         ]
+        if not skip_audio:
+            sdp_lines.extend([
+                f"m=audio 0 RTP/AVP {audio_pt}",
+                f"a=rtpmap:{audio_pt} {audio_codec}",
+                "a=recvonly",
+                "a=control:trackID=1",
+            ])
+        # ONVIF backchannel.  Per the ONVIF Streaming Specification the
+        # server marks client-to-server media as a=sendonly (yes, it reads
+        # backwards -- the direction is named from the *client's* point of
+        # view).  We only emit this section when the client actually asked
+        # for it with the Require header, so plain RTSP consumers keep
+        # seeing exactly the two-track SDP they saw before.
+        # NOTE: deliberately *not* gated on talkback_ready.  go2rtc issues
+        # DESCRIBE about 200 ms before the SIP session finishes setting up
+        # the uplink RTP leg, so gating here would hide the backchannel on
+        # every single call.  If audio arrives before the sender exists,
+        # feed_talkback_pcma() just discards it.
+        talkback_ok = not skip_audio
+        if backchannel and talkback_ok:
+            sdp_lines.extend([
+                f"m=audio 0 RTP/AVP {audio_pt}",
+                f"a=rtpmap:{audio_pt} {audio_codec}",
+                "a=sendonly",
+                f"a=control:{BACKCHANNEL_TRACK}",
+            ])
+        sdp_lines.append("")
         _LOGGER.info(
             "[abb] camera %s: DESCRIBE returning SDP codec=%s fmtp=%s "
-            "camera_index=%s",
+            "camera_index=%s backchannel_requested=%s backchannel_offered=%s",
             self._attr_name, codec, fmtp,
             self._camera_index if self._camera_index is not None else "default",
+            backchannel, bool(backchannel and talkback_ok),
         )
         return "\r\n".join(sdp_lines) + "\r\n"
+
+    async def _on_rtsp_backchannel(
+        self, sess: RtspSession, rtp: bytes
+    ) -> None:
+        """Handle one RTP packet the client sent us on the ONVIF backchannel.
+
+        go2rtc hands us plain RTP carrying PCMA (whatever we advertised in
+        the sendonly media section).  We strip the RTP header and pass the
+        raw codec bytes straight through to the talk sender, which does the
+        ABB framing and encryption on the way out to the panel.
+        """
+        if len(rtp) < 12:
+            self._bc_bad += 1
+            return
+        hdr = rtp_header_length(rtp)
+        if hdr <= 0 or hdr >= len(rtp):
+            self._bc_bad += 1
+            return
+        pt = rtp[1] & 0x7F
+        expected = getattr(self._coordinator, "audio_pt", 8) or 8
+        if pt != expected:
+            # Comfort noise / DTMF / a codec we never offered: dropping is
+            # safer than feeding the panel bytes it will decode as static.
+            self._bc_bad += 1
+            if self._bc_bad % 100 == 1:
+                _LOGGER.debug(
+                    "[abb] camera %s: backchannel dropping pt=%s (want %s)",
+                    self._attr_name, pt, expected,
+                )
+            return
+        payload = rtp[hdr:]
+        if not payload:
+            return
+        self._bc_packets += 1
+        self._bc_last_pt = pt
+        if self._bc_packets == 1:
+            _LOGGER.info(
+                "[abb] camera %s: backchannel audio started pt=%s bytes=%d",
+                self._attr_name, pt, len(payload),
+            )
+        elif self._bc_packets % 250 == 0:
+            _LOGGER.info(
+                "[abb] camera %s: backchannel stats packets=%d bad=%d pt=%s",
+                self._attr_name, self._bc_packets, self._bc_bad, pt,
+            )
+        try:
+            self._coordinator.feed_talkback_pcma(payload)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("[abb] backchannel feed failed: %s", err)
+            return
+        self._arm_backchannel_watchdog()
+
+    def _arm_backchannel_watchdog(self) -> None:
+        """Stop talking shortly after the client's mic stops sending.
+
+        WebRTC clients just stop sending when the user releases the talk
+        button -- there is no explicit end marker -- so a short idle timer
+        is what returns the uplink to its silence stream.
+        """
+        if self._bc_watchdog is not None:
+            self._bc_watchdog.cancel()
+        loop = asyncio.get_running_loop()
+        self._bc_watchdog = loop.call_later(
+            _BACKCHANNEL_IDLE_SECONDS, self._on_backchannel_idle
+        )
+
+    def _on_backchannel_idle(self) -> None:
+        self._bc_watchdog = None
+        try:
+            self._coordinator.backchannel_idle()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("[abb] backchannel idle failed: %s", err)
+        else:
+            _LOGGER.info(
+                "[abb] camera %s: backchannel idle after %d packets",
+                self._attr_name, self._bc_packets,
+            )
 
     async def _on_rtsp_play(self, sess: RtspSession) -> None:
         if not self._stream_allowed():

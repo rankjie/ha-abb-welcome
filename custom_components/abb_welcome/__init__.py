@@ -21,6 +21,7 @@ from homeassistant.helpers.start import async_at_start
 
 from .const import (
     CONF_ALLOW_PICKUP,
+    CONF_DEVICE_TYPE,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
     CONF_UNLOCK_STRATEGY,
@@ -29,6 +30,7 @@ from .const import (
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS,
     DEFAULT_UNLOCK_STRATEGY,
+    DEVICE_TYPE_WIFI_PANEL,
     DOMAIN,
     EVENT_DISCOVERY_CHANGED,
     GO2RTC_RTSP_HOST,
@@ -208,15 +210,25 @@ def _fire_discovery_changed(
 
 
 def _build_client(entry: ConfigEntry) -> SIPClient:
+    wifi_panel = entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_WIFI_PANEL
+    # WiFi panels: the fast TCP MESSAGE path works (the panel processes
+    # the MESSAGE and opens the door, even though it responds with an
+    # INVITE instead of 200 OK).  The standard TLS invite path gets
+    # 407/403 from the panel, so force fast for WiFi.
+    if wifi_panel:
+        unlock_strategy = "fast"
+    else:
+        unlock_strategy = entry.options.get(
+            CONF_UNLOCK_STRATEGY, DEFAULT_UNLOCK_STRATEGY
+        )
     return SIPClient(
         host=entry.data["gateway_ip"],
         username=entry.data["sip_username"],
         password=entry.data["sip_password"],
         domain=entry.data["sip_domain"],
         doors=entry.data.get("doors", []),
-        unlock_strategy=entry.options.get(
-            CONF_UNLOCK_STRATEGY, DEFAULT_UNLOCK_STRATEGY
-        ),
+        unlock_strategy=unlock_strategy,
+        wifi_panel=wifi_panel,
     )
 
 
@@ -308,6 +320,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "sip_client": _build_client(entry),
         "coordinator": coordinator,
     }
+    wifi_panel = entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_WIFI_PANEL
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = entry_data
     set_pickup_allowed(
         hass,
@@ -379,6 +392,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             sensor = entry_data.get("ringing_sensor")
             if sensor is not None:
                 sensor.trigger_ring(payload)
+
+            # WiFi panel auto-discovery: when the panel has no doors
+            # (no outdoorstation_* in the ACL-update), capture the
+            # outdoor station's SIP URI from the incoming call and
+            # persist it so a door-open button can be created.
+            device_type = entry.data.get(CONF_DEVICE_TYPE, "ip_gateway")
+            if (
+                device_type == DEVICE_TYPE_WIFI_PANEL
+                and not entry.data.get("doors")
+                and not entry.data.get("discovered_outdoor_station")
+                and call.caller_uri
+                and call.caller_user
+            ):
+                sip_domain = entry.data.get("sip_domain", "")
+                # Build a clean SIP address without ;transport=tls to
+                # avoid duplication when sip_client appends it later.
+                clean_address = f"sip:{call.caller_user}@{sip_domain}" if sip_domain else call.caller_uri
+                _LOGGER.warning(
+                    "[abb] WiFi panel: discovered outdoor station from "
+                    "incoming call: uri=%s user=%s clean_address=%s",
+                    call.caller_uri,
+                    call.caller_user,
+                    clean_address,
+                )
+                discovered = {
+                    "address": clean_address,
+                    "station_id": call.caller_user,
+                    "name": f"Puerta ({call.caller_user})",
+                }
+                hass.config_entries.async_update_entry(
+                    entry,
+                    data={**entry.data, "discovered_outdoor_station": discovered},
+                )
+                # Delayed reload so the current ring/camera flow is
+                # not interrupted by unloading the integration immediately.
+                async def _reload_after_discovery() -> None:
+                    import asyncio
+                    await asyncio.sleep(5)
+                    await hass.config_entries.async_reload(entry.entry_id)
+
+                hass.async_create_task(_reload_after_discovery())
+
             if is_pickup_allowed(hass, entry.entry_id):
                 # Auto-arm streaming so the user can answer the ring within
                 # the next minute (clicking the camera or accepting a HomeKit
@@ -507,6 +562,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             on_ring=_on_ring,
             on_frame=_on_frame,
             on_state_change=_on_state_change,
+            wifi_panel=wifi_panel,
         )
         entry_data["sip_listener"] = listener
 
@@ -696,6 +752,17 @@ async def _async_refresh_doors_for_entry(
     hass: HomeAssistant, entry: ConfigEntry, *, reload_on_change: bool
 ) -> bool:
     """Refresh one config entry's stored door topology from the gateway."""
+    # WiFi panels have no web admin CGI, so door refresh is not possible.
+    device_type = entry.data.get(CONF_DEVICE_TYPE, "ip_gateway")
+    if device_type == DEVICE_TYPE_WIFI_PANEL:
+        _LOGGER.info(
+            "[abb] refresh_doors: entry %s is a WiFi panel — door refresh "
+            "via gateway admin CGI is not available. Doors come from the "
+            "ACL-update payload during pairing.",
+            entry.entry_id,
+        )
+        return False
+
     gateway_ip = entry.data.get("gateway_ip")
     admin_password = entry.data.get("gateway_admin_password")
     sip_domain = entry.data.get("sip_domain")

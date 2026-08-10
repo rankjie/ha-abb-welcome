@@ -247,6 +247,14 @@ def _preferred_payload(
     return None
 
 
+def _mirrored_crypto_lines(offer: ParsedSdp, media: str) -> list[str]:
+    """Return the offer's ``a=crypto`` lines for the given media section."""
+    for desc in offer.medias:
+        if desc.media == media and getattr(desc, "crypto", None):
+            return [f"a=crypto:{line}" for line in desc.crypto]
+    return []
+
+
 def _build_answer_sdp(
     offer: ParsedSdp,
     *,
@@ -273,8 +281,14 @@ def _build_answer_sdp(
             f"m=audio {audio_port} {proto} {pt}",
             f"a=rtpmap:{pt} {rtpmap or 'PCMA/8000'}",
             "a=ptime:20",
-            "a=sendrecv",
         ])
+        # Echo the panel's own crypto attribute.  ABB WiFi panels expect
+        # the uplink to use the same AES key they announced, so mirroring
+        # the line keeps both interpretations of the (non-standard)
+        # handshake consistent: whichever key the panel decrypts with, it
+        # is the one we encrypt with.
+        lines.extend(_mirrored_crypto_lines(offer, "audio"))
+        lines.append("a=sendrecv")
 
     video = _preferred_payload(offer, "video", ("H264/90000",))
     if video is not None:
@@ -285,6 +299,7 @@ def _build_answer_sdp(
         ])
         if fmtp:
             lines.append(f"a=fmtp:{pt} {fmtp}")
+        lines.extend(_mirrored_crypto_lines(offer, "video"))
         lines.append("a=sendrecv")
 
     lines.append("")
@@ -358,6 +373,7 @@ class SipListener:
         on_ring: RingCallback | None = None,
         on_state_change: Callable[[str], None] | None = None,
         on_frame: FrameCallback | None = None,
+        wifi_panel: bool = False,
     ) -> None:
         if transport not in ("tls", "tcp"):
             raise ValueError("transport must be 'tls' or 'tcp'")
@@ -367,6 +383,7 @@ class SipListener:
         self.domain = domain
         self.port = port
         self.transport = transport
+        self.wifi_panel = wifi_panel
         self._on_ring = on_ring
         self._on_state_change = on_state_change
         self._on_frame = on_frame
@@ -425,6 +442,17 @@ class SipListener:
 
             call_id = _header(frame.headers, "Call-ID")
             offer = parse_sdp(frame.body)
+            # Log the full incoming INVITE SDP body to find sprop-parameter-sets
+            _LOGGER.info(
+                "[abb] Incoming INVITE SDP body call_id=%s:\n%s",
+                call_id,
+                frame.body.decode("utf-8", errors="replace") if frame.body else "(empty)",
+            )
+            for m in offer.medias:
+                _LOGGER.info(
+                    "[abb] Incoming SDP media=%s port=%d pts=%s rtpmap=%s fmtp=%s direction=%s",
+                    m.media, m.port, m.payload_types, m.rtpmap, m.fmtp, m.direction,
+                )
             answer = _build_answer_sdp(
                 offer,
                 username=self.username,
@@ -489,15 +517,25 @@ class SipListener:
                 video_port,
             )
         try:
-            await asyncio.wait_for(dialog.ack_event.wait(), timeout=3.0)
+            # WiFi panels don't send ACK after 200 OK — don't block media
+            # startup waiting for it.  Use a very short timeout (200ms)
+            # instead of 3 seconds.
+            ack_timeout = 0.2 if self.wifi_panel else 3.0
+            await asyncio.wait_for(dialog.ack_event.wait(), timeout=ack_timeout)
             accepted.ack_received = True
             _LOGGER.info("[abb] Incoming call ACK received call_id=%s", call_id)
         except asyncio.TimeoutError:
-            _LOGGER.warning(
-                "[abb] Incoming call ACK not received within timeout call_id=%s; "
-                "continuing media setup",
-                call_id,
-            )
+            if self.wifi_panel:
+                _LOGGER.info(
+                    "[abb] WiFi panel: ACK not received (expected); starting media immediately call_id=%s",
+                    call_id,
+                )
+            else:
+                _LOGGER.warning(
+                    "[abb] Incoming call ACK not received within timeout call_id=%s; "
+                    "continuing media setup",
+                    call_id,
+                )
         if dialog.ended_event.is_set():
             _LOGGER.warning(
                 "[abb] Incoming call ended while waiting for ACK call_id=%s reason=%s",
@@ -848,12 +886,15 @@ class SipListener:
         from_header = _header(frame.headers, "From")
         caller_uri = re.search(r"<([^>]+)>", from_header)
         caller = caller_uri.group(1) if caller_uri else from_header
+        to_header = _header(frame.headers, "To")
+        contact_header = _header(frame.headers, "Contact")
+        call_id = _header(frame.headers, "Call-ID")
         call = IncomingCall(
             caller_uri=caller,
             caller_user=_user_from_uri(caller),
-            call_id=_header(frame.headers, "Call-ID"),
+            call_id=call_id,
             from_header=from_header,
-            to_header=_header(frame.headers, "To"),
+            to_header=to_header,
             via_header=_header(frame.headers, "Via"),
             cseq=_header(frame.headers, "CSeq"),
             raw_invite=frame.raw,
@@ -862,6 +903,12 @@ class SipListener:
         _LOGGER.info(
             "[abb] Incoming INVITE from %s (call_id=%s)",
             call.caller_uri, call.call_id,
+        )
+        _LOGGER.debug(
+            "[abb] INVITE details: From=%s To=%s Contact=%s Call-ID=%s "
+            "caller_user=%s",
+            from_header, to_header, contact_header, call_id,
+            call.caller_user,
         )
 
         # Remember the INVITE so we can issue 487 if a CANCEL arrives later.

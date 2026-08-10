@@ -760,6 +760,7 @@ class SIPClient:
         doors: list[dict] | None = None,
         invite_transport: str = DEFAULT_INVITE_TRANSPORT,
         unlock_strategy: str = "hybrid",
+        wifi_panel: bool = False,
     ) -> None:
         self.host = host
         self.username = username
@@ -769,6 +770,7 @@ class SIPClient:
         if unlock_strategy not in ("hybrid", "fast", "standard"):
             unlock_strategy = "hybrid"
         self.unlock_strategy = unlock_strategy
+        self.wifi_panel = wifi_panel
         self._first_station_id = self._derive_first_station_id(doors or [])
 
     def _derive_first_station_id(self, doors: list[dict]) -> str:
@@ -858,11 +860,24 @@ class SIPClient:
                 door.address,
                 door.unlock_body,
             )
-            if response.status_code() != 200:
-                _LOGGER.error("Fast unlock MESSAGE failed for %s: %s", door.name, response.start_line)
-                return False
-            _LOGGER.debug("Fast unlock succeeded for %s", door.name)
-            return True
+            if response.status_code() == 200:
+                _LOGGER.debug("Fast unlock succeeded for %s", door.name)
+                return True
+
+            # WiFi panels respond to the MESSAGE with an INVITE
+            # (the panel tries to call us back) instead of 200 OK.
+            # The MESSAGE was delivered and the door opens, so treat
+            # the INVITE response as success for WiFi panels.
+            if self.wifi_panel and response.start_line.upper().startswith("INVITE "):
+                _LOGGER.warning(
+                    "Fast unlock MESSAGE got INVITE response (panel processed "
+                    "MESSAGE); treating as success for WiFi panel %s: %s",
+                    door.name, response.start_line,
+                )
+                return True
+
+            _LOGGER.error("Fast unlock MESSAGE failed for %s: %s", door.name, response.start_line)
+            return False
         except RuntimeError as err:
             _LOGGER.error("Fast unlock failed for %s: %s", door.name, err)
             return False

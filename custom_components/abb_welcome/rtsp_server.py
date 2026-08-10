@@ -43,6 +43,18 @@ VIDEO_RTP_CHANNEL: Final = 0
 VIDEO_RTCP_CHANNEL: Final = 1
 AUDIO_RTP_CHANNEL: Final = 2
 AUDIO_RTCP_CHANNEL: Final = 3
+BACKCHANNEL_RTP_CHANNEL: Final = 4
+BACKCHANNEL_RTCP_CHANNEL: Final = 5
+
+# ONVIF Streaming Specification section 5.3: a client that wants an audio
+# backchannel puts this feature tag in the Require header of DESCRIBE (and
+# usually SETUP/PLAY too).  go2rtc sends it by default on every RTSP source
+# and silently retries without it if the server answers 551, so advertising
+# support here is safe for every other consumer.
+ONVIF_BACKCHANNEL_TAG: Final = "www.onvif.org/ver20/backchannel"
+
+# The control URL suffix we hand out for the backchannel media section.
+BACKCHANNEL_TRACK: Final = "trackID=2"
 
 _USER_AGENT = "ABB-Welcome-HA-RTSP-Server/1.0"
 
@@ -53,6 +65,11 @@ _USER_AGENT = "ABB-Welcome-HA-RTSP-Server/1.0"
 # a live doorbell stream a dropped packet is recoverable, an OOM is not.  On
 # the normal localhost loopback the buffer sits near zero, so this never fires.
 _MAX_WRITE_BUFFER_BYTES = 4 * 1024 * 1024
+
+
+async def _ignore_backchannel(_sess: "RtspSession", _rtp: bytes) -> None:
+    """Default no-op when the camera entity wires up no talkback sink."""
+    return None
 
 
 @dataclass
@@ -66,6 +83,9 @@ class RtspSession:
     has_audio: bool = False
     playing: bool = False
     overflow_drops: int = 0
+    backchannel: bool = False
+    backchannel_channel: int | None = None
+    backchannel_packets: int = 0
 
     def close(self) -> None:
         """Close this RTSP client connection."""
@@ -113,14 +133,17 @@ class RtspServer:
         self,
         *,
         host: str,
-        on_describe: Callable[[], Awaitable[str | None]],
+        on_describe: Callable[[bool], Awaitable[str | None]],
         on_play: Callable[[RtspSession], Awaitable[None]],
         on_teardown: Callable[[RtspSession], Awaitable[None]],
+        on_backchannel: Callable[[RtspSession, bytes], Awaitable[None]]
+        | None = None,
     ) -> None:
         self._host = host
         self._on_describe = on_describe
         self._on_play = on_play
         self._on_teardown = on_teardown
+        self._on_backchannel = on_backchannel or _ignore_backchannel
         self._server: asyncio.base_events.Server | None = None
         self._port: int = 0
         self._next_session = 1
@@ -171,11 +194,36 @@ class RtspServer:
         session_id: str | None = None
         try:
             while True:
-                request = await self._read_request(reader)
-                if request is None:
+                message = await self._read_message(reader)
+                if message is None:
                     break
-                method, url, headers, body = request
+                kind, payload = message
+                if kind == "data":
+                    channel, rtp = payload  # type: ignore[misc]
+                    sess = (
+                        self._sessions.get(session_id) if session_id else None
+                    )
+                    if sess is None:
+                        continue
+                    # RTCP receiver reports on the odd channel are noise for
+                    # us; only the RTP channel carries talkback audio.
+                    if (
+                        sess.backchannel_channel is not None
+                        and channel == sess.backchannel_channel
+                    ):
+                        sess.backchannel_packets += 1
+                        try:
+                            await self._on_backchannel(sess, rtp)
+                        except Exception as err:  # noqa: BLE001
+                            _LOGGER.debug(
+                                "[abb-rtsp] backchannel handler raised: %s", err
+                            )
+                    continue
+                method, url, headers, body = payload  # type: ignore[misc]
                 cseq = headers.get("cseq", "0")
+                wants_backchannel = ONVIF_BACKCHANNEL_TAG in headers.get(
+                    "require", ""
+                )
                 _LOGGER.debug(
                     "[abb-rtsp] %s %s %s (CSeq=%s)",
                     peer, method, url, cseq,
@@ -184,12 +232,16 @@ class RtspServer:
                 if method == "OPTIONS":
                     await self._send_response(
                         writer, write_lock, 200, "OK",
-                        {"CSeq": cseq, "Public": "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER"},
+                        {
+                            "CSeq": cseq,
+                            "Public": "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER",
+                            "Supported": ONVIF_BACKCHANNEL_TAG,
+                        },
                     )
                     continue
 
                 if method == "DESCRIBE":
-                    sdp = await self._on_describe()
+                    sdp = await self._on_describe(wants_backchannel)
                     if sdp is None:
                         await self._send_response(
                             writer, write_lock, 503, "Service Unavailable",
@@ -233,7 +285,22 @@ class RtspServer:
                         self._sessions[session_id] = sess
                     else:
                         sess = self._sessions[session_id]
-                    if interleaved == (VIDEO_RTP_CHANNEL, VIDEO_RTCP_CHANNEL):
+                    # The backchannel is identified by its control URL, not
+                    # by the channel numbers — the client picks those, and
+                    # some clients number them from zero per session.  The
+                    # Require header is the secondary signal.
+                    is_backchannel = BACKCHANNEL_TRACK in url or (
+                        wants_backchannel
+                        and "backchannel" in url.lower()
+                    )
+                    if is_backchannel:
+                        sess.backchannel = True
+                        sess.backchannel_channel = (
+                            interleaved[0]
+                            if interleaved
+                            else BACKCHANNEL_RTP_CHANNEL
+                        )
+                    elif interleaved == (VIDEO_RTP_CHANNEL, VIDEO_RTCP_CHANNEL):
                         sess.has_video = True
                     elif interleaved == (AUDIO_RTP_CHANNEL, AUDIO_RTCP_CHANNEL):
                         sess.has_audio = True
@@ -245,24 +312,35 @@ class RtspServer:
                             sess.has_video = True
                         elif not sess.has_audio:
                             sess.has_audio = True
-                    transport_resp = transport.split(";", 1)[0] + ";unicast;" + (
-                        f"interleaved={interleaved[0]}-{interleaved[1]}"
-                        if interleaved
-                        else "interleaved=0-1"
+                    if interleaved:
+                        chans = f"interleaved={interleaved[0]}-{interleaved[1]}"
+                    elif is_backchannel:
+                        chans = (
+                            f"interleaved={BACKCHANNEL_RTP_CHANNEL}-"
+                            f"{BACKCHANNEL_RTCP_CHANNEL}"
+                        )
+                    else:
+                        chans = "interleaved=0-1"
+                    transport_resp = (
+                        transport.split(";", 1)[0] + ";unicast;" + chans
                     )
+                    setup_headers = {
+                        "CSeq": cseq,
+                        "Transport": transport_resp,
+                        "Session": f"{session_id};timeout=60",
+                    }
+                    if is_backchannel:
+                        setup_headers["Require"] = ONVIF_BACKCHANNEL_TAG
                     await self._send_response(
-                        writer, write_lock, 200, "OK",
-                        {
-                            "CSeq": cseq,
-                            "Transport": transport_resp,
-                            "Session": f"{session_id};timeout=60",
-                        },
+                        writer, write_lock, 200, "OK", setup_headers,
                     )
                     _LOGGER.info(
-                        "[abb-rtsp] SETUP peer=%s session=%s cseq=%s "
-                        "interleaved=%s has_video=%s has_audio=%s",
-                        peer, session_id, cseq, interleaved,
+                        "[abb-rtsp] SETUP peer=%s session=%s cseq=%s url=%s "
+                        "interleaved=%s has_video=%s has_audio=%s "
+                        "backchannel=%s bc_channel=%s",
+                        peer, session_id, cseq, url, interleaved,
                         sess.has_video, sess.has_audio,
+                        sess.backchannel, sess.backchannel_channel,
                     )
                     continue
 
@@ -340,10 +418,33 @@ class RtspServer:
         return int(m.group(1)), int(m.group(2))
 
     @staticmethod
-    async def _read_request(
+    async def _read_message(
         reader: asyncio.StreamReader,
+    ) -> tuple[str, object] | None:
+        """Read either an RTSP request or one interleaved binary packet.
+
+        Once a backchannel is set up the same TCP socket carries both
+        directions, so a read can return either a text request or a
+        ``$<channel><len16><payload>`` frame.  We peek the first byte to
+        tell them apart — anything that isn't ``$`` starts a request line.
+        """
+        first = await reader.readexactly(1)
+        if first == b"$":
+            hdr = await reader.readexactly(3)
+            channel = hdr[0]
+            length = struct.unpack("!H", hdr[1:3])[0]
+            payload = await reader.readexactly(length) if length else b""
+            return ("data", (channel, payload))
+        request = await RtspServer._read_request(reader, first)
+        if request is None:
+            return None
+        return ("rtsp", request)
+
+    @staticmethod
+    async def _read_request(
+        reader: asyncio.StreamReader, prefix: bytes = b""
     ) -> tuple[str, str, dict[str, str], bytes] | None:
-        head = bytearray()
+        head = bytearray(prefix)
         while True:
             line = await reader.readline()
             if not line:

@@ -36,6 +36,12 @@ DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS = 100
 CONF_ALLOW_PICKUP = "allow_pickup"
 DEFAULT_ALLOW_PICKUP = True
 
+# Publish the door station's audio on the local RTSP stream.  Only relevant
+# for WiFi panels, whose audio payload is AES-encrypted; turn it off if a
+# particular panel model sends a codec go2rtc refuses to negotiate.
+CONF_PANEL_AUDIO = "panel_audio"
+DEFAULT_PANEL_AUDIO = True
+
 # Per-integration option: which unlock strategy to use.
 #   hybrid   — fast plain MESSAGE for the first outdoor station, INVITE-then-MESSAGE for the rest.
 #              Tested working on the reference gateway; lowest latency on the main door.
@@ -53,3 +59,14 @@ UNLOCK_STRATEGIES = (
     UNLOCK_STRATEGY_STANDARD,
 )
 DEFAULT_UNLOCK_STRATEGY = UNLOCK_STRATEGY_HYBRID
+
+# Device type: distinguish between the IP gateway (with web admin) and the
+# WiFi panel (no web admin, pairing approved on the panel touchscreen).
+CONF_DEVICE_TYPE = "device_type"
+DEVICE_TYPE_IP_GATEWAY = "ip_gateway"
+DEVICE_TYPE_WIFI_PANEL = "wifi_panel"
+DEVICE_TYPES = (
+    DEVICE_TYPE_IP_GATEWAY,
+    DEVICE_TYPE_WIFI_PANEL,
+)
+DEFAULT_DEVICE_TYPE = DEVICE_TYPE_IP_GATEWAY

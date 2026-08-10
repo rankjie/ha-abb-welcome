@@ -163,10 +163,15 @@ talk_pcm16le:
         text:
     pcm16le:
       name: PCM16LE
-      description: Base64-encoded 8 kHz mono signed 16-bit little-endian PCM.
+      description: >-
+        Base64-encoded 8 kHz mono signed 16-bit little-endian PCM. Convert a
+        file with:
+        ffmpeg -i input.mp3 -ar 8000 -ac 1 -f s16le - | base64 -w0
       required: true
+      example: "AAAAAP//AQA="
       selector:
         text:
+          multiline: true
 
 talk_tone:
   name: Send talkback tone

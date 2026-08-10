@@ -21,14 +21,21 @@ from .const import (
     CONF_ABB_PASSWORD,
     CONF_ABB_USERNAME,
     CONF_ALLOW_PICKUP,
+    CONF_DEVICE_TYPE,
     CONF_GATEWAY_IP,
     CONF_GATEWAY_UUID_OVERRIDE,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
+    CONF_PANEL_AUDIO,
     CONF_UNLOCK_STRATEGY,
     DEFAULT_ALLOW_PICKUP,
+    DEFAULT_PANEL_AUDIO,
+    DEFAULT_DEVICE_TYPE,
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_UNLOCK_STRATEGY,
+    DEVICE_TYPE_IP_GATEWAY,
+    DEVICE_TYPE_WIFI_PANEL,
+    DEVICE_TYPES,
     DOMAIN,
     UNLOCK_STRATEGIES,
 )
@@ -38,6 +45,7 @@ from .portal import (
     compute_integrity_code,
     default_client_name,
     derive_identity,
+    discover_gateway,
     gateway_authorize,
     gateway_local_info,
     generate_keypair_and_csr,
@@ -84,6 +92,29 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
     }
 )
 
+STEP_DEVICE_TYPE_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_DEVICE_TYPE, default=DEFAULT_DEVICE_TYPE): selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=list(DEVICE_TYPES),
+                translation_key=CONF_DEVICE_TYPE,
+                mode=selector.SelectSelectorMode.LIST,
+            )
+        ),
+    }
+)
+
+STEP_WIFI_PANEL_DATA_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_ABB_USERNAME): str,
+        vol.Required(CONF_ABB_PASSWORD): selector.TextSelector(
+            selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+        ),
+        vol.Required(CONF_GATEWAY_IP): str,
+        vol.Optional(CONF_GATEWAY_UUID_OVERRIDE, default=""): str,
+    }
+)
+
 
 GATEWAY_WEB_PORT = 443
 
@@ -114,6 +145,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         return ABBWelcomeOptionsFlow(config_entry)
 
     def __init__(self) -> None:
+        self._device_type: str = DEFAULT_DEVICE_TYPE
         self._username = ""
         self._password = ""
         self._gateway_ip = ""
@@ -148,7 +180,22 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict | None = None
     ) -> ConfigFlowResult:
-        """Single-step setup: collect credentials and run pairing end-to-end."""
+        """First step: select device type (IP Gateway or WiFi Panel)."""
+        if user_input is not None:
+            self._device_type = user_input[CONF_DEVICE_TYPE]
+            if self._device_type == DEVICE_TYPE_WIFI_PANEL:
+                return await self.async_step_wifi_panel()
+            return await self.async_step_ip_gateway()
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=STEP_DEVICE_TYPE_SCHEMA,
+        )
+
+    async def async_step_ip_gateway(
+        self, user_input: dict | None = None
+    ) -> ConfigFlowResult:
+        """Setup for IP Gateway (with web admin)."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -170,8 +217,6 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
 
             if not errors:
                 # Phase 1: portal-side setup + send connect event to gateway.
-                # Errors here are unrecoverable (we never put a pending request
-                # on the gateway), so they go straight back to the form.
                 try:
                     await self.hass.async_add_executor_job(self._do_pairing_setup)
                 except GatewayAdminError as err:
@@ -179,8 +224,6 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                     if "login failed" in msg:
                         errors["base"] = "gateway_admin_auth_failed"
                     elif "missing uuid" in msg or "op=6" in msg:
-                        # Local op=6 lookup failed and user didn't supply an
-                        # override. Tell them how to recover.
                         errors["base"] = "gateway_op6_failed"
                     else:
                         _log_error("Gateway admin error during setup: %s", err)
@@ -198,10 +241,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                     _LOGGER.exception("Unexpected portal setup error: %s", err)
                     errors["base"] = "unknown"
                 else:
-                    # Phase 2: auto-approve on the gateway. By this point the
-                    # connect event was successfully sent, so the gateway has
-                    # a pending request — recoverable via the manual UI even
-                    # if our CGI calls fail.
+                    # Phase 2: auto-approve on the gateway.
                     try:
                         await self.hass.async_add_executor_job(
                             self._do_gateway_authorize
@@ -209,7 +249,6 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                     except GatewayAdminError as err:
                         msg = str(err).lower()
                         if "login failed" in msg:
-                            # Wrong admin password — manual flow can't recover.
                             errors["base"] = "gateway_admin_auth_failed"
                         else:
                             _log_info(
@@ -229,13 +268,73 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                         return await self.async_step_poll_acl()
 
         return self.async_show_form(
-            step_id="user",
+            step_id="ip_gateway",
             data_schema=STEP_USER_DATA_SCHEMA,
             errors=errors,
         )
 
+    async def async_step_wifi_panel(
+        self, user_input: dict | None = None
+    ) -> ConfigFlowResult:
+        """Setup for WiFi Panel (no web admin, pairing approved on panel)."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            self._username = user_input[CONF_ABB_USERNAME].strip()
+            self._password = user_input[CONF_ABB_PASSWORD]
+            self._gateway_ip = user_input[CONF_GATEWAY_IP].strip()
+            uuid_raw = user_input.get(CONF_GATEWAY_UUID_OVERRIDE, "").strip().lower()
+            if uuid_raw and not _UUID_RE.fullmatch(uuid_raw):
+                errors[CONF_GATEWAY_UUID_OVERRIDE] = "invalid_uuid"
+            self._gateway_uuid_override = uuid_raw
+
+            if not errors:
+                # Phase 1: portal-side setup (cert, identity, gateway UUID
+                # via discovery, connect event). No gateway admin needed.
+                try:
+                    await self.hass.async_add_executor_job(self._do_pairing_setup_wifi)
+                except PortalError as err:
+                    msg = str(err).lower()
+                    if "401" in msg or "auth" in msg:
+                        errors["base"] = "invalid_auth"
+                    elif "no discovery" in msg or "gateway entry" in msg:
+                        errors["base"] = "gateway_not_found"
+                    else:
+                        _log_error("Portal pairing error: %s", err)
+                        errors["base"] = "unknown"
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.exception("Unexpected portal setup error: %s", err)
+                    errors["base"] = "unknown"
+                else:
+                    # Phase 2: user must approve on the WiFi panel touchscreen.
+                    return await self.async_step_wifi_approve()
+
+        return self.async_show_form(
+            step_id="wifi_panel",
+            data_schema=STEP_WIFI_PANEL_DATA_SCHEMA,
+            errors=errors,
+        )
+
+    async def async_step_wifi_approve(
+        self, user_input: dict | None = None
+    ) -> ConfigFlowResult:
+        """Show instructions for the user to approve pairing on the WiFi panel."""
+        if user_input is not None:
+            self._manual_authorize = True
+            return await self.async_step_poll_acl()
+
+        return self.async_show_form(
+            step_id="wifi_approve",
+            data_schema=vol.Schema({}),
+            description_placeholders={
+                "gateway_ip": self._gateway_ip,
+                "client_name": self._client_name,
+                "integrity_code": self._integrity_display,
+            },
+        )
+
     def _do_pairing_setup(self) -> None:
-        """Synchronous helper for the portal-side setup steps."""
+        """Synchronous helper for the portal-side setup steps (IP Gateway)."""
         self._client_name = default_client_name()
         priv_pem, csr_pem, _ = generate_keypair_and_csr(self._username)
         self._private_key_pem = priv_pem
@@ -266,6 +365,56 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             gw_info = gateway_local_info(self._gateway_ip, self._gateway_password)
             self._gateway_uuid = gw_info["uuid"]
             self._gateway_name = gw_info.get("portalname") or "ABB Welcome Gateway"
+
+        self._integrity_eight, self._integrity_display = compute_integrity_code(
+            self._fingerprint
+        )
+        send_connect_event(
+            self._portal_url,
+            self._cert_pem,
+            self._private_key_pem,
+            self._gateway_uuid,
+            self._own_uuid,
+            self._integrity_eight,
+        )
+
+    def _do_pairing_setup_wifi(self) -> None:
+        """Synchronous helper for the portal-side setup steps (WiFi Panel).
+
+        Same as _do_pairing_setup but without any local gateway admin CGI
+        calls — the WiFi panel has no web admin interface.
+        Gateway UUID is resolved from the portal discovery event instead.
+        """
+        self._client_name = default_client_name()
+        priv_pem, csr_pem, _ = generate_keypair_and_csr(self._username)
+        self._private_key_pem = priv_pem
+
+        self._portal_url = resolve_portal_url(self._username)
+        self._cert_pem = request_certificate(
+            self._portal_url,
+            self._username,
+            self._password,
+            csr_pem,
+            self._client_name,
+        )
+
+        identity = derive_identity(self._cert_pem, self._username)
+        self._sip_username = identity["sip_username"]
+        self._fingerprint = identity["fingerprint_sha1"]
+        self._own_uuid = identity["own_portal_uuid"]
+
+        # For WiFi panels, resolve the gateway UUID from the portal
+        # discovery event instead of the local admin CGI.
+        if self._gateway_uuid_override:
+            self._gateway_uuid = self._gateway_uuid_override
+            self._gateway_name = "ABB Welcome WiFi Panel"
+        else:
+            self._gateway_uuid, self._gateway_name = discover_gateway(
+                self._portal_url,
+                self._cert_pem,
+                self._private_key_pem,
+            )
+            self._gateway_name = self._gateway_name or "ABB Welcome WiFi Panel"
 
         self._integrity_eight, self._integrity_display = compute_integrity_code(
             self._fingerprint
@@ -372,6 +521,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_create_entry(
                 title=f"ABB Welcome ({self._gateway_name})",
                 data={
+                    CONF_DEVICE_TYPE: self._device_type,
                     CONF_GATEWAY_IP: self._gateway_ip,
                     "sip_username": self._sip_username,
                     "sip_password": self._sip_password,
@@ -432,6 +582,9 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
         current_allow_pickup = bool(
             self._entry.options.get(CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP)
         )
+        current_panel_audio = bool(
+            self._entry.options.get(CONF_PANEL_AUDIO, DEFAULT_PANEL_AUDIO)
+        )
         schema = vol.Schema(
             {
                 vol.Required(CONF_UNLOCK_STRATEGY, default=current): selector.SelectSelector(
@@ -449,6 +602,9 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
                 ): vol.All(vol.Coerce(int), vol.Range(min=1024, max=65535)),
                 vol.Required(
                     CONF_ALLOW_PICKUP, default=current_allow_pickup
+                ): selector.BooleanSelector(),
+                vol.Required(
+                    CONF_PANEL_AUDIO, default=current_panel_audio
                 ): selector.BooleanSelector(),
             }
         )
