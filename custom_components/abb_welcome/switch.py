@@ -24,11 +24,12 @@ from collections.abc import Callable
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP, DOMAIN
+from .device import gateway_device_info
+from .gateway_profile import GatewayProfile
 from .streaming_state import (
     ARM_REASON_MANUAL,
     MANUAL_ARM_SECONDS,
@@ -51,21 +52,12 @@ async def async_setup_entry(
 ) -> None:
     if not entry.data.get("doors"):
         return
+    profile: GatewayProfile = hass.data[DOMAIN][entry.entry_id]["gateway_profile"]
     async_add_entities(
         [
-            ABBStreamingArmedSwitch(hass, entry),
-            ABBAllowPickupSwitch(hass, entry),
+            ABBStreamingArmedSwitch(hass, entry, profile),
+            ABBAllowPickupSwitch(hass, entry, profile),
         ]
-    )
-
-
-def _gateway_device_info(entry: ConfigEntry) -> DeviceInfo:
-    gateway_uuid = entry.data.get("gateway_uuid", "unknown")
-    return DeviceInfo(
-        identifiers={(DOMAIN, gateway_uuid)},
-        name="ABB Welcome Gateway",
-        manufacturer="ABB / Busch-Jaeger",
-        model="IP Gateway (MRANGE)",
     )
 
 
@@ -76,12 +68,17 @@ class ABBStreamingArmedSwitch(SwitchEntity):
     _attr_name = "Streaming enabled"
     _attr_icon = "mdi:cctv"
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        profile: GatewayProfile,
+    ) -> None:
         self.hass = hass
         self._entry = entry
         gateway_uuid = entry.data.get("gateway_uuid", "unknown")
         self._attr_unique_id = f"{gateway_uuid}_streaming_enabled"
-        self._attr_device_info = _gateway_device_info(entry)
+        self._attr_device_info = gateway_device_info(gateway_uuid, profile)
         self._unsub: Callable[[], None] | None = None
 
     async def async_added_to_hass(self) -> None:
@@ -133,12 +130,17 @@ class ABBAllowPickupSwitch(SwitchEntity):
     _attr_name = "Allow pickup"
     _attr_icon = "mdi:phone-incoming"
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        profile: GatewayProfile,
+    ) -> None:
         self.hass = hass
         self._entry = entry
         gateway_uuid = entry.data.get("gateway_uuid", "unknown")
         self._attr_unique_id = f"{gateway_uuid}_allow_pickup"
-        self._attr_device_info = _gateway_device_info(entry)
+        self._attr_device_info = gateway_device_info(gateway_uuid, profile)
         self._unsub: Callable[[], None] | None = None
 
     async def async_added_to_hass(self) -> None:

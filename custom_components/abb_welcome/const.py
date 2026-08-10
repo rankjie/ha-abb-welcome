@@ -1,11 +1,16 @@
 """Constants for the ABB Welcome integration."""
 
+from .gateway_profile import GATEWAY_KIND_M22401, GATEWAY_KIND_MRANGE
+
 DOMAIN = "abb_welcome"
 
 CONF_ABB_USERNAME = "abb_username"
 CONF_ABB_PASSWORD = "abb_password"
 CONF_GATEWAY_IP = "gateway_ip"
 CONF_GATEWAY_UUID_OVERRIDE = "gateway_uuid_override"
+CONF_GATEWAY_KIND = "gateway_kind"
+
+GATEWAY_KINDS = (GATEWAY_KIND_MRANGE, GATEWAY_KIND_M22401)
 
 GEO_URL = "https://geo.mybuildings.abb.com"
 DEFAULT_PORTAL_URL = "https://api.eu.mybuildings.abb.com"

@@ -7,11 +7,13 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import ABBWelcomeCoordinator
+from .device import gateway_device_info
+from .gateway_profile import GatewayProfile
+from .gateway_runtime import GatewayRuntime
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,18 +49,23 @@ async def async_setup_entry(
 ) -> None:
     """Set up ABB Welcome door buttons from a config entry."""
     data = hass.data[DOMAIN][entry.entry_id]
-    sip_client = data["sip_client"]
+    runtime: GatewayRuntime = data["runtime"]
     coordinator: ABBWelcomeCoordinator | None = data.get("coordinator")
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
+    profile: GatewayProfile = data["gateway_profile"]
     doors = entry.data.get("doors", [])
 
     entities: list[ButtonEntity] = [
-        ABBWelcomeDoorButton(sip_client, door, gateway_uuid, entry.entry_id)
+        ABBWelcomeDoorButton(
+            runtime, door, gateway_uuid, entry.entry_id, profile
+        )
         for door in doors
         if _door_can_unlock(door)
     ]
     if coordinator is not None and coordinator.has_certs:
-        entities.append(ABBWelcomeRefreshButton(coordinator, gateway_uuid))
+        entities.append(
+            ABBWelcomeRefreshButton(coordinator, gateway_uuid, profile)
+        )
     async_add_entities(entities)
 
 
@@ -68,24 +75,24 @@ class ABBWelcomeDoorButton(ButtonEntity):
     _attr_icon = "mdi:door-open"
     _attr_has_entity_name = True
 
-    def __init__(self, sip_client, door: dict, gateway_uuid: str, entry_id: str) -> None:
-        self._sip_client = sip_client
+    def __init__(
+        self,
+        runtime: GatewayRuntime,
+        door: dict,
+        gateway_uuid: str,
+        entry_id: str,
+        profile: GatewayProfile,
+    ) -> None:
+        self._runtime = runtime
         self._door = door
         self._attr_name = door["name"]
         self._attr_unique_id = f"{gateway_uuid}_{_door_station_key(door)}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = gateway_device_info(gateway_uuid, profile)
 
     async def async_press(self) -> None:
         """Unlock the door."""
         _LOGGER.debug("Unlocking door: %s", self._attr_name)
-        success = await self.hass.async_add_executor_job(
-            self._sip_client.unlock_door, self._door
-        )
+        success = await self._runtime.async_unlock(self.hass, self._door)
         if not success:
             raise HomeAssistantError(
                 f"Failed to unlock door: {self._attr_name}"
@@ -106,15 +113,15 @@ class ABBWelcomeRefreshButton(ButtonEntity):
     _attr_name = "Refresh Events"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
-    def __init__(self, coordinator: ABBWelcomeCoordinator, gateway_uuid: str) -> None:
+    def __init__(
+        self,
+        coordinator: ABBWelcomeCoordinator,
+        gateway_uuid: str,
+        profile: GatewayProfile,
+    ) -> None:
         self._coordinator = coordinator
         self._attr_unique_id = f"{gateway_uuid}_refresh_events"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = gateway_device_info(gateway_uuid, profile)
 
     async def async_press(self) -> None:
         await self._coordinator.async_request_refresh()

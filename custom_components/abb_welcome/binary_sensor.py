@@ -11,11 +11,12 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later
 
 from .const import DOMAIN
+from .device import gateway_device_info
+from .gateway_profile import GatewayProfile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,7 +36,8 @@ async def async_setup_entry(
     if "sip_listener" not in data:
         return
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
-    sensor = ABBWelcomeRingingSensor(gateway_uuid)
+    profile: GatewayProfile = data["gateway_profile"]
+    sensor = ABBWelcomeRingingSensor(gateway_uuid, profile)
     data["ringing_sensor"] = sensor
     async_add_entities([sensor])
 
@@ -53,14 +55,9 @@ class ABBWelcomeRingingSensor(BinarySensorEntity):
     _attr_icon = "mdi:bell-ring"
     _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
 
-    def __init__(self, gateway_uuid: str) -> None:
+    def __init__(self, gateway_uuid: str, profile: GatewayProfile) -> None:
         self._attr_unique_id = f"{gateway_uuid}_ringing"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = gateway_device_info(gateway_uuid, profile)
         self._attr_is_on = False
         self._caller: dict[str, Any] = {}
         self._cancel_off: Any = None

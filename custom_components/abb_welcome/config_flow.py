@@ -22,6 +22,7 @@ from .const import (
     CONF_ABB_USERNAME,
     CONF_ALLOW_PICKUP,
     CONF_GATEWAY_IP,
+    CONF_GATEWAY_KIND,
     CONF_GATEWAY_UUID_OVERRIDE,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
@@ -30,6 +31,7 @@ from .const import (
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_UNLOCK_STRATEGY,
     DOMAIN,
+    GATEWAY_KIND_MRANGE,
     UNLOCK_STRATEGIES,
 )
 from .portal import (
@@ -373,6 +375,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 title=f"ABB Welcome ({self._gateway_name})",
                 data={
                     CONF_GATEWAY_IP: self._gateway_ip,
+                    CONF_GATEWAY_KIND: GATEWAY_KIND_MRANGE,
                     "sip_username": self._sip_username,
                     "sip_password": self._sip_password,
                     "sip_domain": self._sip_domain,

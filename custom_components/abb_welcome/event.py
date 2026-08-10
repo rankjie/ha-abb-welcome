@@ -11,11 +11,12 @@ import logging
 from homeassistant.components.event import EventEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import ABBWelcomeCoordinator
+from .device import gateway_device_info
+from .gateway_profile import GatewayProfile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,11 +42,13 @@ async def async_setup_entry(
     if not coordinator or not coordinator.has_certs:
         return
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
+    profile: GatewayProfile = data["gateway_profile"]
     async_add_entities([
         ABBWelcomeEventEntity(
             coordinator,
             gateway_uuid,
             entry.data.get("doors", []) or [],
+            profile,
         )
     ])
 
@@ -63,6 +66,7 @@ class ABBWelcomeEventEntity(EventEntity):
         coordinator: ABBWelcomeCoordinator,
         gateway_uuid: str,
         doors: list[dict],
+        profile: GatewayProfile,
     ) -> None:
         self._coordinator = coordinator
         self._station_names = {
@@ -73,12 +77,7 @@ class ABBWelcomeEventEntity(EventEntity):
             if str(door.get("station_id", "")).strip()
         }
         self._attr_unique_id = f"{gateway_uuid}_intercom_events"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = gateway_device_info(gateway_uuid, profile)
         self._last_seen_id = ""
 
     async def async_added_to_hass(self) -> None:

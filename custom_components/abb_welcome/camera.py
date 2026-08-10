@@ -52,11 +52,12 @@ from homeassistant.components.camera import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, GO2RTC_RTSP_HOST, GO2RTC_RTSP_PORT
+from .device import gateway_device_info
+from .gateway_profile import GatewayProfile
 from .intercom_dialer import Door, IntercomDialer
 from .media_pipeline import StreamSession
 from .rtsp_server import (
@@ -126,6 +127,7 @@ async def async_setup_entry(
         return
 
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
+    profile: GatewayProfile = data["gateway_profile"]
     door_meta: dict[str, tuple[Door, str, bool | str | int | None]] = {}
     camera_entities: dict[tuple[str, int], ABBWelcomeCamera] = {}
     created_indexes: dict[str, set[int]] = {}
@@ -162,6 +164,7 @@ async def async_setup_entry(
             coordinator=coordinator,
             door=door,
             gateway_uuid=gateway_uuid,
+            profile=profile,
             camera_index=exposed_index,
             camera_count=camera_count,
             station_type=station_type,
@@ -642,6 +645,7 @@ class ABBWelcomeCamera(Camera):
         coordinator: StationStreamCoordinator,
         door: Door,
         gateway_uuid: str,
+        profile: GatewayProfile,
         camera_index: int | None,
         camera_count: int,
         station_type: str,
@@ -669,12 +673,7 @@ class ABBWelcomeCamera(Camera):
             else door.name
         )
         self._attr_unique_id = f"{gateway_uuid}_camera_{station_key}{camera_suffix}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = gateway_device_info(gateway_uuid, profile)
         self._stream_name = f"abb_{station_key}{camera_suffix}"
 
         self._rtsp = RtspServer(

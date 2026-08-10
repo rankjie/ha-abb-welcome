@@ -8,11 +8,12 @@ from datetime import datetime, timezone
 from homeassistant.components.image import ImageEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import ABBWelcomeCoordinator
+from .device import gateway_device_info
+from .gateway_profile import GatewayProfile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,8 +29,9 @@ async def async_setup_entry(
     if not coordinator or not coordinator.has_certs:
         return
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
+    profile: GatewayProfile = data["gateway_profile"]
     async_add_entities(
-        [ABBWelcomeScreenshotImage(hass, coordinator, gateway_uuid)]
+        [ABBWelcomeScreenshotImage(hass, coordinator, gateway_uuid, profile)]
     )
 
 
@@ -76,18 +78,14 @@ class ABBWelcomeScreenshotImage(ImageEntity):
         hass: HomeAssistant,
         coordinator: ABBWelcomeCoordinator,
         gateway_uuid: str,
+        profile: GatewayProfile,
     ) -> None:
         super().__init__(hass)
         self._coordinator = coordinator
         self._image: bytes | None = None
         self._last_event_id = ""
         self._attr_unique_id = f"{gateway_uuid}_latest_screenshot"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = gateway_device_info(gateway_uuid, profile)
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()

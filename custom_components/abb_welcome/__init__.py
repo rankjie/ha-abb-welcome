@@ -36,6 +36,12 @@ from .const import (
     SIP_PORT_TLS,
 )
 from .coordinator import ABBWelcomeCoordinator
+from .gateway_profile import (
+    GatewayProfile,
+    get_gateway_profile,
+    resolve_gateway_kind,
+)
+from .gateway_runtime import GatewayRuntime, MRangeUnlockAdapter
 from .rtsp_proxy import RtspTcpProxy
 from .sip_client import SIPClient
 from .sip_listener import IncomingCall, SipListener
@@ -154,15 +160,11 @@ for _name in (
 ):
     logging.getLogger(_name).setLevel(logging.INFO)
 
-PLATFORMS = [
-    Platform.BINARY_SENSOR,
-    Platform.BUTTON,
-    Platform.CAMERA,
-    Platform.IMAGE,
-    Platform.EVENT,
-    Platform.SENSOR,
-    Platform.SWITCH,
-]
+
+def _platforms_for_profile(profile: GatewayProfile) -> list[Platform]:
+    """Return entity platforms declared by ``profile`` in stable order."""
+    return [Platform(platform) for platform in profile.platforms]
+
 
 _RELOAD_OPTION_KEYS = (
     CONF_LAN_RTSP_HOST,
@@ -294,6 +296,12 @@ async def _async_start_rtsp_proxy(
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up ABB Welcome from a config entry."""
+    try:
+        profile = get_gateway_profile(resolve_gateway_kind(entry.data))
+    except ValueError as err:
+        _LOGGER.error("[abb] refusing unsupported config entry: %s", err)
+        return False
+
     # Repair names persisted by older versions before entities are created.
     _repair_entry_door_names(hass, entry)
 
@@ -304,9 +312,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator = ABBWelcomeCoordinator(hass, entry)
 
+    sip_client = _build_client(entry)
+    runtime = GatewayRuntime(
+        profile=profile,
+        coordinator=coordinator,
+        unlock_adapter=MRangeUnlockAdapter(),
+        sip_client=sip_client,
+    )
     entry_data: dict = {
-        "sip_client": _build_client(entry),
+        "runtime": runtime,
+        "sip_client": sip_client,
         "coordinator": coordinator,
+        "gateway_profile": profile,
     }
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = entry_data
     set_pickup_allowed(
@@ -509,6 +526,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             on_state_change=_on_state_change,
         )
         entry_data["sip_listener"] = listener
+        runtime.sip_listener = listener
 
         # Defer start until HA finishes booting.  Before EVENT_HOMEASSISTANT_
         # STARTED the network stack and other integrations may not be ready,
@@ -529,7 +547,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entry_data["reload_options"] = _reload_relevant_options(entry)
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    await hass.config_entries.async_forward_entry_setups(
+        entry, _platforms_for_profile(profile)
+    )
     _fire_discovery_changed(
         hass,
         entry,
@@ -1135,7 +1155,16 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload ABB Welcome config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+    profile = entry_data.get("gateway_profile")
+    if profile is None:
+        try:
+            profile = get_gateway_profile(resolve_gateway_kind(entry.data))
+        except ValueError:
+            # Unknown entries never forward platforms during setup.
+            profile = None
+    platforms = _platforms_for_profile(profile) if profile is not None else []
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id, None)
     return unload_ok

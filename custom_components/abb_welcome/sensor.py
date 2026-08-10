@@ -11,11 +11,12 @@ from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import ABBWelcomeCoordinator
+from .device import gateway_device_info
+from .gateway_profile import GatewayProfile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ async def async_setup_entry(
     """Set up ABB Welcome sensors from a config entry."""
     data = hass.data[DOMAIN][entry.entry_id]
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
+    profile: GatewayProfile = data["gateway_profile"]
 
     sensors: list[SensorEntity] = []
 
@@ -38,11 +40,12 @@ async def async_setup_entry(
                 coordinator,
                 gateway_uuid,
                 entry.data.get("doors", []) or [],
+                profile,
             )
         )
 
     if "sip_listener" in data:
-        listener_sensor = ABBWelcomeListenerStateSensor(gateway_uuid)
+        listener_sensor = ABBWelcomeListenerStateSensor(gateway_uuid, profile)
         data["listener_state_sensor"] = listener_sensor
         sensors.append(listener_sensor)
 
@@ -62,6 +65,7 @@ class ABBWelcomeLastEventSensor(SensorEntity):
         coordinator: ABBWelcomeCoordinator,
         gateway_uuid: str,
         doors: list[dict[str, Any]],
+        profile: GatewayProfile,
     ) -> None:
         self._coordinator = coordinator
         self._station_names = {
@@ -72,12 +76,7 @@ class ABBWelcomeLastEventSensor(SensorEntity):
             if str(door.get("station_id", "")).strip()
         }
         self._attr_unique_id = f"{gateway_uuid}_last_event"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = gateway_device_info(gateway_uuid, profile)
 
     async def async_added_to_hass(self) -> None:
         self._coordinator.async_add_listener(self._handle_update)
@@ -147,14 +146,9 @@ class ABBWelcomeListenerStateSensor(SensorEntity):
     _attr_device_class = SensorDeviceClass.ENUM
     _attr_options = ["stopped", "connecting", "registered", "disconnected"]
 
-    def __init__(self, gateway_uuid: str) -> None:
+    def __init__(self, gateway_uuid: str, profile: GatewayProfile) -> None:
         self._attr_unique_id = f"{gateway_uuid}_sip_listener_state"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = gateway_device_info(gateway_uuid, profile)
         self._state = "stopped"
         self._last_change = datetime.now(timezone.utc)
         self._frames_in = 0
