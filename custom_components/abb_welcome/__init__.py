@@ -12,6 +12,7 @@ from urllib.parse import unquote, urlparse
 
 import requests
 import voluptuous as vol
+from homeassistant.components.tts import generate_media_source_id
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
@@ -592,6 +593,7 @@ SERVICE_TALK_STOP = "talk_stop"
 SERVICE_TALK_PCM16LE = "talk_pcm16le"
 SERVICE_TALK_TONE = "talk_tone"
 SERVICE_PLAY_AUDIO = "play_audio"
+SERVICE_ANNOUNCE = "announce"
 EXPORT_FIELDS = (
     "gateway_ip",
     "sip_username",
@@ -1232,6 +1234,65 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     vol.Required("media"): MediaSelector(
                         {"accept": ["audio/*"]}
                     ),
+                }
+            ),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_ANNOUNCE):
+
+        async def _announce(call: ServiceCall) -> None:
+            talkback_session_id = str(
+                call.data.get("talkback_session_id")
+                or call.data.get("session_id")
+                or ""
+            ).strip()
+            camera = _cameras_for_talk_service(hass, call)[0]
+            announce = getattr(camera, "async_temporary_talkback_audio", None)
+            if not callable(announce):
+                raise HomeAssistantError(
+                    "Selected camera does not support unattended announcements"
+                )
+
+            try:
+                media_content_id = generate_media_source_id(
+                    hass,
+                    call.data["message"],
+                    engine=call.data.get("tts_entity_id") or None,
+                    language=call.data.get("language") or None,
+                    cache=True,
+                )
+                pcm = await async_prepare_talkback_audio(hass, media_content_id)
+            except HomeAssistantError:
+                raise
+            except (OSError, RuntimeError, TypeError, ValueError) as err:
+                raise HomeAssistantError(
+                    "Unable to prepare the unattended announcement"
+                ) from err
+
+            try:
+                await announce(pcm, talkback_session_id)
+            except HomeAssistantError:
+                raise
+            except (OSError, RuntimeError, ValueError) as err:
+                raise HomeAssistantError(
+                    "Unable to play the unattended announcement; the selected "
+                    "station may already be in use"
+                ) from err
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_ANNOUNCE,
+            _announce,
+            schema=vol.Schema(
+                {
+                    **talk_target_schema,
+                    vol.Required("message"): vol.All(
+                        str,
+                        lambda value: value.strip(),
+                        vol.Length(min=1, max=500),
+                    ),
+                    vol.Optional("tts_entity_id"): str,
+                    vol.Optional("language"): str,
                 }
             ),
         )

@@ -270,3 +270,56 @@ play_audio:
         media:
           accept:
             - audio/*
+
+announce:
+  name: Announce at a door
+  description: >-
+    Generate speech and play it through a short-lived intercom call without
+    requiring an active camera stream. Refuses to interrupt active streams,
+    calls, talkback owners, or other announcements.
+  fields:
+    entity_id:
+      name: Camera
+      description: Optional ABB Welcome camera entity to announce through.
+      required: false
+      selector:
+        entity:
+          domain: camera
+    station_id:
+      name: Station ID
+      description: Optional outdoor station id when no camera entity is supplied.
+      required: false
+      selector:
+        text:
+    entry_id:
+      name: Entry ID
+      description: Optional ABB Welcome config-entry id.
+      required: false
+      selector:
+        text:
+    talkback_session_id:
+      name: Talkback session ID
+      description: Optional owner id held only for this announcement.
+      required: false
+      selector:
+        text:
+    message:
+      name: Message
+      description: Speech text, from 1 to 500 characters after trimming.
+      required: true
+      selector:
+        text:
+          multiline: true
+    tts_entity_id:
+      name: TTS entity
+      description: Optional TTS entity. Uses Home Assistant's default when omitted.
+      required: false
+      selector:
+        entity:
+          domain: tts
+    language:
+      name: Language
+      description: Optional language code supported by the selected TTS entity.
+      required: false
+      selector:
+        text:

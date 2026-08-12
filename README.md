@@ -313,6 +313,7 @@ are mainly intended for the Scrypted plugin.
 - `abb_welcome.talk_pcm16le`
 - `abb_welcome.talk_tone`
 - `abb_welcome.play_audio`
+- `abb_welcome.announce`
 
 The audio format for `talk_pcm16le` is base64-encoded 8 kHz mono signed 16-bit
 little-endian PCM. HA converts it to continuous PCMA/G.711 A-law RTP on the
@@ -365,6 +366,52 @@ data:
 Choose the TTS item with Home Assistant's media picker; the TTS identifier above
 is only a generic placeholder.
 
+`abb_welcome.announce` is the unattended alternative: Home Assistant generates
+and fully decodes the speech first, then opens a short-lived intercom call,
+plays the message, and hangs up. It refuses to run while any related camera
+stream, visitor call, RTSP client, talkback owner, or another announcement is
+active; it never reuses or interrupts an existing stream. Messages are limited
+to 500 characters, decoded playback is limited to 30 seconds, and the configured
+talkback output gain and peak limiter apply.
+
+Default TTS provider example (replace the camera and message placeholders):
+
+```yaml
+action: abb_welcome.announce
+data:
+  entity_id: camera.abb_welcome_front_door
+  message: "<message to announce>"
+  talkback_session_id: "<optional-automation-id>"
+```
+
+Explicit TTS entity and language example:
+
+```yaml
+action: abb_welcome.announce
+data:
+  entity_id: camera.abb_welcome_back_door
+  message: "<message to announce>"
+  tts_entity_id: tts.example_provider
+  language: en
+```
+
+AppDaemon should request the unlock first and announce only after the unlock
+action reports success. The exact success check belongs in the AppDaemon app;
+the compact example below leaves that application-specific check explicit:
+
+```python
+def unlock_and_announce(self, _event_name, _data, _kwargs):
+    unlock_succeeded = self.unlock_selected_door()
+    if not unlock_succeeded:
+        return
+    self.call_service(
+        "abb_welcome/announce",
+        entity_id="camera.abb_welcome_front_door",
+        message="The door is open.",
+        talkback_session_id="appdaemon-entry",
+    )
+```
+
 ## Scrypted RTSP Endpoint
 
 Scrypted needs a LAN-reachable RTSP URL. HA's bundled go2rtc RTSP listener is
@@ -407,6 +454,9 @@ uses that event to refresh its station list and RTSP URLs.
 - `abb_welcome.talk_tone` - send a short generated tone for testing.
 - `abb_welcome.play_audio` - play local media or Home Assistant TTS audio on the
   active camera stream (maximum 30 seconds and 20 MiB source size).
+- `abb_welcome.announce` - generate up to 500 characters of speech, play at most
+  30 seconds through a new temporary call, then hang up; active streams or calls
+  are never interrupted.
 - `abb_welcome.export_credentials` - export stored SIP/gateway credentials to a
   JSON file for local debugging. This output contains secrets.
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from http import HTTPStatus
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -174,6 +174,7 @@ async def async_setup_entry(
                 door=door,
                 camera_index=exposed_index,
                 talkback_output_gain_db=talkback_gain_db,
+                peer_coordinators=lambda: stream_coordinators.values(),
             )
             stream_coordinators[coordinator_key] = coordinator
         camera = ABBWelcomeCamera(
@@ -369,6 +370,10 @@ class StationStreamCoordinator:
         door: Door,
         camera_index: int | None,
         talkback_output_gain_db: float = 0.0,
+        peer_coordinators: Callable[
+            [], Iterable[StationStreamCoordinator]
+        ]
+        | None = None,
     ) -> None:
         self.hass = hass
         self.entry_id = entry_id
@@ -378,6 +383,9 @@ class StationStreamCoordinator:
         self._rtsp_play_sessions: list[RtspSession] = []
         self._close_task: asyncio.Task | None = None
         self._talkback_owner = ""
+        self._temporary_talkback_active = False
+        self._temporary_talkback_task: asyncio.Task | None = None
+        self._peer_coordinators = peer_coordinators
         self._state_callbacks: list[Callable[[], None]] = []
         self.session = StreamSession(
             dialer=dialer,
@@ -414,6 +422,10 @@ class StationStreamCoordinator:
     def talkback_owner(self) -> str:
         return self._talkback_owner
 
+    @property
+    def temporary_talkback_active(self) -> bool:
+        return self._temporary_talkback_active
+
     def talkback_stats(self) -> dict[str, Any]:
         stats = self.session.talkback_stats()
         stats["owner"] = self._talkback_owner
@@ -440,7 +452,57 @@ class StationStreamCoordinator:
             self._close_task.cancel()
         self._close_task = None
 
+    def _coordinator_group(self) -> list[StationStreamCoordinator]:
+        peers = list(self._peer_coordinators()) if self._peer_coordinators else []
+        if not any(peer is self for peer in peers):
+            peers.append(self)
+        return peers
+
+    def _temporary_talkback_unavailable_reason(
+        self,
+        session_id: str,
+        *,
+        own_reservation: bool = False,
+    ) -> str | None:
+        for coordinator in self._coordinator_group():
+            is_own_reservation = own_reservation and coordinator is self
+            if (
+                coordinator._temporary_talkback_active
+                and not is_own_reservation
+            ):
+                return "another unattended announcement is already in progress"
+            if coordinator._rtsp_play_sessions:
+                return "an RTSP camera stream is already in use"
+            if coordinator.session.active:
+                return "an intercom stream or call is already active"
+            if coordinator._talkback_owner and not is_own_reservation:
+                if session_id and coordinator._talkback_owner != session_id:
+                    return "talkback is owned by another session"
+                return "talkback already has an owner"
+            close_task = coordinator._close_task
+            if close_task is not None and not close_task.done():
+                return "a camera stream is still closing"
+            if coordinator._stream_lock.locked() and not is_own_reservation:
+                return "the camera stream is busy"
+        return None
+
+    def _temporary_talkback_in_group(self) -> bool:
+        return any(
+            coordinator._temporary_talkback_active
+            for coordinator in self._coordinator_group()
+        )
+
+    def _reject_rtsp_during_temporary_talkback(self, sess: RtspSession) -> bool:
+        self._discard_rtsp_play_session(sess)
+        if not self._rtsp_play_sessions:
+            self.session.set_packet_handlers(on_video=None, on_audio=None)
+        sess.close()
+        self._notify_state()
+        return False
+
     async def attach_rtsp_session(self, sess: RtspSession) -> bool:
+        if self._temporary_talkback_in_group():
+            return self._reject_rtsp_during_temporary_talkback(sess)
         self._cancel_close_task()
         _LOGGER.info(
             "[abb] stream coordinator: attach RTSP session station=%s "
@@ -451,6 +513,8 @@ class StationStreamCoordinator:
             len(self._rtsp_play_sessions),
         )
         self._add_rtsp_play_session(sess)
+        if self._temporary_talkback_in_group():
+            return self._reject_rtsp_during_temporary_talkback(sess)
         self.session.set_packet_handlers(
             on_video=self._forward_video,
             on_audio=self._forward_audio,
@@ -458,6 +522,8 @@ class StationStreamCoordinator:
         self._notify_state()
         try:
             async with self._stream_lock:
+                if self._temporary_talkback_in_group():
+                    return self._reject_rtsp_during_temporary_talkback(sess)
                 if not self.session.active:
                     await self.session.open()
         except Exception:
@@ -516,10 +582,23 @@ class StationStreamCoordinator:
         self._cancel_close_task()
         self._rtsp_play_sessions = []
         self.session.set_packet_handlers(on_video=None, on_audio=None)
+        temporary_task = self._temporary_talkback_task
+        if (
+            temporary_task is not None
+            and temporary_task is not asyncio.current_task()
+            and not temporary_task.done()
+        ):
+            temporary_task.cancel()
+            try:
+                await temporary_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         async with self._stream_lock:
             if self.session.active:
                 await self.session.close()
         self._talkback_owner = ""
+        self._temporary_talkback_active = False
+        self._temporary_talkback_task = None
         self._notify_state()
 
     def _schedule_close(self) -> None:
@@ -573,6 +652,8 @@ class StationStreamCoordinator:
             self._notify_state()
 
     def start_talkback(self, session_id: str = "") -> dict[str, Any]:
+        if self._temporary_talkback_active:
+            raise RuntimeError("an unattended announcement is already in progress")
         session_id = str(session_id or "").strip()
         if self._talkback_owner and session_id and self._talkback_owner != session_id:
             _LOGGER.info(
@@ -588,6 +669,8 @@ class StationStreamCoordinator:
         return stats
 
     def stop_talkback(self, session_id: str = "") -> dict[str, Any]:
+        if self._temporary_talkback_active:
+            raise RuntimeError("an unattended announcement is already in progress")
         session_id = str(session_id or "").strip()
         if session_id and self._talkback_owner and session_id != self._talkback_owner:
             stats = self.talkback_stats()
@@ -605,6 +688,8 @@ class StationStreamCoordinator:
         pcm: bytes,
         session_id: str = "",
     ) -> dict[str, Any]:
+        if self._temporary_talkback_active:
+            raise RuntimeError("an unattended announcement is already in progress")
         session_id = str(session_id or "").strip()
         if session_id and self._talkback_owner and session_id != self._talkback_owner:
             stats = self.talkback_stats()
@@ -634,6 +719,8 @@ class StationStreamCoordinator:
         amplitude: float = 0.35,
         session_id: str = "",
     ) -> dict[str, Any]:
+        if self._temporary_talkback_active:
+            raise RuntimeError("an unattended announcement is already in progress")
         session_id = str(session_id or "").strip()
         if session_id and self._talkback_owner and session_id != self._talkback_owner:
             stats = self.talkback_stats()
@@ -658,6 +745,8 @@ class StationStreamCoordinator:
         session_id: str = "",
     ) -> dict[str, Any]:
         """Play a complete decoded clip using talkback owner semantics."""
+        if self._temporary_talkback_active:
+            raise RuntimeError("an unattended announcement is already in progress")
         session_id = str(session_id or "").strip()
         if session_id and self._talkback_owner and session_id != self._talkback_owner:
             stats = self.talkback_stats()
@@ -670,6 +759,43 @@ class StationStreamCoordinator:
         stats["owner"] = self._talkback_owner
         self._notify_state()
         return stats
+
+    async def send_temporary_talkback_pcm16le_audio(
+        self,
+        pcm: bytes,
+        *,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        """Open a short-lived, audio-only consumer-free talkback call."""
+        session_id = str(session_id or "").strip()
+        unavailable_reason = self._temporary_talkback_unavailable_reason(session_id)
+        if unavailable_reason is not None:
+            raise RuntimeError(unavailable_reason)
+
+        self._temporary_talkback_active = True
+        self._temporary_talkback_task = asyncio.current_task()
+        self._talkback_owner = session_id
+        self._notify_state()
+        try:
+            async with self._stream_lock:
+                unavailable_reason = self._temporary_talkback_unavailable_reason(
+                    session_id,
+                    own_reservation=True,
+                )
+                if unavailable_reason is not None:
+                    raise RuntimeError(unavailable_reason)
+                self.session.set_packet_handlers(on_video=None, on_audio=None)
+                try:
+                    await self.session.open()
+                    return await self.session.send_talkback_pcm16le_audio(pcm)
+                finally:
+                    if self.session.active:
+                        await self.session.close()
+        finally:
+            self._talkback_owner = ""
+            self._temporary_talkback_active = False
+            self._temporary_talkback_task = None
+            self._notify_state()
 
 
 class ABBWelcomeCamera(Camera):
@@ -766,6 +892,9 @@ class ABBWelcomeCamera(Camera):
             "rtsp_sessions": self._rtsp.session_count,
             "stream_clients": self._coordinator.client_count,
             "stream_active": self._coordinator.active,
+            "temporary_talkback_active": (
+                self._coordinator.temporary_talkback_active
+            ),
             "snapshot_event_id": snapshot.event_id if snapshot else "",
             "snapshot_station_id": snapshot.station_id if snapshot else "",
             "talkback_ready": self._coordinator.talkback_ready,
@@ -1094,7 +1223,7 @@ class ABBWelcomeCamera(Camera):
             return
 
         try:
-            await self._coordinator.attach_rtsp_session(sess)
+            attached = await self._coordinator.attach_rtsp_session(sess)
         except Exception as err:  # noqa: BLE001
             _LOGGER.exception(
                 "[abb] camera %s: failed to open stream session "
@@ -1103,6 +1232,8 @@ class ABBWelcomeCamera(Camera):
                 self._camera_index if self._camera_index is not None else "default",
                 err,
             )
+            return
+        if not attached:
             return
         _LOGGER.info(
             "[abb] camera %s: PLAY started, forwarding RTP to RTSP client "
@@ -1133,11 +1264,19 @@ class ABBWelcomeCamera(Camera):
     async def stream_source(self) -> str | None:
         if _go2rtc_url(self.hass) is None:
             return None
+        # HA's stream/record pipeline does not pass through the WebRTC offer
+        # handler, so refresh the volatile go2rtc registration here too.
+        # Bundled go2rtc may restart after entity setup and lose its streams.
+        await self._register_with_go2rtc()
         return f"rtsp://{GO2RTC_RTSP_HOST}:{GO2RTC_RTSP_PORT}/{self._stream_name}"
 
     @property
     def talkback_ready(self) -> bool:
         return self._coordinator.talkback_ready
+
+    @property
+    def temporary_talkback_active(self) -> bool:
+        return self._coordinator.temporary_talkback_active
 
     @property
     def talkback_stats(self) -> dict[str, Any]:
@@ -1209,6 +1348,20 @@ class ABBWelcomeCamera(Camera):
         )
         self.async_write_ha_state()
         return stats
+
+    async def async_temporary_talkback_audio(
+        self,
+        pcm: bytes,
+        talkback_session_id: str = "",
+    ) -> dict[str, Any]:
+        """Play decoded PCM through a new, short-lived intercom call."""
+        try:
+            return await self._coordinator.send_temporary_talkback_pcm16le_audio(
+                pcm,
+                session_id=talkback_session_id,
+            )
+        finally:
+            self.async_write_ha_state()
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
