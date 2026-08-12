@@ -22,7 +22,6 @@ and "reason" string stay coherent.
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass
 
@@ -30,8 +29,9 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import DEFAULT_ALLOW_PICKUP, DOMAIN
+from .redaction import get_redacting_logger
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_redacting_logger(__name__)
 
 MANUAL_ARM_SECONDS = 180
 RING_ARM_SECONDS = 120

@@ -30,14 +30,15 @@ Channel allocation:
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
 import struct
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final
 
-_LOGGER = logging.getLogger(__name__)
+from .redaction import get_redacting_logger
+
+_LOGGER = get_redacting_logger(__name__)
 
 VIDEO_RTP_CHANNEL: Final = 0
 VIDEO_RTCP_CHANNEL: Final = 1

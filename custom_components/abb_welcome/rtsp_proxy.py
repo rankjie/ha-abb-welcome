@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from contextlib import suppress
 
-_LOGGER = logging.getLogger(__name__)
+from .redaction import get_redacting_logger
+
+_LOGGER = get_redacting_logger(__name__)
 
 
 class RtspTcpProxy:

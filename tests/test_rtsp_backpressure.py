@@ -10,17 +10,23 @@ from __future__ import annotations
 import importlib.util
 import struct
 import sys
+import types
 from pathlib import Path
 
-_FILE = (
+_PKG_DIR = (
     Path(__file__).resolve().parent.parent
-    / "custom_components" / "abb_welcome" / "rtsp_server.py"
+    / "custom_components" / "abb_welcome"
 )
 
-_spec = importlib.util.spec_from_file_location("abb_rtsp_server", _FILE)
+pkg = types.ModuleType("abb_welcome")
+pkg.__path__ = [str(_PKG_DIR)]
+sys.modules.setdefault("abb_welcome", pkg)
+_spec = importlib.util.spec_from_file_location(
+    "abb_welcome.rtsp_server", _PKG_DIR / "rtsp_server.py"
+)
 rtsp_server = importlib.util.module_from_spec(_spec)
 # Register before exec so dataclass annotation resolution can find the module.
-sys.modules["abb_rtsp_server"] = rtsp_server
+sys.modules["abb_welcome.rtsp_server"] = rtsp_server
 _spec.loader.exec_module(rtsp_server)
 
 

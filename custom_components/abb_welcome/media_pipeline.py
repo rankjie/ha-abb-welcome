@@ -16,23 +16,37 @@ the SIP call, TEARDOWN the RTSP session.
 from __future__ import annotations
 
 import asyncio
-import logging
 import math
 import secrets
 import socket
 import struct
+import threading
+import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from .intercom_dialer import CallState, Door, IntercomDialer
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-_LOGGER = logging.getLogger(__name__)
+from .intercom_dialer import (
+    CallState,
+    Door,
+    IntercomDialer,
+    MediaDescription,
+    MediaEncryptionKeys,
+)
+from .redaction import get_redacting_logger
+
+_LOGGER = get_redacting_logger(__name__)
 
 _KEEPALIVE_INTERVAL = 1.0
 _RTCP_INTERVAL = 5.0
+_PLI_INTERVAL = 1.0
+_UDP_PAIR_ALLOCATION_ATTEMPTS = 32
 _PCMA_SILENCE_20MS = b"\xd5" * 160
+_TALK_SEND_GAP_WARNING_SECONDS = 0.030
+_NANOSECONDS_PER_SECOND = 1_000_000_000
 
 
 def _build_rtp_keepalive(seq: int, pt: int = 0) -> bytes:
@@ -41,6 +55,20 @@ def _build_rtp_keepalive(seq: int, pt: int = 0) -> bytes:
 
 def _build_rtcp_pli(reporter: int, media: int) -> bytes:
     return struct.pack("!BBHII", 0x81, 206, 2, reporter, media)
+
+
+def _build_rtcp_fir(reporter: int, media: int, sequence: int) -> bytes:
+    """Build an RFC 5104 Full Intra Request with one FCI entry."""
+    return struct.pack(
+        "!BBHIIIB3x",
+        0x84,
+        206,
+        4,
+        reporter,
+        0,
+        media,
+        sequence & 0xFF,
+    )
 
 
 def _build_rtcp_rr(reporter: int, source: int, last_seq: int) -> bytes:
@@ -55,7 +83,13 @@ def _build_rtcp_rr(reporter: int, source: int, last_seq: int) -> bytes:
     )
 
 
-def _rtp_payload(data: bytes) -> bytes | None:
+def _is_rtcp_packet(data: bytes) -> bool:
+    """Recognize the RTCP packet-type range used by RTP/RTCP mux."""
+    return len(data) >= 4 and (data[0] >> 6) == 2 and 192 <= data[1] <= 223
+
+
+def _rtp_payload_bounds(data: bytes) -> tuple[int, int] | None:
+    """Return RTP payload bounds, accounting for CSRCs, extensions and padding."""
     if len(data) < 12 or (data[0] >> 6) != 2:
         return None
     cc = data[0] & 0x0F
@@ -75,7 +109,259 @@ def _rtp_payload(data: bytes) -> bytes | None:
         if padding == 0 or padding > end - offset:
             return None
         end -= padding
-    return data[offset:end]
+    return offset, end
+
+
+def _rtp_payload(data: bytes) -> bytes | None:
+    bounds = _rtp_payload_bounds(data)
+    if bounds is None:
+        return None
+    return data[bounds[0]:bounds[1]]
+
+
+def _validate_aes_key(key: bytes) -> bytes:
+    if len(key) not in (16, 24, 32):
+        raise ValueError("invalid ABB media encryption key length")
+    return key
+
+
+def _media_encryption_key(media: MediaDescription) -> bytes | None:
+    """Return the validated negotiated key for one media leg."""
+    if not media.abb_encrypt:
+        return None
+    return _validate_aes_key(media.abb_encrypt_key)
+
+
+def _directional_media_encryption_keys(
+    media: MediaDescription,
+    local_send_keys: MediaEncryptionKeys | None,
+) -> tuple[bytes | None, bytes | None]:
+    """Return receive/decrypt and send/encrypt keys for one media leg.
+
+    ASI22 requires a distinct local key in SDP to establish two-way audio,
+    but uses the gateway-provided key for the custom AES RTP framing in both
+    directions.  Validate the advertised local key while retaining that
+    device-specific symmetric wire-key behavior.
+    """
+    receive_key = _media_encryption_key(media)
+    if local_send_keys is None:
+        return receive_key, receive_key
+    if receive_key is None:
+        raise ValueError(
+            f"missing negotiated remote {media.media} media encryption key"
+        )
+    try:
+        send_key = getattr(local_send_keys, media.media)
+    except AttributeError as err:
+        raise ValueError(f"missing local {media.media} media encryption key") from err
+    _validate_aes_key(send_key)
+    return receive_key, receive_key
+
+
+def _encrypt_rtp_payload(packet: bytes, key: bytes) -> bytes:
+    """Apply ABB's AES-ECB framing to an RTP payload, leaving RTCP untouched."""
+    if _is_rtcp_packet(packet):
+        return packet
+    key = _validate_aes_key(key)
+    bounds = _rtp_payload_bounds(packet)
+    if bounds is None:
+        raise ValueError("malformed RTP packet")
+    offset, end = bounds
+    plaintext = packet[offset:end]
+    if len(plaintext) > 0xFFFF:
+        raise ValueError("RTP payload is too large for ABB encryption framing")
+    padded_length = (len(plaintext) + 15) & ~15
+    padded = plaintext + (b"\x00" * (padded_length - len(plaintext)))
+    encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    framed = struct.pack("!H", len(plaintext)) + ciphertext
+    return packet[:offset] + framed + packet[end:]
+
+
+def _decrypt_rtp_payload(packet: bytes, key: bytes) -> bytes:
+    """Remove ABB's AES-ECB framing from an RTP payload; RTCP is unchanged."""
+    if _is_rtcp_packet(packet):
+        return packet
+    key = _validate_aes_key(key)
+    bounds = _rtp_payload_bounds(packet)
+    if bounds is None:
+        raise ValueError("malformed RTP packet")
+    offset, end = bounds
+    framed = packet[offset:end]
+    if len(framed) < 2 or (len(framed) - 2) % 16:
+        raise ValueError("malformed ABB encrypted RTP payload")
+    plaintext_length = struct.unpack_from("!H", framed)[0]
+    ciphertext = framed[2:]
+    if plaintext_length > len(ciphertext):
+        raise ValueError("invalid ABB encrypted RTP payload length")
+    decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+    padded = decryptor.update(ciphertext) + decryptor.finalize()
+    if any(padded[plaintext_length:]):
+        raise ValueError("invalid ABB encrypted RTP payload padding")
+    return packet[:offset] + padded[:plaintext_length] + packet[end:]
+
+
+@dataclass(frozen=True)
+class _SelectedVideoFormat:
+    """The negotiated video format selected from an SDP media description."""
+
+    payload_type: int
+    codec: str | None
+    fmtp: str | None
+
+    @property
+    def is_h264(self) -> bool:
+        codec_name = (self.codec or "").partition("/")[0]
+        return codec_name.upper() == "H264"
+
+    @property
+    def has_sprop_parameter_sets(self) -> bool:
+        return "sprop-parameter-sets" in (self.fmtp or "").lower()
+
+
+def _select_video_format(
+    payload_types: list[int],
+    rtpmap: dict[int, str],
+    fmtp: dict[int, str],
+) -> _SelectedVideoFormat | None:
+    """Prefer H.264 and consistently return metadata for the selected PT."""
+    if not payload_types:
+        return None
+    payload_type = next(
+        (
+            pt
+            for pt in payload_types
+            if rtpmap.get(pt, "").partition("/")[0].upper() == "H264"
+        ),
+        payload_types[0],
+    )
+    return _SelectedVideoFormat(
+        payload_type=payload_type,
+        codec=rtpmap.get(payload_type),
+        fmtp=fmtp.get(payload_type),
+    )
+
+
+@dataclass(frozen=True)
+class _H264NalMetadata:
+    """Payload-free RFC 6184 metadata extracted from one RTP packet."""
+
+    packetization_type: int | None
+    nal_types: tuple[int, ...] = ()
+    fu_start: bool = False
+    valid: bool = True
+
+
+def _h264_nal_metadata(data: bytes) -> _H264NalMetadata:
+    """Parse only NAL type metadata; never retain the RTP payload."""
+    payload = _rtp_payload(data)
+    if not payload:
+        return _H264NalMetadata(None, valid=False)
+
+    nal_type = payload[0] & 0x1F
+    if 1 <= nal_type <= 23:
+        return _H264NalMetadata(nal_type, (nal_type,))
+
+    if nal_type == 24:  # STAP-A: two-byte length followed by each NAL unit.
+        member_types: list[int] = []
+        offset = 1
+        while offset < len(payload):
+            if offset + 2 > len(payload):
+                return _H264NalMetadata(nal_type, valid=False)
+            member_size = struct.unpack_from("!H", payload, offset)[0]
+            offset += 2
+            if member_size == 0 or offset + member_size > len(payload):
+                return _H264NalMetadata(nal_type, valid=False)
+            member_type = payload[offset] & 0x1F
+            if not 1 <= member_type <= 23:
+                return _H264NalMetadata(nal_type, valid=False)
+            member_types.append(member_type)
+            offset += member_size
+        if not member_types:
+            return _H264NalMetadata(nal_type, valid=False)
+        return _H264NalMetadata(nal_type, tuple(member_types))
+
+    if nal_type == 28:  # FU-A: the FU header carries the original NAL type.
+        if len(payload) < 2:
+            return _H264NalMetadata(nal_type, valid=False)
+        fu_header = payload[1]
+        original_type = fu_header & 0x1F
+        if fu_header & 0x20 or not 1 <= original_type <= 23:
+            return _H264NalMetadata(nal_type, valid=False)
+        return _H264NalMetadata(
+            nal_type,
+            (original_type,),
+            fu_start=bool(fu_header & 0x80),
+        )
+
+    if nal_type == 0:
+        return _H264NalMetadata(nal_type, valid=False)
+    return _H264NalMetadata(nal_type, (nal_type,))
+
+
+@dataclass
+class _H264NalCounters:
+    """Aggregate safe integer counters without retaining packet data."""
+
+    sps: int = 0
+    pps: int = 0
+    idr: int = 0
+    stap_a: int = 0
+    fu_a: int = 0
+    fu_a_starts: int = 0
+    other: int = 0
+    invalid: int = 0
+    type_1: int = 0
+    type_2: int = 0
+    type_3: int = 0
+    type_4: int = 0
+    type_6: int = 0
+    type_9: int = 0
+    type_25: int = 0
+    type_26: int = 0
+    type_27: int = 0
+    type_29: int = 0
+
+    def observe(self, data: bytes) -> None:
+        metadata = _h264_nal_metadata(data)
+        if not metadata.valid:
+            self.invalid += 1
+            return
+        if metadata.packetization_type == 24:
+            self.stap_a += 1
+        elif metadata.packetization_type == 28:
+            self.fu_a += 1
+            if metadata.fu_start:
+                self.fu_a_starts += 1
+        for nal_type in metadata.nal_types:
+            if nal_type == 7:
+                self.sps += 1
+            elif nal_type == 8:
+                self.pps += 1
+            elif nal_type == 5:
+                self.idr += 1
+            else:
+                self.other += 1
+                if nal_type == 1:
+                    self.type_1 += 1
+                elif nal_type == 2:
+                    self.type_2 += 1
+                elif nal_type == 3:
+                    self.type_3 += 1
+                elif nal_type == 4:
+                    self.type_4 += 1
+                elif nal_type == 6:
+                    self.type_6 += 1
+                elif nal_type == 9:
+                    self.type_9 += 1
+                elif nal_type == 25:
+                    self.type_25 += 1
+                elif nal_type == 26:
+                    self.type_26 += 1
+                elif nal_type == 27:
+                    self.type_27 += 1
+                elif nal_type == 29:
+                    self.type_29 += 1
 
 
 def _linear16_to_pcma_sample(sample: int) -> int:
@@ -135,25 +421,54 @@ def _encode_pcm16le_to_pcma(pcm: bytes) -> bytes:
     return bytes(out)
 
 
+def _next_talk_send_deadline_ns(
+    deadline_ns: int,
+    sent_at_ns: int,
+    interval_ns: int,
+) -> int:
+    """Advance an absolute RTP deadline without burst catch-up after a stall."""
+    scheduled_ns = deadline_ns + interval_ns
+    if scheduled_ns <= sent_at_ns:
+        return sent_at_ns + interval_ns
+    return scheduled_ns
+
+
 class _PCMATalkSender:
-    """Continuous PCMA RTP sender for the intercom talkback uplink."""
+    """Continuous PCMA RTP sender on a dedicated cadence thread.
+
+    The owned socket is a duplicate of the RTP receive socket, so outgoing
+    packets retain the negotiated source port without calling an asyncio
+    transport from a foreign thread.
+    """
 
     def __init__(
         self,
-        transport: asyncio.DatagramTransport,
+        sock: socket.socket,
         dest: tuple[str, int],
         *,
         payload_type: int = 8,
         samples_per_packet: int = 160,
         packet_rate: int = 50,
         max_queue_frames: int = 25,
+        encryption_key: bytes | None = None,
+        monotonic_ns: Callable[[], int] | None = None,
     ) -> None:
-        self.transport = transport
+        self._sock = sock
         self.dest = dest
         self.payload_type = payload_type
         self.samples_per_packet = samples_per_packet
         self.interval = 1.0 / packet_rate
+        self._interval_ns = max(
+            1,
+            round(_NANOSECONDS_PER_SECOND / packet_rate),
+        )
         self.max_queue_frames = max_queue_frames
+        self._encryption_key = (
+            _validate_aes_key(encryption_key)
+            if encryption_key is not None
+            else None
+        )
+        self._monotonic_ns = monotonic_ns or time.monotonic_ns
         self.ssrc = secrets.randbits(32)
         self.seq = secrets.randbits(16)
         self.timestamp = secrets.randbits(32)
@@ -161,8 +476,13 @@ class _PCMATalkSender:
         self._marker_next = False
         self._pcm_buffer = bytearray()
         self._queued_pcma: deque[bytes] = deque()
-        self._task: asyncio.Task[None] | None = None
-        self._stop = asyncio.Event()
+        self._condition = threading.Condition()
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()
+        self._stop_requested = False
+        self._active = False
+        self._started = False
+        self._socket_closed = False
         self.packets_sent = 0
         self.bytes_sent = 0
         self.frames_received = 0
@@ -170,91 +490,170 @@ class _PCMATalkSender:
         self.silence_packets_sent = 0
         self.underrun_silence_packets = 0
         self.dropped_frames = 0
+        self.send_errors = 0
+        self._last_send_at_ns: int | None = None
+        self.send_intervals = 0
+        self.send_gaps_over_30ms = 0
+        self.max_send_gap_ns = 0
 
     @property
     def active(self) -> bool:
-        return self._task is not None and not self._task.done()
+        with self._condition:
+            return self._active
+
+    @property
+    def queue_frames(self) -> int:
+        with self._condition:
+            return len(self._queued_pcma)
 
     async def start(self) -> None:
-        if self._task is not None:
-            return
-        self._stop.clear()
-        self._task = asyncio.create_task(self._loop(), name="abb_pcma_talk_sender")
+        with self._condition:
+            if self._active:
+                return
+            if self._started:
+                raise RuntimeError("talkback RTP sender cannot be restarted")
+            self._started = True
+            self._stop_requested = False
+            self._ready.clear()
+            thread = threading.Thread(
+                target=self._thread_main,
+                name="abb_pcma_talk_sender",
+                daemon=True,
+            )
+            self._thread = thread
+        try:
+            thread.start()
+        except BaseException:
+            with self._condition:
+                self._thread = None
+            self._close_owned_socket()
+            raise
+        await asyncio.to_thread(self._ready.wait)
+        if not self.active:
+            await asyncio.to_thread(thread.join)
+            raise RuntimeError("talkback RTP sender failed to start")
 
     async def stop(self) -> None:
         self.stop_talk()
-        self._stop.set()
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-            self._task = None
+        with self._condition:
+            self._stop_requested = True
+            self._condition.notify_all()
+            thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            await asyncio.to_thread(thread.join)
+        elif thread is None:
+            self._close_owned_socket()
+        with self._condition:
+            self._thread = None
 
     def start_talk(self) -> None:
-        self.talking = True
-        self._marker_next = True
+        with self._condition:
+            self.talking = True
+            self._marker_next = True
+            self._condition.notify_all()
 
     def stop_talk(self) -> None:
-        self.talking = False
-        self._marker_next = False
-        self._pcm_buffer.clear()
-        self._queued_pcma.clear()
+        with self._condition:
+            self.talking = False
+            self._marker_next = False
+            self._pcm_buffer.clear()
+            self._queued_pcma.clear()
+            self._condition.notify_all()
 
     async def drain(self, timeout: float = 1.0) -> None:
         deadline = asyncio.get_running_loop().time() + timeout
-        while self._queued_pcma and asyncio.get_running_loop().time() < deadline:
+        while self.queue_frames and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(self.interval)
 
     def feed_pcm16le(self, pcm: bytes) -> int:
-        if not self.talking:
-            return 0
-        self._pcm_buffer.extend(pcm)
         frame_bytes = self.samples_per_packet * 2
-        queued = 0
-        while len(self._pcm_buffer) >= frame_bytes:
-            frame = bytes(self._pcm_buffer[:frame_bytes])
-            del self._pcm_buffer[:frame_bytes]
-            self._queued_pcma.append(_encode_pcm16le_to_pcma(frame))
-            self.frames_received += 1
-            queued += 1
+        with self._condition:
+            if not self.talking:
+                return 0
+            self._pcm_buffer.extend(pcm)
+            frames: list[bytes] = []
+            while len(self._pcm_buffer) >= frame_bytes:
+                frames.append(bytes(self._pcm_buffer[:frame_bytes]))
+                del self._pcm_buffer[:frame_bytes]
+        encoded = [_encode_pcm16le_to_pcma(frame) for frame in frames]
+        with self._condition:
+            if not self.talking:
+                return 0
+            for frame in encoded:
+                self._queued_pcma.append(frame)
+                self.frames_received += 1
             while len(self._queued_pcma) > self.max_queue_frames:
                 self._queued_pcma.popleft()
                 self.dropped_frames += 1
-        return queued
+            self._condition.notify_all()
+        return len(encoded)
 
-    async def _loop(self) -> None:
-        loop = asyncio.get_running_loop()
-        next_at = loop.time()
-        while not self._stop.is_set():
-            payload = _PCMA_SILENCE_20MS
-            marker = False
-            if self.talking:
-                if self._queued_pcma:
-                    payload = self._queued_pcma.popleft()
-                    marker = self._marker_next
-                    self._marker_next = False
-                    self.voice_packets_sent += 1
-                else:
-                    self.underrun_silence_packets += 1
-                    self.silence_packets_sent += 1
-            else:
-                self.silence_packets_sent += 1
+    def _thread_main(self) -> None:
+        deadline_ns = self._monotonic_ns()
+        ready = False
+        try:
+            while True:
+                with self._condition:
+                    while True:
+                        if self._stop_requested:
+                            return
+                        now_ns = self._monotonic_ns()
+                        remaining_ns = deadline_ns - now_ns
+                        if remaining_ns <= 0:
+                            break
+                        self._condition.wait(
+                            timeout=remaining_ns / _NANOSECONDS_PER_SECOND
+                        )
 
-            self._send_pcma(payload, marker=marker)
-            next_at += self.interval
-            sleep_for = next_at - loop.time()
-            if sleep_for > 0:
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=sleep_for)
-                    return
-                except asyncio.TimeoutError:
-                    pass
-            else:
-                next_at = loop.time()
+                    payload = _PCMA_SILENCE_20MS
+                    marker = False
+                    if self.talking:
+                        if self._queued_pcma:
+                            payload = self._queued_pcma.popleft()
+                            marker = self._marker_next
+                            self._marker_next = False
+                            self.voice_packets_sent += 1
+                        else:
+                            self.underrun_silence_packets += 1
+                            self.silence_packets_sent += 1
+                    else:
+                        self.silence_packets_sent += 1
+                    self._condition.notify_all()
+                    try:
+                        self._send_pcma_locked(payload, marker=marker)
+                    except BlockingIOError:
+                        self.send_errors += 1
+                    if not ready:
+                        # Report readiness only after packet construction and
+                        # the first socket-send attempt completed without a
+                        # fatal socket error.
+                        self._active = True
+                        self._ready.set()
+                        ready = True
+                    sent_at_ns = self._monotonic_ns()
+                    deadline_ns = _next_talk_send_deadline_ns(
+                        deadline_ns,
+                        sent_at_ns,
+                        self._interval_ns,
+                    )
+        except OSError:
+            with self._condition:
+                self.send_errors += 1
+            _LOGGER.warning("[abb] talkback RTP sender stopped after socket error")
+        except Exception:
+            _LOGGER.exception("[abb] talkback RTP sender stopped unexpectedly")
+        finally:
+            with self._condition:
+                self._active = False
+                self._ready.set()
+                self._condition.notify_all()
+            self._close_owned_socket()
 
     def _send_pcma(self, payload: bytes, *, marker: bool = False) -> None:
+        with self._condition:
+            self._send_pcma_locked(payload, marker=marker)
+
+    def _send_pcma_locked(self, payload: bytes, *, marker: bool = False) -> None:
         header = struct.pack(
             "!BBHII",
             0x80,
@@ -263,28 +662,56 @@ class _PCMATalkSender:
             self.timestamp & 0xFFFFFFFF,
             self.ssrc & 0xFFFFFFFF,
         )
-        self.transport.sendto(header + payload, self.dest)
+        packet = header + payload
+        if self._encryption_key is not None:
+            packet = _encrypt_rtp_payload(packet, self._encryption_key)
+        self._sock.sendto(packet, self.dest)
+        sent_at_ns = self._monotonic_ns()
+        if self._last_send_at_ns is not None:
+            gap_ns = sent_at_ns - self._last_send_at_ns
+            self.send_intervals += 1
+            self.max_send_gap_ns = max(self.max_send_gap_ns, gap_ns)
+            if gap_ns > round(
+                _TALK_SEND_GAP_WARNING_SECONDS * _NANOSECONDS_PER_SECOND
+            ):
+                self.send_gaps_over_30ms += 1
+        self._last_send_at_ns = sent_at_ns
         self.packets_sent += 1
-        self.bytes_sent += len(header) + len(payload)
+        self.bytes_sent += len(packet)
         self.seq = (self.seq + 1) & 0xFFFF
         self.timestamp = (self.timestamp + len(payload)) & 0xFFFFFFFF
 
+    def _close_owned_socket(self) -> None:
+        with self._condition:
+            if self._socket_closed:
+                return
+            self._socket_closed = True
+        _close_socket(self._sock)
+
     def stats(self) -> dict[str, Any]:
-        return {
-            "talking": self.talking,
-            "active": self.active,
-            "packets": self.packets_sent,
-            "bytes": self.bytes_sent,
-            "frames": self.frames_received,
-            "voice_packets": self.voice_packets_sent,
-            "silence_packets": self.silence_packets_sent,
-            "underrun_packets": self.underrun_silence_packets,
-            "dropped_frames": self.dropped_frames,
-            "queue_frames": len(self._queued_pcma),
-            "payload_type": self.payload_type,
-            "ssrc": self.ssrc,
-            "dest": f"{self.dest[0]}:{self.dest[1]}",
-        }
+        with self._condition:
+            return {
+                "talking": self.talking,
+                "active": self._active,
+                "packets": self.packets_sent,
+                "bytes": self.bytes_sent,
+                "frames": self.frames_received,
+                "voice_packets": self.voice_packets_sent,
+                "silence_packets": self.silence_packets_sent,
+                "underrun_packets": self.underrun_silence_packets,
+                "dropped_frames": self.dropped_frames,
+                "queue_frames": len(self._queued_pcma),
+                "send_errors": self.send_errors,
+                "send_intervals": self.send_intervals,
+                "send_gaps_over_30ms": self.send_gaps_over_30ms,
+                "max_send_gap_ms": round(
+                    self.max_send_gap_ns / 1_000_000,
+                    3,
+                ),
+                "payload_type": self.payload_type,
+                "ssrc": self.ssrc,
+                "dest": f"{self.dest[0]}:{self.dest[1]}",
+            }
 
 
 def best_local_ip_for(host: str) -> str:
@@ -298,11 +725,42 @@ def best_local_ip_for(host: str) -> str:
         probe.close()
 
 
-def _alloc_udp(bind_ip: str) -> socket.socket:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind((bind_ip, 0))
-    s.setblocking(False)
-    return s
+def _alloc_udp_pair(
+    bind_ip: str,
+    *,
+    attempts: int = _UDP_PAIR_ALLOCATION_ATTEMPTS,
+) -> tuple[socket.socket, socket.socket]:
+    """Bind an even RTP port and its adjacent RTCP port with bounded retries."""
+    last_error: OSError | None = None
+    for _attempt in range(max(1, attempts)):
+        first: socket.socket | None = None
+        second: socket.socket | None = None
+        try:
+            first = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            first.bind((bind_ip, 0))
+            first_port = first.getsockname()[1]
+            second = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if first_port % 2 == 0:
+                rtp_sock, rtcp_sock = first, second
+                second.bind((bind_ip, first_port + 1))
+            else:
+                rtp_sock, rtcp_sock = second, first
+                second.bind((bind_ip, first_port - 1))
+            rtp_sock.setblocking(False)
+            rtcp_sock.setblocking(False)
+            return rtp_sock, rtcp_sock
+        except OSError as err:
+            last_error = err
+            _close_socket(first)
+            _close_socket(second)
+    raise OSError(
+        "unable to allocate an adjacent UDP RTP/RTCP port pair"
+    ) from last_error
+
+
+def _close_socket(sock: socket.socket | None) -> None:
+    if sock is not None:
+        sock.close()
 
 
 class _RTPProtocol(asyncio.DatagramProtocol):
@@ -320,11 +778,21 @@ class _RTPProtocol(asyncio.DatagramProtocol):
         rewrite_pt: int | None,
         on_first_packet: Callable[[bytes], None] | None,
         label: str = "rtp",
+        *,
+        track_h264_nals: bool = False,
+        drop_muxed_rtcp: bool = False,
+        encryption_key: bytes | None = None,
     ) -> None:
         self._on_packet = on_packet
         self._rewrite_pt = rewrite_pt
         self._on_first_packet = on_first_packet
         self.label = label
+        self._drop_muxed_rtcp = drop_muxed_rtcp
+        self._encryption_key = (
+            _validate_aes_key(encryption_key)
+            if encryption_key is not None
+            else None
+        )
         self.transport: asyncio.DatagramTransport | None = None
         self.packets = 0
         self.bytes_received = 0
@@ -332,13 +800,34 @@ class _RTPProtocol(asyncio.DatagramProtocol):
         self.media_ssrc = 0
         self.payload_types: dict[int, int] = {}
         self._rewrites = 0
+        self.rtcp_packets = 0
+        self.decrypt_errors = 0
+        self.h264_nals = _H264NalCounters() if track_h264_nals else None
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        if _is_rtcp_packet(data):
+            self.rtcp_packets += 1
+            if self._drop_muxed_rtcp:
+                return
+            try:
+                self._on_packet(data)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("on_packet handler raised: %s", err)
+            return
+        elif self._encryption_key is not None:
+            try:
+                data = _decrypt_rtp_payload(data, self._encryption_key)
+            except ValueError:
+                self.decrypt_errors += 1
+                _LOGGER.debug("Dropping malformed encrypted ABB RTP packet")
+                return
         self.packets += 1
         self.bytes_received += len(data)
+        if self.h264_nals is not None:
+            self.h264_nals.observe(data)
         if len(data) >= 12:
             pt = data[1] & 0x7F
             self.payload_types[pt] = self.payload_types.get(pt, 0) + 1
@@ -366,10 +855,55 @@ class _RTPProtocol(asyncio.DatagramProtocol):
         _LOGGER.debug("RTP datagram error: %s", exc)
 
 
+@dataclass(frozen=True)
+class _RemoteMediaEndpoints:
+    rtp: tuple[str, int]
+    rtcp: tuple[str, int]
+    rtcp_mux: bool
+    explicit_rtcp: bool
+
+
+def _remote_media_endpoints(
+    media: MediaDescription,
+) -> _RemoteMediaEndpoints | None:
+    """Resolve RTP and RTCP destinations from one SDP media description."""
+    if not media.connection_ip or not 1 <= media.port <= 65535:
+        return None
+    rtp = (media.connection_ip, media.port)
+    if media.rtcp_mux:
+        return _RemoteMediaEndpoints(rtp, rtp, True, media.rtcp_port is not None)
+    rtcp_port = media.rtcp_port
+    if rtcp_port is None:
+        rtcp_port = media.port + 1
+    if not 1 <= rtcp_port <= 65535:
+        return None
+    rtcp_ip = media.rtcp_ip or media.connection_ip
+    return _RemoteMediaEndpoints(
+        rtp,
+        (rtcp_ip, rtcp_port),
+        False,
+        media.rtcp_port is not None,
+    )
+
+
+def _select_rtcp_transport(
+    rtcp_mux: bool,
+    rtp_transport: asyncio.DatagramTransport | None,
+    rtcp_transport: asyncio.DatagramTransport | None,
+) -> asyncio.DatagramTransport | None:
+    """Use the RTP socket for muxed RTCP and the paired socket otherwise."""
+    return rtp_transport if rtcp_mux else rtcp_transport
+
+
+def _should_request_h264_keyframe(counters: _H264NalCounters | None) -> bool:
+    """Request a keyframe until SPS, PPS, and IDR metadata have all arrived."""
+    return counters is None or not (counters.sps and counters.pps and counters.idr)
+
+
 @dataclass
 class _MediaEndpoints:
-    audio: tuple[str, int] | None
-    video: tuple[str, int] | None
+    audio: _RemoteMediaEndpoints | None
+    video: _RemoteMediaEndpoints | None
 
 
 class StreamSession:
@@ -412,22 +946,36 @@ class StreamSession:
 
         self._media_ip = ""
         self._video_sock: socket.socket | None = None
+        self._video_rtcp_sock: socket.socket | None = None
         self._audio_sock: socket.socket | None = None
+        self._audio_rtcp_sock: socket.socket | None = None
         self._video_proto: _RTPProtocol | None = None
         self._audio_proto: _RTPProtocol | None = None
         self._video_transport: asyncio.DatagramTransport | None = None
+        self._video_rtcp_transport: asyncio.DatagramTransport | None = None
         self._audio_transport: asyncio.DatagramTransport | None = None
+        self._audio_rtcp_transport: asyncio.DatagramTransport | None = None
         self._call: CallState | None = None
         self._accepted_incoming_call_id: str | None = None
         self._accepted_incoming_ack_received: bool | None = None
         self._incoming_end_task: asyncio.Task | None = None
         self._outbound_end_task: asyncio.Task | None = None
         self._endpoints = _MediaEndpoints(None, None)
+        # Negotiated media keys are directional and must not outlive the call.
+        self._audio_receive_key: bytes | None = None
+        self._video_receive_key: bytes | None = None
+        self._audio_send_key: bytes | None = None
+        self._video_send_key: bytes | None = None
         self._video_codec = "H264/90000"
         self._video_fmtp: str | None = None
         self._remote_audio_pt = 8
         self._remote_video_pt = 102
         self._talk_sender: _PCMATalkSender | None = None
+        self._last_pli_at = 0.0
+        self._pli_requests_sent = 0
+        self._fir_requests_sent = 0
+        self._receiver_reports_sent = 0
+        self._fir_sequence = 0
 
         self._stop = asyncio.Event()
         self._keepalive_task: asyncio.Task | None = None
@@ -465,47 +1013,136 @@ class StreamSession:
         self._on_video_packet = on_video
         self._on_audio_packet = on_audio
 
+    def _close_media_io(self) -> None:
+        """Close transports and any bound sockets not owned by a transport."""
+        resources = (
+            (self._video_transport, self._video_sock),
+            (self._video_rtcp_transport, self._video_rtcp_sock),
+            (self._audio_transport, self._audio_sock),
+            (self._audio_rtcp_transport, self._audio_rtcp_sock),
+        )
+        for transport, sock in resources:
+            if transport is not None:
+                transport.close()
+            else:
+                _close_socket(sock)
+        self._video_transport = None
+        self._video_rtcp_transport = None
+        self._audio_transport = None
+        self._audio_rtcp_transport = None
+        self._video_sock = None
+        self._video_rtcp_sock = None
+        self._audio_sock = None
+        self._audio_rtcp_sock = None
+
+    def _video_feedback_transport(self) -> asyncio.DatagramTransport | None:
+        endpoints = self._endpoints.video
+        if endpoints is None:
+            return None
+        return _select_rtcp_transport(
+            endpoints.rtcp_mux,
+            self._video_transport,
+            self._video_rtcp_transport,
+        )
+
+    def _send_video_pli_if_due(self, now: float) -> bool:
+        endpoints = self._endpoints.video
+        video_proto = self._video_proto
+        video_nals = video_proto.h264_nals if video_proto is not None else None
+        if (
+            endpoints is None
+            or video_proto is None
+            or video_proto.media_ssrc == 0
+            or not _should_request_h264_keyframe(video_nals)
+            or now - self._last_pli_at < _PLI_INTERVAL
+        ):
+            return False
+        transport = self._video_feedback_transport()
+        if transport is None:
+            return False
+        try:
+            transport.sendto(
+                _build_rtcp_pli(0xCAFEBABE, video_proto.media_ssrc),
+                endpoints.rtcp,
+            )
+        except OSError:
+            return False
+        self._last_pli_at = now
+        self._pli_requests_sent += 1
+        try:
+            transport.sendto(
+                _build_rtcp_fir(
+                    0xCAFEBABE,
+                    video_proto.media_ssrc,
+                    self._fir_sequence,
+                ),
+                endpoints.rtcp,
+            )
+        except OSError:
+            pass
+        else:
+            self._fir_sequence = (self._fir_sequence + 1) & 0xFF
+            self._fir_requests_sent += 1
+        return True
+
     async def open(self) -> None:
         """Dial gateway and start receiving RTP."""
         loop = asyncio.get_running_loop()
         self._accepted_incoming_call_id = None
         self._accepted_incoming_ack_received = None
+        self._last_pli_at = 0.0
+        self._pli_requests_sent = 0
+        self._fir_requests_sent = 0
+        self._receiver_reports_sent = 0
+        self._fir_sequence = 0
+        self._audio_receive_key = None
+        self._video_receive_key = None
+        self._audio_send_key = None
+        self._video_send_key = None
 
         self._media_ip = best_local_ip_for(self._gateway_host)
-        self._video_sock = _alloc_udp(self._media_ip)
-        self._audio_sock = _alloc_udp(self._media_ip)
+        try:
+            self._audio_sock, self._audio_rtcp_sock = _alloc_udp_pair(self._media_ip)
+            self._video_sock, self._video_rtcp_sock = _alloc_udp_pair(self._media_ip)
+        except OSError:
+            self._close_media_io()
+            raise
         offer_audio_port = self._audio_sock.getsockname()[1]
         offer_video_port = self._video_sock.getsockname()[1]
 
-        call = await self._accept_incoming_call_if_pending(
-            audio_port=offer_audio_port,
-            video_port=offer_video_port,
-        )
-        accepted_incoming = call is not None
-        if call is None:
-            _LOGGER.info(
-                "[abb] media: dialing gateway for door=%s media_ip=%s "
-                "audio_port=%d video_port=%d camera_index=%s",
-                self._door.name, self._media_ip,
-                offer_audio_port, offer_video_port,
-                self._camera_index if self._camera_index is not None else "default",
-            )
-            call = await self._dialer.dial(
-                self._door,
+        try:
+            call = await self._accept_incoming_call_if_pending(
                 audio_port=offer_audio_port,
                 video_port=offer_video_port,
             )
-        else:
-            _LOGGER.info(
-                "[abb] media: using accepted incoming gateway call for door=%s "
-                "call_id=%s ack=%s media_ip=%s audio_port=%d video_port=%d",
-                self._door.name,
-                call.call_id,
-                self._accepted_incoming_ack_received,
-                self._media_ip,
-                offer_audio_port,
-                offer_video_port,
-            )
+            accepted_incoming = call is not None
+            if call is None:
+                _LOGGER.info(
+                    "[abb] media: dialing gateway for door=%s media_ip=%s "
+                    "audio_port=%d video_port=%d camera_index=%s",
+                    self._door.name, self._media_ip,
+                    offer_audio_port, offer_video_port,
+                    self._camera_index if self._camera_index is not None else "default",
+                )
+                call = await self._dialer.dial(
+                    self._door,
+                    audio_port=offer_audio_port,
+                    video_port=offer_video_port,
+                )
+            else:
+                _LOGGER.info(
+                    "[abb] media: using accepted incoming gateway call for door=%s "
+                    "call_id=%s ack=%s media_ip=%s audio_port=%d video_port=%d",
+                    self._door.name,
+                    call.call_id,
+                    self._accepted_incoming_ack_received,
+                    self._media_ip,
+                    offer_audio_port,
+                    offer_video_port,
+                )
+        except BaseException:
+            self._close_media_io()
+            raise
         self._call = call
         if accepted_incoming:
             self._start_incoming_end_watcher(call.call_id)
@@ -544,15 +1181,11 @@ class StreamSession:
                 )
 
         for m in call.answer.medias:
-            _LOGGER.info(
-                "[abb] media: %s SDP answer camera_index=%s media=%s ip=%s "
-                "port=%d pts=%s rtpmap=%s direction=%s",
-                self._door.name,
-                self._camera_index if self._camera_index is not None else "default",
-                m.media, m.connection_ip, m.port,
-                m.payload_types, m.rtpmap, m.direction,
-            )
-            if m.media == "audio" and m.connection_ip and m.port:
+            remote_endpoints = _remote_media_endpoints(m)
+            if m.media == "audio" and remote_endpoints is not None:
+                self._audio_receive_key, self._audio_send_key = (
+                    _directional_media_encryption_keys(m, call.local_send_keys)
+                )
                 if m.payload_types:
                     self._remote_audio_pt = (
                         8
@@ -560,26 +1193,44 @@ class StreamSession:
                         else m.payload_types[0]
                     )
                 self._endpoints = _MediaEndpoints(
-                    audio=(m.connection_ip, m.port),
+                    audio=remote_endpoints,
                     video=self._endpoints.video,
                 )
-            elif m.media == "video" and m.connection_ip and m.port:
-                if m.payload_types:
-                    self._remote_video_pt = next(
-                        (
-                            pt for pt in m.payload_types
-                            if "H264" in m.rtpmap.get(pt, "").upper()
-                        ),
-                        m.payload_types[0],
-                    )
+            elif m.media == "video" and remote_endpoints is not None:
+                self._video_receive_key, self._video_send_key = (
+                    _directional_media_encryption_keys(m, call.local_send_keys)
+                )
+                selected = _select_video_format(m.payload_types, m.rtpmap, m.fmtp)
+                if selected is not None:
+                    self._remote_video_pt = selected.payload_type
+                    self._video_codec = selected.codec or self._video_codec
+                    self._video_fmtp = selected.fmtp
+                _LOGGER.info(
+                    "[abb] media: negotiated video metadata h264=%s "
+                    "selected_pt=%d payload_count=%d fmtp_present=%s "
+                    "sprop_parameter_sets_present=%s rtcp_mux=%s "
+                    "explicit_rtcp=%s",
+                    selected.is_h264 if selected is not None else False,
+                    selected.payload_type if selected is not None else -1,
+                    len(m.payload_types),
+                    bool(selected and selected.fmtp),
+                    bool(selected and selected.has_sprop_parameter_sets),
+                    remote_endpoints.rtcp_mux,
+                    remote_endpoints.explicit_rtcp,
+                )
                 self._endpoints = _MediaEndpoints(
                     audio=self._endpoints.audio,
-                    video=(m.connection_ip, m.port),
+                    video=remote_endpoints,
                 )
-                if m.payload_types:
-                    pt = m.payload_types[0]
-                    self._video_codec = m.rtpmap.get(pt, self._video_codec)
-                    self._video_fmtp = m.fmtp.get(pt)
+
+        _LOGGER.info(
+            "[abb] media encryption negotiation: audio_receive=%s "
+            "audio_send=%s video_receive=%s video_send=%s",
+            self._audio_receive_key is not None,
+            self._audio_send_key is not None,
+            self._video_receive_key is not None,
+            self._video_send_key is not None,
+        )
 
         def _video_first(data: bytes) -> None:
             _LOGGER.info(
@@ -589,18 +1240,7 @@ class StreamSession:
                 self._camera_index if self._camera_index is not None else "default",
                 len(data),
             )
-            if self._endpoints.video and self._video_transport:
-                ssrc = (
-                    struct.unpack_from("!I", data, 8)[0]
-                    if len(data) >= 12 else 0
-                )
-                try:
-                    self._video_transport.sendto(
-                        _build_rtcp_pli(0xCAFEBABE, ssrc),
-                        self._endpoints.video,
-                    )
-                except OSError:
-                    pass
+            self._send_video_pli_if_due(loop.time())
 
         def _on_video(packet: bytes) -> None:
             cb = self._on_video_packet
@@ -617,47 +1257,95 @@ class StreamSession:
             rewrite_pt=self.VIDEO_SDP_PT,
             on_first_packet=_video_first,
             label="video",
+            track_h264_nals=True,
+            encryption_key=self._video_receive_key,
+            drop_muxed_rtcp=bool(
+                self._endpoints.video and self._endpoints.video.rtcp_mux
+            ),
         )
-        self._video_transport, _ = await loop.create_datagram_endpoint(
-            lambda: self._video_proto, sock=self._video_sock
-        )
-
-        self._audio_proto = _RTPProtocol(
-            on_packet=_on_audio,
-            rewrite_pt=None,
-            on_first_packet=None,
-            label="audio",
-        )
-        self._audio_transport, _ = await loop.create_datagram_endpoint(
-            lambda: self._audio_proto, sock=self._audio_sock
-        )
-
-        # Punch audio with PCMA PT (8) and video with H.264 PT (102) so
-        # the gateway recognises them as legitimate media flows.
-        # Keepalives later in ``_keepalive_loop`` use the same PTs.
-        if self._endpoints.audio:
-            await self._punch(
-                self._audio_transport, self._endpoints.audio, pt=self._remote_audio_pt
+        talkback_sock: socket.socket | None = None
+        if self._endpoints.audio is not None and self._audio_sock is not None:
+            try:
+                # asyncio takes ownership of the receive socket below. Duplicate
+                # it first so the cadence thread can send from the exact same
+                # negotiated UDP source port without touching the transport.
+                talkback_sock = self._audio_sock.dup()
+            except OSError:
+                self._close_media_io()
+                raise
+        try:
+            self._video_transport, _ = await loop.create_datagram_endpoint(
+                lambda: self._video_proto, sock=self._video_sock
             )
-        if self._endpoints.video:
-            await self._punch(
-                self._video_transport, self._endpoints.video, pt=self._remote_video_pt
+            self._video_rtcp_transport, _ = await loop.create_datagram_endpoint(
+                asyncio.DatagramProtocol, sock=self._video_rtcp_sock
             )
 
-        if self._audio_transport is not None and self._endpoints.audio is not None:
-            self._talk_sender = _PCMATalkSender(
-                self._audio_transport,
-                self._endpoints.audio,
-                payload_type=self._remote_audio_pt,
+            self._audio_proto = _RTPProtocol(
+                on_packet=_on_audio,
+                rewrite_pt=None,
+                on_first_packet=None,
+                label="audio",
+                encryption_key=self._audio_receive_key,
+                drop_muxed_rtcp=bool(
+                    self._endpoints.audio and self._endpoints.audio.rtcp_mux
+                ),
             )
-            await self._talk_sender.start()
-            _LOGGER.info(
-                "[abb] media: talkback RTP leg ready for %s -> %s:%d pt=%d",
-                self._door.name,
-                self._endpoints.audio[0],
-                self._endpoints.audio[1],
-                self._remote_audio_pt,
+            self._audio_transport, _ = await loop.create_datagram_endpoint(
+                lambda: self._audio_proto, sock=self._audio_sock
             )
+            self._audio_rtcp_transport, _ = await loop.create_datagram_endpoint(
+                asyncio.DatagramProtocol, sock=self._audio_rtcp_sock
+            )
+        except BaseException:
+            _close_socket(talkback_sock)
+            self._close_media_io()
+            raise
+
+        sender: _PCMATalkSender | None = None
+        try:
+            # Punch audio with PCMA PT (8) and video with H.264 PT (102) so
+            # the gateway recognises them as legitimate media flows.
+            # Keepalives later in ``_keepalive_loop`` use the same PTs.
+            if self._endpoints.audio:
+                await self._punch(
+                    self._audio_transport,
+                    self._endpoints.audio.rtp,
+                    pt=self._remote_audio_pt,
+                    encryption_key=self._audio_send_key,
+                )
+            if self._endpoints.video:
+                await self._punch(
+                    self._video_transport,
+                    self._endpoints.video.rtp,
+                    pt=self._remote_video_pt,
+                    encryption_key=self._video_send_key,
+                )
+
+            if talkback_sock is not None and self._endpoints.audio is not None:
+                sender = _PCMATalkSender(
+                    talkback_sock,
+                    self._endpoints.audio.rtp,
+                    payload_type=self._remote_audio_pt,
+                    encryption_key=self._audio_send_key,
+                )
+                talkback_sock = None  # Ownership transferred to the sender.
+                await sender.start()
+                self._talk_sender = sender
+                _LOGGER.info(
+                    "[abb] media: talkback RTP leg ready for %s -> %s:%d pt=%d",
+                    self._door.name,
+                    self._endpoints.audio.rtp[0],
+                    self._endpoints.audio.rtp[1],
+                    self._remote_audio_pt,
+                )
+        except BaseException:
+            _close_socket(talkback_sock)
+            if sender is not None:
+                await sender.stop()
+            self._talk_sender = None
+            self._close_media_io()
+            raise
 
         self._stop.clear()
         self._keepalive_task = asyncio.create_task(
@@ -799,10 +1487,14 @@ class StreamSession:
             audio_local_port=accepted.audio_local_port,
             video_local_port=accepted.video_local_port,
             answer=accepted.remote_sdp,
+            local_send_keys=accepted.local_send_keys,
         )
 
     async def close(self) -> None:
         current_task = asyncio.current_task()
+        video_nals = (
+            self._video_proto.h264_nals if self._video_proto is not None else None
+        )
         _LOGGER.info(
             "[abb] media: closing stream for %s "
             "camera_index=%s (video_pkts=%d audio_pkts=%d rewrites=%d)",
@@ -811,6 +1503,38 @@ class StreamSession:
             self._video_proto.packets if self._video_proto else 0,
             self._audio_proto.packets if self._audio_proto else 0,
             self._video_proto._rewrites if self._video_proto else 0,
+        )
+        _LOGGER.info(
+            "[abb] media H264 final metadata: sps=%d pps=%d idr=%d "
+            "stap_a=%d fu_a=%d fu_a_starts=%d other=%d invalid=%d "
+            "nal1=%d nal2=%d nal3=%d nal4=%d nal6=%d nal9=%d "
+            "nal25=%d nal26=%d nal27=%d nal29=%d "
+            "pli_sent=%d fir_sent=%d rr_sent=%d muxed_rtcp_received=%d "
+            "video_decrypt_errors=%d audio_decrypt_errors=%d",
+            video_nals.sps if video_nals else 0,
+            video_nals.pps if video_nals else 0,
+            video_nals.idr if video_nals else 0,
+            video_nals.stap_a if video_nals else 0,
+            video_nals.fu_a if video_nals else 0,
+            video_nals.fu_a_starts if video_nals else 0,
+            video_nals.other if video_nals else 0,
+            video_nals.invalid if video_nals else 0,
+            video_nals.type_1 if video_nals else 0,
+            video_nals.type_2 if video_nals else 0,
+            video_nals.type_3 if video_nals else 0,
+            video_nals.type_4 if video_nals else 0,
+            video_nals.type_6 if video_nals else 0,
+            video_nals.type_9 if video_nals else 0,
+            video_nals.type_25 if video_nals else 0,
+            video_nals.type_26 if video_nals else 0,
+            video_nals.type_27 if video_nals else 0,
+            video_nals.type_29 if video_nals else 0,
+            self._pli_requests_sent,
+            self._fir_requests_sent,
+            self._receiver_reports_sent,
+            self._video_proto.rtcp_packets if self._video_proto else 0,
+            self._video_proto.decrypt_errors if self._video_proto else 0,
+            self._audio_proto.decrypt_errors if self._audio_proto else 0,
         )
         if (
             self._incoming_end_task is not None
@@ -847,12 +1571,12 @@ class StreamSession:
             await self._talk_sender.stop()
             self._talk_sender = None
 
-        for tr in (self._video_transport, self._audio_transport):
-            if tr is not None:
-                tr.close()
-        self._video_transport = self._audio_transport = None
-        self._video_sock = self._audio_sock = None
+        self._close_media_io()
         self._video_proto = self._audio_proto = None
+        self._audio_receive_key = None
+        self._video_receive_key = None
+        self._audio_send_key = None
+        self._video_send_key = None
 
         if self._call is not None:
             try:
@@ -916,24 +1640,43 @@ class StreamSession:
         samples_per_frame = 160
         frames = max(1, duration_ms // 20)
 
+        # Build the synthetic signal before switching the sender into talking
+        # mode, then keep a small queue ahead of the 20 ms RTP clock. Feeding
+        # one frame followed by a 20 ms asyncio sleep lets normal scheduling
+        # jitter empty the queue, which the outdoor station renders as a row
+        # of short beeps instead of one continuous tone.
+        tone_frames: list[bytes] = []
+        for frame_no in range(frames):
+            frame = bytearray(samples_per_frame * 2)
+            base = frame_no * samples_per_frame
+            for i in range(samples_per_frame):
+                t = (base + i) / sample_rate
+                sample = int(
+                    math.sin(2 * math.pi * frequency_hz * t)
+                    * amplitude
+                    * 32767
+                )
+                frame[i * 2 : i * 2 + 2] = sample.to_bytes(
+                    2, "little", signed=True
+                )
+            tone_frames.append(bytes(frame))
+
         sender.start_talk()
         try:
-            for frame_no in range(frames):
-                frame = bytearray(samples_per_frame * 2)
-                base = frame_no * samples_per_frame
-                for i in range(samples_per_frame):
-                    t = (base + i) / sample_rate
-                    sample = int(
-                        math.sin(2 * math.pi * frequency_hz * t)
-                        * amplitude
-                        * 32767
-                    )
-                    frame[i * 2 : i * 2 + 2] = sample.to_bytes(
-                        2, "little", signed=True
-                    )
-                sender.feed_pcm16le(bytes(frame))
-                await asyncio.sleep(0.02)
-            await sender.drain()
+            high_watermark = max(1, min(sender.max_queue_frames, 10))
+            low_watermark = max(1, high_watermark // 2)
+            next_frame = 0
+            while next_frame < len(tone_frames):
+                while (
+                    next_frame < len(tone_frames)
+                    and sender.queue_frames < high_watermark
+                ):
+                    sender.feed_pcm16le(tone_frames[next_frame])
+                    next_frame += 1
+                if next_frame < len(tone_frames):
+                    while sender.queue_frames > low_watermark:
+                        await asyncio.sleep(min(0.005, sender.interval / 4))
+            await sender.drain(timeout=max(1.0, duration_ms / 1000 + 1.0))
         finally:
             sender.stop_talk()
         return sender.stats()
@@ -944,10 +1687,14 @@ class StreamSession:
         dest: tuple[str, int],
         *,
         pt: int = 0,
+        encryption_key: bytes | None = None,
     ) -> None:
         for i in range(6):
             try:
-                transport.sendto(_build_rtp_keepalive(i, pt=pt), dest)
+                packet = _build_rtp_keepalive(i, pt=pt)
+                if encryption_key is not None:
+                    packet = _encrypt_rtp_payload(packet, encryption_key)
+                transport.sendto(packet, dest)
             except OSError:
                 break
 
@@ -959,44 +1706,71 @@ class StreamSession:
                 return
             except asyncio.TimeoutError:
                 pass
-            for transport, dest, pt in (
+            for transport, dest, pt, encryption_key in (
                 (
                     None if self._talk_sender is not None else self._audio_transport,
-                    self._endpoints.audio,
+                    (
+                        self._endpoints.audio.rtp
+                        if self._endpoints.audio is not None
+                        else None
+                    ),
                     self._remote_audio_pt,
+                    self._audio_send_key,
                 ),
-                (self._video_transport, self._endpoints.video, self._remote_video_pt),
+                (
+                    self._video_transport,
+                    (
+                        self._endpoints.video.rtp
+                        if self._endpoints.video is not None
+                        else None
+                    ),
+                    self._remote_video_pt,
+                    self._video_send_key,
+                ),
             ):
                 if transport is None or dest is None:
                     continue
                 try:
-                    transport.sendto(_build_rtp_keepalive(seq, pt=pt), dest)
+                    packet = _build_rtp_keepalive(seq, pt=pt)
+                    if encryption_key is not None:
+                        packet = _encrypt_rtp_payload(packet, encryption_key)
+                    transport.sendto(packet, dest)
                 except OSError:
                     pass
                 seq = (seq + 1) & 0xFFFF
 
     async def _rtcp_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        last_rr_at = loop.time()
         while not self._stop.is_set():
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=_RTCP_INTERVAL)
+                await asyncio.wait_for(self._stop.wait(), timeout=_PLI_INTERVAL)
                 return
             except asyncio.TimeoutError:
                 pass
             vp = self._video_proto
+            now = loop.time()
+            self._send_video_pli_if_due(now)
             if (
                 vp is None
-                or self._video_transport is None
                 or self._endpoints.video is None
                 or vp.media_ssrc == 0
+                or now - last_rr_at < _RTCP_INTERVAL
             ):
                 continue
+            transport = self._video_feedback_transport()
+            if transport is None:
+                continue
             try:
-                self._video_transport.sendto(
+                transport.sendto(
                     _build_rtcp_rr(0xCAFEBABE, vp.media_ssrc, vp.last_seq),
-                    self._endpoints.video,
+                    self._endpoints.video.rtcp,
                 )
             except OSError:
                 pass
+            else:
+                last_rr_at = now
+                self._receiver_reports_sent += 1
 
     async def _stats_loop(self) -> None:
         while not self._stop.is_set():
@@ -1007,15 +1781,48 @@ class StreamSession:
                 pass
             vp = self._video_proto
             ap = self._audio_proto
+            video_nals = vp.h264_nals if vp is not None else None
             _LOGGER.info(
-                "[abb] media stats %s camera_index=%s: video pkts=%d pts=%s "
-                "rewrites=%d audio pkts=%d",
+                "[abb] media stats %s camera_index=%s: video pkts=%d "
+                "payload_type_count=%d rewrites=%d audio pkts=%d "
+                "video_decrypt_errors=%d audio_decrypt_errors=%d",
                 self._door.name,
                 self._camera_index if self._camera_index is not None else "default",
                 vp.packets if vp else 0,
-                dict(vp.payload_types) if vp else {},
+                len(vp.payload_types) if vp else 0,
                 vp._rewrites if vp else 0,
                 ap.packets if ap else 0,
+                vp.decrypt_errors if vp else 0,
+                ap.decrypt_errors if ap else 0,
+            )
+            _LOGGER.info(
+                "[abb] media H264 periodic metadata: sps=%d pps=%d idr=%d "
+                "stap_a=%d fu_a=%d fu_a_starts=%d other=%d invalid=%d "
+                "nal1=%d nal2=%d nal3=%d nal4=%d nal6=%d nal9=%d "
+                "nal25=%d nal26=%d nal27=%d nal29=%d "
+                "pli_sent=%d fir_sent=%d rr_sent=%d muxed_rtcp_received=%d",
+                video_nals.sps if video_nals else 0,
+                video_nals.pps if video_nals else 0,
+                video_nals.idr if video_nals else 0,
+                video_nals.stap_a if video_nals else 0,
+                video_nals.fu_a if video_nals else 0,
+                video_nals.fu_a_starts if video_nals else 0,
+                video_nals.other if video_nals else 0,
+                video_nals.invalid if video_nals else 0,
+                video_nals.type_1 if video_nals else 0,
+                video_nals.type_2 if video_nals else 0,
+                video_nals.type_3 if video_nals else 0,
+                video_nals.type_4 if video_nals else 0,
+                video_nals.type_6 if video_nals else 0,
+                video_nals.type_9 if video_nals else 0,
+                video_nals.type_25 if video_nals else 0,
+                video_nals.type_26 if video_nals else 0,
+                video_nals.type_27 if video_nals else 0,
+                video_nals.type_29 if video_nals else 0,
+                self._pli_requests_sent,
+                self._fir_requests_sent,
+                self._receiver_reports_sent,
+                vp.rtcp_packets if vp else 0,
             )
             if self._talk_sender is not None:
                 _LOGGER.info(

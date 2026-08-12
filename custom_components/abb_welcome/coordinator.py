@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
-import logging
 import tempfile
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,25 +16,29 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN
+from .const import DEFAULT_PORTAL_URL, DOMAIN
+from .redaction import get_redacting_logger
 from .text import repair_utf8_mojibake
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_redacting_logger(__name__)
 _LOG = "[abb] "
 
-PORTAL_URL = "https://api.eu.mybuildings.abb.com"
-
-HISTORY_TYPES = ",".join([
-    "com.abb.ispf.event.welcome.ring",
-    "com.abb.ispf.event.welcome.call-answered",
-    "com.abb.ispf.event.welcome.call-terminated",
-    "com.abb.ispf.event.welcome.call-missed",
-    "com.abb.ispf.event.welcome.door-open",
-    "com.abb.ispf.event.welcome.screenshot",
-    "com.abb.ispf.event.welcome.light",
-])
+HISTORY_TYPES = ",".join(
+    [
+        "com.abb.ispf.event.welcome.ring",
+        "com.abb.ispf.event.welcome.call-answered",
+        "com.abb.ispf.event.welcome.call-terminated",
+        "com.abb.ispf.event.welcome.call-missed",
+        "com.abb.ispf.event.welcome.door-open",
+        "com.abb.ispf.event.welcome.screenshot",
+        "com.abb.ispf.event.welcome.light",
+    ]
+)
 
 POLL_INTERVAL_SECONDS = 30
+HISTORY_PAGE_SIZE = 20
+HISTORY_EVENT_CAP = 200
+SCREENSHOT_HISTORY_TYPE = "com.abb.ispf.event.welcome.screenshot"
 
 
 @dataclass
@@ -86,6 +88,10 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
         self._cert_pem: bytes = entry.data.get("certificate_pem", "").encode()
         self._key_pem: bytes = entry.data.get("private_key_pem", "").encode()
         self._newest_id: str = ""
+        self._screenshot_history_checked = False
+        self._portal_url = str(
+            entry.data.get("portal_url", DEFAULT_PORTAL_URL) or DEFAULT_PORTAL_URL
+        ).rstrip("/")
         self._data = ABBWelcomeData()
         self._has_certs = bool(self._cert_pem and self._key_pem)
         self._station_names = {
@@ -124,7 +130,8 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
     ) -> IntercomEvent | None:
         """Find the station event that most likely produced a screenshot."""
         candidates = [
-            evt for evt in events
+            evt
+            for evt in events
             if evt.event_id != screenshot.event_id and evt.station_id
         ]
         if not candidates:
@@ -177,6 +184,63 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
             except OSError:
                 pass
 
+    @staticmethod
+    def _raw_event_has_screenshot(event: dict[str, Any]) -> bool:
+        """Return whether an event contains a JPEG-like screenshot payload."""
+        if (event.get("type") or "").rsplit(".", 1)[-1] != "screenshot":
+            return False
+        payload_b64 = event.get("payload", "")
+        if not isinstance(payload_b64, str) or not payload_b64:
+            return False
+        try:
+            pad = "=" * (-len(payload_b64) % 4)
+            return base64.b64decode(payload_b64 + pad)[:2] == b"\xff\xd8"
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _response_events(response: requests.Response) -> list[dict[str, Any]]:
+        """Return dictionary events from a successful portal response."""
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise TypeError("Unexpected portal event response")
+        events = data.get("events") or []
+        if not isinstance(events, list):
+            raise TypeError("Unexpected portal events value")
+        return [event for event in events if isinstance(event, dict)]
+
+    def _fetch_latest_historical_screenshot(
+        self,
+        session: requests.Session,
+    ) -> list[dict[str, Any]]:
+        """Fetch the newest screenshot without scanning mixed history pages."""
+        response = session.get(
+            f"{self._portal_url}/event",
+            params={
+                "type": SCREENSHOT_HISTORY_TYPE,
+                "order": "desc",
+                "pagination_limit": 1,
+                "pagination_page": 1,
+            },
+            timeout=15,
+        )
+        events = self._response_events(response)
+        return [event for event in events if self._raw_event_has_screenshot(event)][:1]
+
+    @staticmethod
+    def _deduplicate_events(events: list[IntercomEvent]) -> list[IntercomEvent]:
+        """Keep newest-first events while removing duplicate portal IDs."""
+        unique: list[IntercomEvent] = []
+        seen_ids: set[str] = set()
+        for event in events:
+            if event.event_id:
+                if event.event_id in seen_ids:
+                    continue
+                seen_ids.add(event.event_id)
+            unique.append(event)
+        return unique
+
     def poll_events(self) -> ABBWelcomeData:
         """Synchronous poll — called via async_add_executor_job."""
         if not self._has_certs:
@@ -187,18 +251,35 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
             params: dict[str, Any] = {
                 "type": HISTORY_TYPES,
                 "order": "desc",
-                "pagination_limit": 20,
+                "pagination_limit": HISTORY_PAGE_SIZE,
                 "pagination_page": 1,
             }
             if self._newest_id:
                 params["newer_than_id"] = self._newest_id
 
-            resp = session.get(
-                f"{PORTAL_URL}/event", params=params, timeout=15
+            response = session.get(
+                f"{self._portal_url}/event", params=params, timeout=15
             )
-            resp.raise_for_status()
-            data = resp.json()
-            raw_events = data.get("events") or []
+            normal_events = self._response_events(response)
+            raw_events = list(normal_events)
+
+            if not self._screenshot_history_checked:
+                if any(
+                    self._raw_event_has_screenshot(event) for event in normal_events
+                ):
+                    self._screenshot_history_checked = True
+                else:
+                    try:
+                        historical = self._fetch_latest_historical_screenshot(session)
+                    except (requests.RequestException, ValueError, TypeError):
+                        # Do not include response details here: portal errors can
+                        # contain private identifiers or payload fragments.
+                        _LOGGER.warning(
+                            _LOG + "Initial screenshot history lookup failed"
+                        )
+                    else:
+                        self._screenshot_history_checked = True
+                        raw_events.extend(historical)
 
             if not raw_events:
                 return self._data
@@ -238,9 +319,9 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
                                     str(payload.get("local_name", "")).strip()
                                 )
                                 if ie.local_id:
-                                    ie.station_id = ie.local_id.split(
-                                        "@", 1
-                                    )[0].removeprefix("sip:")
+                                    ie.station_id = ie.local_id.split("@", 1)[
+                                        0
+                                    ].removeprefix("sip:")
                     except Exception:
                         pass
 
@@ -264,14 +345,24 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
                     ie.station_id, ""
                 )
 
-            if raw_events:
-                first_id = raw_events[0].get("id", "")
+            # The mixed-history page remains the sole incremental polling
+            # anchor.  A historical screenshot must never move this backward.
+            if normal_events:
+                first_id = normal_events[0].get("id", "")
                 if first_id:
                     self._newest_id = first_id
 
-            # Prepend new events to existing list (newest first), cap at 200
-            self._data.events = new_events + self._data.events
-            self._data.events = self._data.events[:200]
+            # Prepend new events to the existing newest-first list, removing
+            # portal page overlap before applying the retained history cap.
+            merged_events = self._deduplicate_events(new_events + self._data.events)
+            merged_events.sort(
+                key=lambda event: (
+                    self._timestamp_seconds(event.timestamp) is not None,
+                    self._timestamp_seconds(event.timestamp) or 0,
+                ),
+                reverse=True,
+            )
+            self._data.events = merged_events[:HISTORY_EVENT_CAP]
 
             if newest_screenshot:
                 self._data.latest_screenshot = newest_screenshot

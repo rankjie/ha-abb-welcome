@@ -10,18 +10,19 @@ body.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
 import hashlib
-import logging
 import re
 import socket
 import ssl
 import time
 import uuid
 import warnings
+from collections.abc import Mapping
+from dataclasses import dataclass
 
-_LOGGER = logging.getLogger(__name__)
+from .redaction import get_redacting_logger
+
+_LOGGER = get_redacting_logger(__name__)
 
 FAST_TCP_PORT = 5060
 INVITE_TLS_PORT = 5061
@@ -749,7 +750,7 @@ def _send_bye(
 
 
 class SIPClient:
-    """ABB Welcome unlock client with hybrid MRANGE routing."""
+    """ABB Welcome unlock client with safe profile-driven hybrid routing."""
 
     def __init__(
         self,
@@ -760,6 +761,8 @@ class SIPClient:
         doors: list[dict] | None = None,
         invite_transport: str = DEFAULT_INVITE_TRANSPORT,
         unlock_strategy: str = "hybrid",
+        default_unlock_station_id: str = "",
+        legacy_first_door_hybrid: bool = True,
     ) -> None:
         self.host = host
         self.username = username
@@ -769,6 +772,8 @@ class SIPClient:
         if unlock_strategy not in ("hybrid", "fast", "standard"):
             unlock_strategy = "hybrid"
         self.unlock_strategy = unlock_strategy
+        self.default_unlock_station_id = default_unlock_station_id.strip()
+        self.legacy_first_door_hybrid = legacy_first_door_hybrid
         self._first_station_id = self._derive_first_station_id(doors or [])
 
     def _derive_first_station_id(self, doors: list[dict]) -> str:
@@ -830,7 +835,12 @@ class SIPClient:
             return True
         if self.unlock_strategy == "standard":
             return False
-        # hybrid: fast for the first station, standard for the rest.
+        # Hybrid uses an explicit physical-default station when configured.
+        # App-managed callers disable the legacy array-order fallback.
+        if self.default_unlock_station_id:
+            return door.station_id == self.default_unlock_station_id
+        if not self.legacy_first_door_hybrid:
+            return False
         if self._first_station_id:
             return door.station_id == self._first_station_id
         if door.index is not None:

@@ -21,6 +21,7 @@ from homeassistant.helpers.start import async_at_start
 
 from .const import (
     CONF_ALLOW_PICKUP,
+    CONF_DEFAULT_UNLOCK_STATION_ID,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
     CONF_UNLOCK_STRATEGY,
@@ -28,14 +29,23 @@ from .const import (
     DEFAULT_LAN_RTSP_BIND_HOST,
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS,
-    DEFAULT_UNLOCK_STRATEGY,
     DOMAIN,
     EVENT_DISCOVERY_CHANGED,
+    GATEWAY_PROFILE_APP_MANAGED,
     GO2RTC_RTSP_HOST,
     GO2RTC_RTSP_PORT,
     SIP_PORT_TLS,
+    TOPOLOGY_REFRESH_ACTION_ERROR,
+    TOPOLOGY_REFRESH_ACTION_REFRESH,
+    TOPOLOGY_REFRESH_ACTION_SKIP,
+    gateway_capabilities,
+    gateway_profile,
+    normalized_unlock_routing,
+    topology_refresh_action,
+    topology_refresh_error,
 )
 from .coordinator import ABBWelcomeCoordinator
+from .redaction import get_redacting_logger
 from .rtsp_proxy import RtspTcpProxy
 from .sip_client import SIPClient
 from .sip_listener import IncomingCall, SipListener
@@ -51,7 +61,7 @@ from .streaming_state import (
 )
 from .text import decode_gateway_text, repair_utf8_mojibake
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_redacting_logger(__name__)
 
 
 def _now_iso() -> str:
@@ -59,7 +69,7 @@ def _now_iso() -> str:
 
 
 def _header_value(headers: dict, name: str) -> str:
-    """Return a SIP header value from sip_listener's JSON-safe summary."""
+    """Return a SIP header value from a case-insensitive mapping."""
     wanted = name.lower()
     for key, value in headers.items():
         if key.lower() != wanted:
@@ -165,6 +175,7 @@ PLATFORMS = [
 ]
 
 _RELOAD_OPTION_KEYS = (
+    CONF_DEFAULT_UNLOCK_STATION_ID,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
     CONF_UNLOCK_STRATEGY,
@@ -208,15 +219,26 @@ def _fire_discovery_changed(
 
 
 def _build_client(entry: ConfigEntry) -> SIPClient:
+    strategy, default_station_id = normalized_unlock_routing(entry.data, entry.options)
+    requested_strategy = entry.options.get(
+        CONF_UNLOCK_STRATEGY,
+        gateway_capabilities(entry.data).default_unlock_strategy,
+    )
+    if strategy != requested_strategy:
+        _LOGGER.warning(
+            "[abb] unsafe unlock strategy normalized to %s for this gateway profile",
+            strategy,
+        )
+    is_app_managed = gateway_profile(entry.data) == GATEWAY_PROFILE_APP_MANAGED
     return SIPClient(
         host=entry.data["gateway_ip"],
         username=entry.data["sip_username"],
         password=entry.data["sip_password"],
         domain=entry.data["sip_domain"],
         doors=entry.data.get("doors", []),
-        unlock_strategy=entry.options.get(
-            CONF_UNLOCK_STRATEGY, DEFAULT_UNLOCK_STRATEGY
-        ),
+        unlock_strategy=strategy,
+        default_unlock_station_id=default_station_id,
+        legacy_first_door_hybrid=not is_app_managed,
     )
 
 
@@ -276,9 +298,7 @@ async def _async_start_rtsp_proxy(
     entry_data["lan_rtsp_port"] = proxy.bind_port
     entry_data["lan_rtsp_proxy_running"] = False
     entry_data["lan_rtsp_port_changed"] = False
-    port_detail = (
-        f"{configured_port}, " if configured_port is not None else ""
-    ) + (
+    port_detail = (f"{configured_port}, " if configured_port is not None else "") + (
         f"{DEFAULT_LAN_RTSP_PORT}-"
         f"{DEFAULT_LAN_RTSP_PORT + DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS - 1}"
     )
@@ -300,7 +320,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Refresh the door topology before entities are created.  This makes a
     # normal config-entry reload pick up outdoor stations added/removed via
     # the gateway admin UI, without re-running the pairing/config flow.
-    await _async_refresh_doors_for_entry(hass, entry, reload_on_change=False)
+    if topology_refresh_action(entry.data) == TOPOLOGY_REFRESH_ACTION_REFRESH:
+        await _async_refresh_doors_for_entry(hass, entry, reload_on_change=False)
 
     coordinator = ABBWelcomeCoordinator(hass, entry)
 
@@ -409,17 +430,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
                 sensor.record_frame(payload.get("direction", ""), is_invite)
 
-            if payload.get("direction") != "in" or payload.get("method") != "MESSAGE":
-                return
-            body = str(payload.get("body") or "").strip()
+        def _on_message(frame) -> None:
+            """Handle private MESSAGE content without putting it on the HA bus."""
+            body = frame.body.decode("utf-8", errors="replace").strip()
             match = _CAMERA_COUNT_MESSAGE_RE.search(body)
             if match is None:
                 return
-            headers = (
-                payload.get("headers")
-                if isinstance(payload.get("headers"), dict)
-                else {}
-            )
+            headers: dict[str, str | list[str]] = {}
+            seen_case: dict[str, str] = {}
+            for key, value in frame.headers:
+                canonical = seen_case.setdefault(key.lower(), key)
+                if canonical not in headers:
+                    headers[canonical] = value
+                elif isinstance(headers[canonical], list):
+                    headers[canonical].append(value)
+                else:
+                    headers[canonical] = [headers[canonical], value]
             count = int(match.group(1))
             call_id = _header_value(headers, "Call-ID")
             from_station_id = _station_id_from_sip_value(_header_value(headers, "From"))
@@ -460,14 +486,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             station_id = from_station_id
             if not station_id:
-                station_id = _station_id_from_sip_value(str(payload.get("request_uri") or ""))
+                request_uri = (
+                    frame.start_line.split(" ", 2)[1] if " " in frame.start_line else ""
+                )
+                station_id = _station_id_from_sip_value(request_uri)
             if not station_id:
                 _LOGGER.info(
                     "[abb] sip_listener: camera count MESSAGE body=%r has no "
                     "station id and no active call (from=%r request_uri=%r)",
                     body[:200],
                     _header_value(headers, "From"),
-                    payload.get("request_uri"),
+                    request_uri,
                 )
                 return
             handler = entry_data.get("camera_count_handler")
@@ -506,7 +535,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             transport="tls",
             on_ring=_on_ring,
             on_frame=_on_frame,
+            on_message=_on_message,
             on_state_change=_on_state_change,
+            custom_media_crypto=(
+                gateway_profile(entry.data) == GATEWAY_PROFILE_APP_MANAGED
+            ),
         )
         entry_data["sip_listener"] = listener
 
@@ -585,10 +618,7 @@ def _fetch_gateway_device_list(gateway_ip: str, admin_password: str) -> str:
                     verify=False,
                 )
                 body = decode_gateway_text(login.content).strip()
-                if (
-                    login.status_code != 200
-                    or body not in _GATEWAY_LOGIN_OK_RESPONSES
-                ):
+                if login.status_code != 200 or body not in _GATEWAY_LOGIN_OK_RESPONSES:
                     errors.append(
                         f"{scheme}: login returned HTTP {login.status_code} "
                         f"body={body!r}"
@@ -604,8 +634,7 @@ def _fetch_gateway_device_list(gateway_ip: str, admin_password: str) -> str:
                 )
                 if response.status_code != 200:
                     errors.append(
-                        f"{scheme}: getdevicelist returned HTTP "
-                        f"{response.status_code}"
+                        f"{scheme}: getdevicelist returned HTTP {response.status_code}"
                     )
                     continue
                 return decode_gateway_text(response.content).strip()
@@ -654,8 +683,7 @@ def _fetch_doors_from_gateway(
     doors = _parse_gateway_doors(raw, sip_domain)
     if not doors:
         _LOGGER.warning(
-            "[abb] refresh_doors: gateway returned no outdoorstation entries "
-            "(raw=%r)",
+            "[abb] refresh_doors: gateway returned no outdoorstation entries (raw=%r)",
             raw,
         )
         return None
@@ -696,6 +724,8 @@ async def _async_refresh_doors_for_entry(
     hass: HomeAssistant, entry: ConfigEntry, *, reload_on_change: bool
 ) -> bool:
     """Refresh one config entry's stored door topology from the gateway."""
+    if topology_refresh_action(entry.data) != TOPOLOGY_REFRESH_ACTION_REFRESH:
+        return False
     gateway_ip = entry.data.get("gateway_ip")
     admin_password = entry.data.get("gateway_admin_password")
     sip_domain = entry.data.get("sip_domain")
@@ -787,7 +817,9 @@ def _cameras_for_talk_service(hass: HomeAssistant, call: ServiceCall) -> list[ob
     target_entry_id = call.data.get("entry_id")
     if target_entry_id:
         if target_entry_id not in entries:
-            raise HomeAssistantError(f"No ABB Welcome config entry id={target_entry_id!r}")
+            raise HomeAssistantError(
+                f"No ABB Welcome config entry id={target_entry_id!r}"
+            )
         entry_items = [(target_entry_id, entries[target_entry_id])]
     else:
         entry_items = list(entries.items())
@@ -846,7 +878,10 @@ def _cameras_for_talk_service(hass: HomeAssistant, call: ServiceCall) -> list[ob
 
 @callback
 def _async_register_services(hass: HomeAssistant) -> None:
-    """Register integration-wide services. Idempotent — safe to call on every entry setup."""
+    """Register integration-wide services.
+
+    Registration is idempotent and safe on every entry setup.
+    """
     if not hass.services.has_service(DOMAIN, SERVICE_EXPORT_CREDENTIALS):
 
         async def _export_creds(call: ServiceCall) -> None:
@@ -916,12 +951,35 @@ def _async_register_services(hass: HomeAssistant) -> None:
             else:
                 entry_ids = list(entries.keys())
 
+            refresh_entries: list[ConfigEntry] = []
+            skipped_entries = 0
+            skipped_error = ""
+            explicitly_targeted = bool(target_entry_id)
             for eid in entry_ids:
                 entry = hass.config_entries.async_get_entry(eid)
                 if entry is None:
                     continue
-                await _async_refresh_doors_for_entry(
-                    hass, entry, reload_on_change=True
+                action = topology_refresh_action(
+                    entry.data, explicitly_targeted=explicitly_targeted
+                )
+                if action == TOPOLOGY_REFRESH_ACTION_ERROR:
+                    raise HomeAssistantError(topology_refresh_error(entry.data))
+                if action == TOPOLOGY_REFRESH_ACTION_SKIP:
+                    skipped_entries += 1
+                    skipped_error = topology_refresh_error(entry.data) or ""
+                    continue
+                refresh_entries.append(entry)
+
+            if not refresh_entries and skipped_entries:
+                raise HomeAssistantError(skipped_error)
+
+            for entry in refresh_entries:
+                await _async_refresh_doors_for_entry(hass, entry, reload_on_change=True)
+            if skipped_entries:
+                _LOGGER.warning(
+                    "[abb] refresh_doors skipped %d app-managed entry or entries; "
+                    "their topology requires re-pairing",
+                    skipped_entries,
                 )
 
         hass.services.async_register(
@@ -989,7 +1047,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
             for camera in _cameras_for_talk_service(hass, call):
                 start = getattr(camera, "async_talkback_start", None)
                 if not callable(start):
-                    raise HomeAssistantError("Selected camera does not support talkback")
+                    raise HomeAssistantError(
+                        "Selected camera does not support talkback"
+                    )
                 stats = await start(talkback_session_id)
                 _LOGGER.info(
                     "[abb] talk_start target=%s stats=%s",
@@ -1015,7 +1075,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
             for camera in _cameras_for_talk_service(hass, call):
                 stop = getattr(camera, "async_talkback_stop", None)
                 if not callable(stop):
-                    raise HomeAssistantError("Selected camera does not support talkback")
+                    raise HomeAssistantError(
+                        "Selected camera does not support talkback"
+                    )
                 stats = await stop(talkback_session_id)
                 _LOGGER.info(
                     "[abb] talk_stop target=%s stats=%s",
@@ -1042,7 +1104,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
             try:
                 pcm = base64.b64decode(encoded, validate=True)
             except (binascii.Error, ValueError) as err:
-                raise HomeAssistantError("pcm16le must be base64-encoded bytes") from err
+                raise HomeAssistantError(
+                    "pcm16le must be base64-encoded bytes"
+                ) from err
             if len(pcm) % 2:
                 raise HomeAssistantError("pcm16le must contain whole 16-bit samples")
             if len(pcm) > 160000:
@@ -1050,9 +1114,14 @@ def _async_register_services(hass: HomeAssistant) -> None:
             for camera in _cameras_for_talk_service(hass, call):
                 feed = getattr(camera, "async_talkback_pcm16le", None)
                 if not callable(feed):
-                    raise HomeAssistantError("Selected camera does not support talkback")
+                    raise HomeAssistantError(
+                        "Selected camera does not support talkback"
+                    )
                 stats = await feed(pcm, talkback_session_id)
-                _LOGGER.info(
+                # PCM is normally fed several times per second. INFO logging
+                # every block can stall Home Assistant's event loop long
+                # enough to disturb the 20 ms RTP talkback clock.
+                _LOGGER.debug(
                     "[abb] talk_pcm16le target=%s bytes=%d stats=%s",
                     getattr(camera, "entity_id", "unknown"),
                     len(pcm),
@@ -1082,7 +1151,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
             for camera in _cameras_for_talk_service(hass, call):
                 tone = getattr(camera, "async_talkback_tone", None)
                 if not callable(tone):
-                    raise HomeAssistantError("Selected camera does not support talkback")
+                    raise HomeAssistantError(
+                        "Selected camera does not support talkback"
+                    )
                 stats = await tone(
                     duration_ms=call.data["duration_ms"],
                     frequency_hz=call.data["frequency_hz"],
