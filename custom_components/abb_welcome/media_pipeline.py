@@ -1036,6 +1036,7 @@ class StreamSession:
         self._remote_audio_pt = 8
         self._remote_video_pt = 102
         self._talk_sender: _PCMATalkSender | None = None
+        self._talkback_playback_lock = asyncio.Lock()
         self._last_pli_at = 0.0
         self._pli_requests_sent = 0
         self._fir_requests_sent = 0
@@ -1701,9 +1702,6 @@ class StreamSession:
         frequency_hz: int = 880,
         amplitude: float = 0.35,
     ) -> dict[str, Any]:
-        sender = self._talk_sender
-        if sender is None or not sender.active:
-            raise RuntimeError("talkback is not ready; open the camera stream first")
         duration_ms = max(100, min(int(duration_ms), 5000))
         frequency_hz = max(100, min(int(frequency_hz), 3000))
         amplitude = max(0.0, min(float(amplitude), 1.0))
@@ -1732,25 +1730,62 @@ class StreamSession:
                 )
             tone_frames.append(bytes(frame))
 
-        sender.start_talk()
-        try:
-            high_watermark = max(1, min(sender.max_queue_frames, 10))
-            low_watermark = max(1, high_watermark // 2)
-            next_frame = 0
-            while next_frame < len(tone_frames):
-                while (
-                    next_frame < len(tone_frames)
-                    and sender.queue_frames < high_watermark
-                ):
-                    sender.feed_pcm16le(tone_frames[next_frame])
-                    next_frame += 1
-                if next_frame < len(tone_frames):
-                    while sender.queue_frames > low_watermark:
-                        await asyncio.sleep(min(0.005, sender.interval / 4))
-            await sender.drain(timeout=max(1.0, duration_ms / 1000 + 1.0))
-        finally:
-            sender.stop_talk()
-        return sender.stats()
+        return await self._play_talkback_frames(
+            tone_frames, drain_timeout=max(1.0, duration_ms / 1000 + 1.0)
+        )
+
+    async def send_talkback_pcm16le_audio(self, pcm: bytes) -> dict[str, Any]:
+        """Play a complete PCM16LE clip through the active talkback sender."""
+        if not pcm:
+            raise RuntimeError("talkback audio is empty")
+        if len(pcm) % 2:
+            pcm += b"\x00"
+        frame_bytes = 160 * 2
+        if len(pcm) % frame_bytes:
+            pcm += b"\x00" * (frame_bytes - len(pcm) % frame_bytes)
+        frames = [
+            pcm[offset : offset + frame_bytes]
+            for offset in range(0, len(pcm), frame_bytes)
+        ]
+        return await self._play_talkback_frames(
+            frames, drain_timeout=max(1.0, len(frames) * 0.02 + 1.0)
+        )
+
+    async def _play_talkback_frames(
+        self, frames: list[bytes], *, drain_timeout: float
+    ) -> dict[str, Any]:
+        """Play pre-built 20 ms PCM frames with bounded queue pacing."""
+        if self._talkback_playback_lock.locked():
+            raise RuntimeError("talkback playback is already in progress")
+        async with self._talkback_playback_lock:
+            sender = self._talk_sender
+            if sender is None or not sender.active:
+                raise RuntimeError(
+                    "talkback is not ready; open the camera stream first"
+                )
+            sender.start_talk()
+            try:
+                high_watermark = max(1, min(sender.max_queue_frames, 10))
+                low_watermark = max(1, high_watermark // 2)
+                next_frame = 0
+                while next_frame < len(frames):
+                    if self._talk_sender is not sender or not sender.active:
+                        raise RuntimeError("talkback stopped during playback")
+                    while (
+                        next_frame < len(frames)
+                        and sender.queue_frames < high_watermark
+                    ):
+                        sender.feed_pcm16le(frames[next_frame])
+                        next_frame += 1
+                    if next_frame < len(frames):
+                        while sender.queue_frames > low_watermark:
+                            if self._talk_sender is not sender or not sender.active:
+                                raise RuntimeError("talkback stopped during playback")
+                            await asyncio.sleep(min(0.005, sender.interval / 4))
+                await sender.drain(timeout=drain_timeout)
+            finally:
+                sender.stop_talk()
+            return sender.stats()
 
     async def _punch(
         self,

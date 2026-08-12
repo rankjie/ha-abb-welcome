@@ -651,6 +651,26 @@ class StationStreamCoordinator:
         self._notify_state()
         return stats
 
+    async def send_talkback_pcm16le_audio(
+        self,
+        pcm: bytes,
+        *,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        """Play a complete decoded clip using talkback owner semantics."""
+        session_id = str(session_id or "").strip()
+        if session_id and self._talkback_owner and session_id != self._talkback_owner:
+            stats = self.talkback_stats()
+            stats["ignored"] = True
+            stats["ignore_reason"] = "talkback_session_owner_mismatch"
+            return stats
+        if session_id and not self._talkback_owner:
+            self._talkback_owner = session_id
+        stats = await self.session.send_talkback_pcm16le_audio(pcm)
+        stats["owner"] = self._talkback_owner
+        self._notify_state()
+        return stats
+
 
 class ABBWelcomeCamera(Camera):
     """Camera entity backed by per-entity RTSP server + lazy SIP dial."""
@@ -1172,6 +1192,19 @@ class ABBWelcomeCamera(Camera):
             duration_ms=duration_ms,
             frequency_hz=frequency_hz,
             amplitude=amplitude,
+            session_id=talkback_session_id,
+        )
+        self.async_write_ha_state()
+        return stats
+
+    async def async_talkback_play_audio(
+        self,
+        pcm: bytes,
+        talkback_session_id: str = "",
+    ) -> dict[str, Any]:
+        """Play decoded PCM audio through this camera's talkback leg."""
+        stats = await self._coordinator.send_talkback_pcm16le_audio(
+            pcm,
             session_id=talkback_session_id,
         )
         self.async_write_ha_state()

@@ -17,6 +17,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.selector import MediaSelector
 from homeassistant.helpers.start import async_at_start
 
 from .const import (
@@ -60,6 +61,7 @@ from .streaming_state import (
     is_pickup_allowed,
     set_pickup_allowed,
 )
+from .talkback_audio import async_prepare_talkback_audio
 from .text import decode_gateway_text, repair_utf8_mojibake
 
 _LOGGER = get_redacting_logger(__name__)
@@ -589,6 +591,7 @@ SERVICE_TALK_START = "talk_start"
 SERVICE_TALK_STOP = "talk_stop"
 SERVICE_TALK_PCM16LE = "talk_pcm16le"
 SERVICE_TALK_TONE = "talk_tone"
+SERVICE_PLAY_AUDIO = "play_audio"
 EXPORT_FIELDS = (
     "gateway_ip",
     "sip_username",
@@ -1183,6 +1186,51 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     ),
                     vol.Optional("amplitude", default=0.35): vol.All(
                         vol.Coerce(float), vol.Range(min=0.0, max=1.0)
+                    ),
+                }
+            ),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_PLAY_AUDIO):
+
+        async def _play_audio(call: ServiceCall) -> None:
+            talkback_session_id = str(
+                call.data.get("talkback_session_id")
+                or call.data.get("session_id")
+                or ""
+            ).strip()
+            media = call.data["media"]
+            camera = _cameras_for_talk_service(hass, call)[0]
+            play = getattr(camera, "async_talkback_play_audio", None)
+            if not callable(play):
+                raise HomeAssistantError(
+                    "Selected camera does not support talkback audio"
+                )
+            if not bool(getattr(camera, "talkback_ready", False)):
+                raise HomeAssistantError(
+                    "Talkback is not ready; open the selected camera stream first"
+                )
+            pcm = await async_prepare_talkback_audio(
+                hass, media["media_content_id"]
+            )
+            try:
+                await play(pcm, talkback_session_id)
+            except HomeAssistantError:
+                raise
+            except (OSError, RuntimeError, ValueError) as err:
+                raise HomeAssistantError(
+                    "Unable to play audio through the selected camera"
+                ) from err
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_PLAY_AUDIO,
+            _play_audio,
+            schema=vol.Schema(
+                {
+                    **talk_target_schema,
+                    vol.Required("media"): MediaSelector(
+                        {"accept": ["audio/*"]}
                     ),
                 }
             ),

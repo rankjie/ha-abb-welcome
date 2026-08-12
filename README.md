@@ -312,6 +312,7 @@ are mainly intended for the Scrypted plugin.
 - `abb_welcome.talk_stop`
 - `abb_welcome.talk_pcm16le`
 - `abb_welcome.talk_tone`
+- `abb_welcome.play_audio`
 
 The audio format for `talk_pcm16le` is base64-encoded 8 kHz mono signed 16-bit
 little-endian PCM. HA converts it to continuous PCMA/G.711 A-law RTP on the
@@ -330,6 +331,39 @@ with peak protection, not an implementation or equivalent of FFmpeg
 
 Scrypted assigns a per-client `talkback_session_id` so stale clients cannot stop
 or overwrite a newer microphone session.
+
+`abb_welcome.play_audio` resolves an audio selection through Home Assistant's
+media-source system, converts it to the talkback format, and plays it in real
+time. It supports local media and Home Assistant TTS media-source output only;
+arbitrary URLs and filesystem paths are rejected. The selected camera stream
+must already be active. Input is limited to 20 MiB and playback to 30 seconds,
+and the configured talkback output gain applies.
+
+Front-door example:
+
+```yaml
+action: abb_welcome.play_audio
+data:
+  entity_id: camera.abb_welcome_front_door
+  media:
+    media_content_id: media-source://media_source/local/front-door-message.mp3
+    media_content_type: audio/mpeg
+```
+
+Back-door example using a TTS media-source selection:
+
+```yaml
+action: abb_welcome.play_audio
+data:
+  entity_id: camera.abb_welcome_back_door
+  talkback_session_id: back-door-announcement
+  media:
+    media_content_id: media-source://tts/example-provider/example-message
+    media_content_type: audio/mpeg
+```
+
+Choose the TTS item with Home Assistant's media picker; the TTS identifier above
+is only a generic placeholder.
 
 ## Scrypted RTSP Endpoint
 
@@ -371,6 +405,8 @@ uses that event to refresh its station list and RTSP URLs.
   silence.
 - `abb_welcome.talk_pcm16le` - queue base64 PCM16LE microphone audio.
 - `abb_welcome.talk_tone` - send a short generated tone for testing.
+- `abb_welcome.play_audio` - play local media or Home Assistant TTS audio on the
+  active camera stream (maximum 30 seconds and 20 MiB source size).
 - `abb_welcome.export_credentials` - export stored SIP/gateway credentials to a
   JSON file for local debugging. This output contains secrets.
 
