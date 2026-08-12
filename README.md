@@ -318,6 +318,16 @@ little-endian PCM. HA converts it to continuous PCMA/G.711 A-law RTP on the
 active call's audio leg. Idle talkback sends silence continuously, and voice
 frames are queued into the same RTP sequence.
 
+**Talkback output gain** is configurable from **ABB Welcome options** between
+0.0 and 3.0 dB. App-managed M2240x/ASI22 devices default to 3.0 dB; web-admin
+gateways and legacy entries default to 0.0 dB, which preserves the previous
+talkback bytes exactly. The setting applies to every outbound talkback source,
+including live microphone PCM, client-generated speech/audio, and the explicit
+`talk_tone` service. A small stateful peak limiter prevents the gain from
+overflowing loud PCM frames and releases smoothly afterward. This is fixed gain
+with peak protection, not an implementation or equivalent of FFmpeg
+`loudnorm`, and it does not add an automatic chime or pre-tone.
+
 Scrypted assigns a per-client `talkback_session_id` so stale clients cannot stop
 or overwrite a newer microphone session.
 

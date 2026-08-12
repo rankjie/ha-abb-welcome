@@ -67,6 +67,7 @@ from .const import (
     GO2RTC_RTSP_HOST,
     GO2RTC_RTSP_PORT,
     gateway_profile,
+    talkback_output_gain_db,
 )
 from .device import gateway_device_info
 from .intercom_dialer import Door, IntercomDialer
@@ -142,6 +143,7 @@ async def async_setup_entry(
     exact_door_targets = (
         gateway_profile(entry.data) == GATEWAY_PROFILE_APP_MANAGED
     )
+    talkback_gain_db = talkback_output_gain_db(entry.data, entry.options)
     device_info = gateway_device_info(entry.data)
     door_meta: dict[str, tuple[Door, str, bool | str | int | None]] = {}
     camera_entities: dict[tuple[str, int], ABBWelcomeCamera] = {}
@@ -171,6 +173,7 @@ async def async_setup_entry(
                 incoming_listener=data.get("sip_listener"),
                 door=door,
                 camera_index=exposed_index,
+                talkback_output_gain_db=talkback_gain_db,
             )
             stream_coordinators[coordinator_key] = coordinator
         camera = ABBWelcomeCamera(
@@ -365,6 +368,7 @@ class StationStreamCoordinator:
         incoming_listener: object | None,
         door: Door,
         camera_index: int | None,
+        talkback_output_gain_db: float = 0.0,
     ) -> None:
         self.hass = hass
         self.entry_id = entry_id
@@ -383,6 +387,7 @@ class StationStreamCoordinator:
             incoming_listener=incoming_listener,
             pickup_allowed=lambda: is_pickup_allowed(self.hass, self.entry_id),
             on_call_ended=self._on_gateway_call_ended,
+            talkback_output_gain_db=talkback_output_gain_db,
         )
 
     @property
@@ -754,6 +759,10 @@ class ABBWelcomeCamera(Camera):
             ),
             "talkback_dropped_frames": int(
                 talkback_stats.get("dropped_frames", 0) or 0
+            ),
+            "talkback_gain_db": float(talkback_stats.get("gain_db", 0.0) or 0.0),
+            "talkback_limited_frames": int(
+                talkback_stats.get("limited_frames", 0) or 0
             ),
             "talkback_send_errors": int(
                 talkback_stats.get("send_errors", 0) or 0

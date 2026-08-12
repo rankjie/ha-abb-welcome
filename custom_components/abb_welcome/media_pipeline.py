@@ -46,6 +46,9 @@ _PLI_INTERVAL = 1.0
 _UDP_PAIR_ALLOCATION_ATTEMPTS = 32
 _PCMA_SILENCE_20MS = b"\xd5" * 160
 _TALK_SEND_GAP_WARNING_SECONDS = 0.030
+_TALK_GAIN_MIN_DB = 0.0
+_TALK_GAIN_MAX_DB = 3.0
+_TALK_LIMITER_RELEASE_ALPHA = 0.2
 _NANOSECONDS_PER_SECOND = 1_000_000_000
 
 
@@ -452,6 +455,7 @@ class _PCMATalkSender:
         max_queue_frames: int = 25,
         encryption_key: bytes | None = None,
         monotonic_ns: Callable[[], int] | None = None,
+        talkback_output_gain_db: float = 0.0,
     ) -> None:
         self._sock = sock
         self.dest = dest
@@ -469,6 +473,16 @@ class _PCMATalkSender:
             else None
         )
         self._monotonic_ns = monotonic_ns or time.monotonic_ns
+        try:
+            gain_db = float(talkback_output_gain_db)
+        except (TypeError, ValueError):
+            gain_db = 0.0
+        if not math.isfinite(gain_db):
+            gain_db = 0.0
+        self.gain_db = max(_TALK_GAIN_MIN_DB, min(_TALK_GAIN_MAX_DB, gain_db))
+        self._requested_gain_factor = 10 ** (self.gain_db / 20.0)
+        self._applied_gain_factor = self._requested_gain_factor
+        self._gain_lock = threading.Lock()
         self.ssrc = secrets.randbits(32)
         self.seq = secrets.randbits(16)
         self.timestamp = secrets.randbits(32)
@@ -490,6 +504,7 @@ class _PCMATalkSender:
         self.silence_packets_sent = 0
         self.underrun_silence_packets = 0
         self.dropped_frames = 0
+        self.limited_frames = 0
         self.send_errors = 0
         self._last_send_at_ns: int | None = None
         self.send_intervals = 0
@@ -575,7 +590,16 @@ class _PCMATalkSender:
             while len(self._pcm_buffer) >= frame_bytes:
                 frames.append(bytes(self._pcm_buffer[:frame_bytes]))
                 del self._pcm_buffer[:frame_bytes]
-        encoded = [_encode_pcm16le_to_pcma(frame) for frame in frames]
+        if self.gain_db == 0.0:
+            # Keep the compatibility path bit-for-bit identical, including
+            # its PCMA lookup-table behavior and sample rounding.
+            encoded = [_encode_pcm16le_to_pcma(frame) for frame in frames]
+        else:
+            with self._gain_lock:
+                encoded = [
+                    _encode_pcm16le_to_pcma(self._apply_gain_and_limiter(frame))
+                    for frame in frames
+                ]
         with self._condition:
             if not self.talking:
                 return 0
@@ -587,6 +611,41 @@ class _PCMATalkSender:
                 self.dropped_frames += 1
             self._condition.notify_all()
         return len(encoded)
+
+    def _apply_gain_and_limiter(self, pcm_frame: bytes) -> bytes:
+        """Apply stateful peak-safe gain to one 20 ms PCM16LE frame."""
+        sample_count = len(pcm_frame) // 2
+        if sample_count == 0:
+            return b""
+        samples = struct.unpack(f"<{sample_count}h", pcm_frame[: sample_count * 2])
+        peak = max(abs(sample) for sample in samples)
+        safe_factor = (
+            self._requested_gain_factor
+            if peak == 0
+            else min(self._requested_gain_factor, 32767.0 / peak)
+        )
+
+        if safe_factor < self._applied_gain_factor:
+            # Attack immediately when this frame cannot safely accept the
+            # current gain. Release toward the configured gain more gently.
+            applied_factor = safe_factor
+        else:
+            applied_factor = self._applied_gain_factor + (
+                self._requested_gain_factor - self._applied_gain_factor
+            ) * _TALK_LIMITER_RELEASE_ALPHA
+        applied_factor = max(
+            0.0,
+            min(self._requested_gain_factor, safe_factor, applied_factor),
+        )
+        self._applied_gain_factor = applied_factor
+        if applied_factor < self._requested_gain_factor:
+            self.limited_frames += 1
+
+        gained = [
+            max(-32768, min(32767, round(sample * applied_factor)))
+            for sample in samples
+        ]
+        return struct.pack(f"<{sample_count}h", *gained)
 
     def _thread_main(self) -> None:
         deadline_ns = self._monotonic_ns()
@@ -689,6 +748,8 @@ class _PCMATalkSender:
         _close_socket(self._sock)
 
     def stats(self) -> dict[str, Any]:
+        with self._gain_lock:
+            limited_frames = self.limited_frames
         with self._condition:
             return {
                 "talking": self.talking,
@@ -700,6 +761,8 @@ class _PCMATalkSender:
                 "silence_packets": self.silence_packets_sent,
                 "underrun_packets": self.underrun_silence_packets,
                 "dropped_frames": self.dropped_frames,
+                "gain_db": self.gain_db,
+                "limited_frames": limited_frames,
                 "queue_frames": len(self._queued_pcma),
                 "send_errors": self.send_errors,
                 "send_intervals": self.send_intervals,
@@ -933,6 +996,7 @@ class StreamSession:
         on_call_ended: Callable[[str, str], None] | None = None,
         on_video_packet: Callable[[bytes], None] | None = None,
         on_audio_packet: Callable[[bytes], None] | None = None,
+        talkback_output_gain_db: float = 0.0,
     ) -> None:
         self._dialer = dialer
         self._door = door
@@ -943,6 +1007,7 @@ class StreamSession:
         self._on_call_ended = on_call_ended
         self._on_video_packet = on_video_packet
         self._on_audio_packet = on_audio_packet
+        self._talkback_output_gain_db = talkback_output_gain_db
 
         self._media_ip = ""
         self._video_sock: socket.socket | None = None
@@ -1001,7 +1066,12 @@ class StreamSession:
     def talkback_stats(self) -> dict[str, Any]:
         sender = self._talk_sender
         if sender is None:
-            return {"active": False, "talking": False}
+            return {
+                "active": False,
+                "talking": False,
+                "gain_db": self._talkback_output_gain_db,
+                "limited_frames": 0,
+            }
         return sender.stats()
 
     def set_packet_handlers(
@@ -1328,6 +1398,7 @@ class StreamSession:
                     self._endpoints.audio.rtp,
                     payload_type=self._remote_audio_pt,
                     encryption_key=self._audio_send_key,
+                    talkback_output_gain_db=self._talkback_output_gain_db,
                 )
                 talkback_sock = None  # Ownership transferred to the sender.
                 await sender.start()

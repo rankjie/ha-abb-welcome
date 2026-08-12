@@ -27,6 +27,7 @@ from .const import (
     CONF_GATEWAY_UUID_OVERRIDE,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
+    CONF_TALKBACK_OUTPUT_GAIN_DB,
     CONF_UNLOCK_STRATEGY,
     DEFAULT_ALLOW_PICKUP,
     DEFAULT_LAN_RTSP_PORT,
@@ -35,12 +36,15 @@ from .const import (
     GATEWAY_PROFILE_APP_MANAGED,
     GATEWAY_PROFILE_WEB_ADMIN,
     GATEWAY_PROFILES,
+    MAX_TALKBACK_OUTPUT_GAIN_DB,
+    MIN_TALKBACK_OUTPUT_GAIN_DB,
     UNLOCK_STRATEGIES,
     UNLOCK_STRATEGY_FAST,
     UNLOCK_STRATEGY_HYBRID,
     UNLOCK_STRATEGY_STANDARD,
     gateway_capabilities,
     gateway_profile,
+    talkback_output_gain_db,
     unlockable_station_ids,
 )
 from .portal import (
@@ -846,6 +850,14 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
             if submitted is not None
             else self._entry.options.get(CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP)
         )
+        current_talkback_output_gain_db = float(
+            submitted.get(
+                CONF_TALKBACK_OUTPUT_GAIN_DB,
+                talkback_output_gain_db(self._entry.data, self._entry.options),
+            )
+            if submitted is not None
+            else talkback_output_gain_db(self._entry.data, self._entry.options)
+        )
         schema_fields = {
             vol.Required(
                 CONF_UNLOCK_STRATEGY, default=current
@@ -865,6 +877,16 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
             vol.Required(
                 CONF_ALLOW_PICKUP, default=current_allow_pickup
             ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_TALKBACK_OUTPUT_GAIN_DB,
+                default=current_talkback_output_gain_db,
+            ): vol.All(
+                vol.Coerce(float),
+                vol.Range(
+                    min=MIN_TALKBACK_OUTPUT_GAIN_DB,
+                    max=MAX_TALKBACK_OUTPUT_GAIN_DB,
+                ),
+            ),
         }
         if is_app_managed and station_ids:
             door_names = {
