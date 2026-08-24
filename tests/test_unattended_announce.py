@@ -198,6 +198,9 @@ def _coordinator(
     coordinator._temporary_talkback_task = None
     coordinator._peer_coordinators = lambda: peers or []
     coordinator._state_callbacks = []
+    coordinator._packet_sinks = []
+    coordinator._handlers_installed = False
+    coordinator._call_ended_callbacks = []
     return coordinator
 
 

@@ -25,7 +25,7 @@ import asyncio
 import re
 from collections.abc import Callable, Iterable
 from http import HTTPStatus
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
@@ -357,6 +357,19 @@ def _go2rtc_session(hass: HomeAssistant) -> ClientSession:
     return async_get_clientsession(hass)
 
 
+class PacketSink(Protocol):
+    """A non-RTSP consumer of raw RTP packets (e.g. the ring-clip recorder).
+
+    Registered sinks keep the coordinator's packet handlers installed and
+    the underlying media session open even when no RTSP client is attached,
+    coexisting with RTSP consumers rather than replacing them.
+    """
+
+    def on_video(self, packet: bytes) -> None: ...
+
+    def on_audio(self, packet: bytes) -> None: ...
+
+
 class StationStreamCoordinator:
     """Own one gateway media session and fan it out to RTSP consumers."""
 
@@ -387,6 +400,9 @@ class StationStreamCoordinator:
         self._temporary_talkback_task: asyncio.Task | None = None
         self._peer_coordinators = peer_coordinators
         self._state_callbacks: list[Callable[[], None]] = []
+        self._packet_sinks: list[PacketSink] = []
+        self._handlers_installed = False
+        self._call_ended_callbacks: list[Callable[[str, str], None]] = []
         self.session = StreamSession(
             dialer=dialer,
             door=door,
@@ -447,6 +463,92 @@ class StationStreamCoordinator:
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("[abb] stream coordinator callback failed: %s", err)
 
+    def add_call_ended_callback(self, callback: Callable[[str, str], None]) -> None:
+        """Register a callback fired whenever the underlying call ends.
+
+        Unlike ``_on_gateway_call_ended``'s RTSP-session teardown, this
+        fires even when only packet sinks (no RTSP clients) are attached —
+        the ring-clip recorder uses it to end its current segment.
+        """
+        if callback not in self._call_ended_callbacks:
+            self._call_ended_callbacks.append(callback)
+
+    def remove_call_ended_callback(self, callback: Callable[[str, str], None]) -> None:
+        self._call_ended_callbacks = [
+            existing
+            for existing in self._call_ended_callbacks
+            if existing is not callback
+        ]
+
+    def _notify_call_ended_listeners(self, call_id: str, reason: str) -> None:
+        for listener in list(self._call_ended_callbacks):
+            try:
+                listener(call_id, reason)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "[abb] stream coordinator call-ended callback failed: %s", err
+                )
+
+    def add_packet_sink(self, sink: PacketSink) -> None:
+        """Register a non-RTSP RTP consumer (e.g. the ring-clip recorder)."""
+        if sink not in self._packet_sinks:
+            self._packet_sinks.append(sink)
+        self._ensure_handlers_installed()
+        self._notify_state()
+
+    def remove_packet_sink(self, sink: PacketSink) -> None:
+        self._packet_sinks = [
+            existing for existing in self._packet_sinks if existing is not sink
+        ]
+        if not self._rtsp_play_sessions and not self._packet_sinks:
+            self._clear_handlers()
+            self._schedule_close()
+        self._notify_state()
+
+    def _ensure_handlers_installed(self) -> None:
+        """Idempotently wire this coordinator's fan-out as the packet handlers.
+
+        The coordinator is the sole owner of ``StreamSession``'s single
+        video/audio handler pair; RTSP sessions and packet sinks are both
+        fanned out from ``_forward_video``/``_forward_audio`` below.
+        """
+        if self._handlers_installed:
+            return
+        self.session.set_packet_handlers(
+            on_video=self._forward_video,
+            on_audio=self._forward_audio,
+        )
+        self._handlers_installed = True
+
+    def _clear_handlers(self) -> None:
+        self.session.set_packet_handlers(on_video=None, on_audio=None)
+        self._handlers_installed = False
+
+    async def async_open_for_ring(self) -> bool:
+        """Open (or reuse) the media session for native ring-clip capture.
+
+        Installs the packet handlers so registered sinks receive RTP even
+        with no RTSP viewer attached, then opens the underlying media
+        session if it is not already active. Returns whether media ended
+        up open; never raises (open failures are logged and reported via
+        the return value only).
+        """
+        self._cancel_close_task()
+        self._ensure_handlers_installed()
+        async with self._stream_lock:
+            if not self.session.active:
+                try:
+                    await self.session.open()
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning(
+                        "[abb] stream coordinator: failed to open media for "
+                        "ring clip capture station=%s: %s",
+                        self.door.station_id or self.door.address,
+                        err,
+                    )
+        self._notify_state()
+        return self.session.active
+
     def _cancel_close_task(self) -> None:
         if self._close_task is not None and not self._close_task.done():
             self._close_task.cancel()
@@ -494,8 +596,8 @@ class StationStreamCoordinator:
 
     def _reject_rtsp_during_temporary_talkback(self, sess: RtspSession) -> bool:
         self._discard_rtsp_play_session(sess)
-        if not self._rtsp_play_sessions:
-            self.session.set_packet_handlers(on_video=None, on_audio=None)
+        if not self._rtsp_play_sessions and not self._packet_sinks:
+            self._clear_handlers()
         sess.close()
         self._notify_state()
         return False
@@ -515,10 +617,7 @@ class StationStreamCoordinator:
         self._add_rtsp_play_session(sess)
         if self._temporary_talkback_in_group():
             return self._reject_rtsp_during_temporary_talkback(sess)
-        self.session.set_packet_handlers(
-            on_video=self._forward_video,
-            on_audio=self._forward_audio,
-        )
+        self._ensure_handlers_installed()
         self._notify_state()
         try:
             async with self._stream_lock:
@@ -528,8 +627,8 @@ class StationStreamCoordinator:
                     await self.session.open()
         except Exception:
             self._discard_rtsp_play_session(sess)
-            if not self._rtsp_play_sessions:
-                self.session.set_packet_handlers(on_video=None, on_audio=None)
+            if not self._rtsp_play_sessions and not self._packet_sinks:
+                self._clear_handlers()
             sess.close()
             self._notify_state()
             raise
@@ -555,17 +654,21 @@ class StationStreamCoordinator:
             self.session.active,
             len(self._rtsp_play_sessions),
         )
-        if not self._rtsp_play_sessions:
-            self.session.set_packet_handlers(on_video=None, on_audio=None)
+        if not self._rtsp_play_sessions and not self._packet_sinks:
+            self._clear_handlers()
             self._schedule_close()
         self._notify_state()
 
     def _on_gateway_call_ended(self, call_id: str, reason: str) -> None:
+        # Fires even with zero RTSP viewers so a sink-only (ring-clip)
+        # capture also learns the call ended.
+        self._notify_call_ended_listeners(call_id, reason)
         if not self._rtsp_play_sessions:
             return
         sessions = list(self._rtsp_play_sessions)
         self._rtsp_play_sessions = []
-        self.session.set_packet_handlers(on_video=None, on_audio=None)
+        if not self._packet_sinks:
+            self._clear_handlers()
         _LOGGER.info(
             "[abb] stream coordinator: closing %d RTSP client(s) after "
             "gateway call ended station=%s call_id=%s reason=%s",
@@ -581,7 +684,12 @@ class StationStreamCoordinator:
     async def force_close(self) -> None:
         self._cancel_close_task()
         self._rtsp_play_sessions = []
-        self.session.set_packet_handlers(on_video=None, on_audio=None)
+        # Unconditional: force_close tears everything down for entry unload /
+        # entity removal, so any sink is force-notified and dropped rather
+        # than allowed to keep the session open.
+        self._notify_call_ended_listeners("", "force_close")
+        self._packet_sinks = []
+        self._clear_handlers()
         temporary_task = self._temporary_talkback_task
         if (
             temporary_task is not None
@@ -613,10 +721,10 @@ class StationStreamCoordinator:
             await asyncio.sleep(_TEARDOWN_GRACE_SECONDS)
         except asyncio.CancelledError:
             return
-        if self._rtsp_play_sessions:
+        if self._rtsp_play_sessions or self._packet_sinks:
             return
         async with self._stream_lock:
-            if self._rtsp_play_sessions:
+            if self._rtsp_play_sessions or self._packet_sinks:
                 return
             if self.session.active:
                 await self.session.close()
@@ -637,8 +745,13 @@ class StationStreamCoordinator:
         for client in list(self._rtsp_play_sessions):
             if not client.push_rtp(VIDEO_RTP_CHANNEL, packet):
                 self._discard_rtsp_play_session(client)
-        if not self._rtsp_play_sessions:
-            self.session.set_packet_handlers(on_video=None, on_audio=None)
+        for sink in list(self._packet_sinks):
+            try:
+                sink.on_video(packet)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("[abb] packet sink on_video failed: %s", err)
+        if not self._rtsp_play_sessions and not self._packet_sinks:
+            self._clear_handlers()
             self._schedule_close()
             self._notify_state()
 
@@ -646,8 +759,13 @@ class StationStreamCoordinator:
         for client in list(self._rtsp_play_sessions):
             if not client.push_rtp(AUDIO_RTP_CHANNEL, packet):
                 self._discard_rtsp_play_session(client)
-        if not self._rtsp_play_sessions:
-            self.session.set_packet_handlers(on_video=None, on_audio=None)
+        for sink in list(self._packet_sinks):
+            try:
+                sink.on_audio(packet)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("[abb] packet sink on_audio failed: %s", err)
+        if not self._rtsp_play_sessions and not self._packet_sinks:
+            self._clear_handlers()
             self._schedule_close()
             self._notify_state()
 

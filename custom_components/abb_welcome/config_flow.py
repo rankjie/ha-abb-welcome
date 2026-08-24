@@ -27,16 +27,26 @@ from .const import (
     CONF_GATEWAY_UUID_OVERRIDE,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
+    CONF_RECORD_RING_CLIPS,
+    CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
+    CONF_RING_CLIP_DIR,
+    CONF_RING_CLIP_SECONDS,
     CONF_TALKBACK_OUTPUT_GAIN_DB,
     CONF_UNLOCK_STRATEGY,
     DEFAULT_ALLOW_PICKUP,
     DEFAULT_LAN_RTSP_PORT,
+    DEFAULT_RECORD_RING_CLIPS,
+    DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
+    DEFAULT_RING_CLIP_DIR,
+    DEFAULT_RING_CLIP_SECONDS,
     DOMAIN,
     GATEWAY_CAPABILITIES,
     GATEWAY_PROFILE_APP_MANAGED,
     GATEWAY_PROFILE_WEB_ADMIN,
     GATEWAY_PROFILES,
+    MAX_RING_CLIP_SECONDS,
     MAX_TALKBACK_OUTPUT_GAIN_DB,
+    MIN_RING_CLIP_SECONDS,
     MIN_TALKBACK_OUTPUT_GAIN_DB,
     UNLOCK_STRATEGIES,
     UNLOCK_STRATEGY_FAST,
@@ -809,6 +819,9 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
             data[CONF_LAN_RTSP_PORT] = int(
                 data.get(CONF_LAN_RTSP_PORT) or DEFAULT_LAN_RTSP_PORT
             )
+            data[CONF_RING_CLIP_DIR] = (
+                str(data.get(CONF_RING_CLIP_DIR) or "").strip() or DEFAULT_RING_CLIP_DIR
+            )
             if not errors:
                 return self.async_create_entry(title="", data=data)
 
@@ -858,6 +871,42 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
             if submitted is not None
             else talkback_output_gain_db(self._entry.data, self._entry.options)
         )
+        current_record_ring_clips = bool(
+            submitted.get(CONF_RECORD_RING_CLIPS, DEFAULT_RECORD_RING_CLIPS)
+            if submitted is not None
+            else self._entry.options.get(
+                CONF_RECORD_RING_CLIPS, DEFAULT_RECORD_RING_CLIPS
+            )
+        )
+        current_ring_clip_seconds = int(
+            (
+                submitted.get(CONF_RING_CLIP_SECONDS, DEFAULT_RING_CLIP_SECONDS)
+                if submitted is not None
+                else self._entry.options.get(
+                    CONF_RING_CLIP_SECONDS, DEFAULT_RING_CLIP_SECONDS
+                )
+            )
+            or DEFAULT_RING_CLIP_SECONDS
+        )
+        current_ring_clip_dir = (
+            str(
+                submitted.get(CONF_RING_CLIP_DIR, DEFAULT_RING_CLIP_DIR)
+                if submitted is not None
+                else self._entry.options.get(CONF_RING_CLIP_DIR, DEFAULT_RING_CLIP_DIR)
+            )
+            or DEFAULT_RING_CLIP_DIR
+        )
+        current_ring_clip_continue_after_hangup = bool(
+            submitted.get(
+                CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
+                DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
+            )
+            if submitted is not None
+            else self._entry.options.get(
+                CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
+                DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
+            )
+        )
         schema_fields = {
             vol.Required(
                 CONF_UNLOCK_STRATEGY, default=current
@@ -887,6 +936,22 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
                     max=MAX_TALKBACK_OUTPUT_GAIN_DB,
                 ),
             ),
+            vol.Required(
+                CONF_RECORD_RING_CLIPS, default=current_record_ring_clips
+            ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_RING_CLIP_SECONDS, default=current_ring_clip_seconds
+            ): vol.All(
+                vol.Coerce(int),
+                vol.Range(min=MIN_RING_CLIP_SECONDS, max=MAX_RING_CLIP_SECONDS),
+            ),
+            vol.Optional(
+                CONF_RING_CLIP_DIR, default=current_ring_clip_dir
+            ): selector.TextSelector(),
+            vol.Required(
+                CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
+                default=current_ring_clip_continue_after_hangup,
+            ): selector.BooleanSelector(),
         }
         if is_app_managed and station_ids:
             door_names = {

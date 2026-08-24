@@ -271,6 +271,52 @@ play_audio:
           accept:
             - audio/*
 
+record_clip:
+  name: Record a ring clip
+  description: >-
+    Record a short native H.264 clip from the selected station and remux it
+    to mp4 without waiting on HA's stream/go2rtc pipeline. Dials the station
+    if it is not already in a call. Fires the same abb_welcome_ring_clip
+    event as an automatic ring capture, with reason "service".
+  fields:
+    entity_id:
+      name: Camera
+      description: Optional camera entity. Defaults to the active ABB camera stream.
+      required: false
+      selector:
+        entity:
+          domain: camera
+    station_id:
+      name: Station ID
+      description: Optional outdoor station id to target when no camera entity is supplied.
+      required: false
+      selector:
+        text:
+    entry_id:
+      name: Entry ID
+      description: Optional ABB Welcome config-entry id.
+      required: false
+      selector:
+        text:
+    duration:
+      name: Duration
+      description: Clip duration in seconds. Defaults to the configured ring clip duration.
+      required: false
+      selector:
+        number:
+          min: 2
+          max: 60
+          mode: box
+          unit_of_measurement: s
+    filename:
+      name: Filename
+      description: >-
+        Optional output filename stem (no extension). Defaults to
+        abb_ringclip_<timestamp>_<station_id>.
+      required: false
+      selector:
+        text:
+
 announce:
   name: Announce at a door
   description: >-
