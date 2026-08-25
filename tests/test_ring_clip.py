@@ -298,12 +298,12 @@ def test_finalize_computes_fps_writes_mp4_and_removes_h264(
     assert result.segments == 1
     assert result.duration_s == pytest.approx(1.0)
     assert result.started_at == pytest.approx(100.0)
-    assert result.fps == 2  # round(2 frames / 1.0s)
+    assert result.fps == 2.0  # 2 frames / 1.0s of captured video
 
     args = captured["args"]
     assert args[0] == "/configured/ffmpeg"
     assert args[1:5] == ("-hide_banner", "-loglevel", "error", "-nostdin")
-    assert args[args.index("-r") + 1] == "2"
+    assert args[args.index("-r") + 1] == "2.0"
     assert args[args.index("-i") + 1] == str(writer.path)
     assert args[-1] == str(tmp_path / "clip.mp4")
 
@@ -459,9 +459,9 @@ def test_finalize_clamps_fps_to_sane_range(
     assert result.ok is True
     assert result.frames == 21
     assert result.duration_s == pytest.approx(0.1)
-    assert result.fps == 30  # clamped down from round(21 / 0.1) == 210
+    assert result.fps == 30.0  # clamped down from 21 / 0.1 == 210
     args = captured["args"]
-    assert args[args.index("-r") + 1] == "30"
+    assert args[args.index("-r") + 1] == "30.0"
 
 
 def test_finalize_is_cancellable_and_kills_the_ffmpeg_process(
@@ -863,3 +863,45 @@ def test_capture_ring_clip_service_reason_allowed_for_a_different_station(
     assert hass.bus.fired[0][1]["ok"] is True
     # The other station's marker is untouched by station2's capture.
     assert entry_data["ring_clip_in_flight_stations"] == {"station1"}
+
+
+def test_finalize_excludes_the_dead_gap_between_segments_from_fps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The station hangs up when the door opens and the continuation dial only
+    gets media seconds later. No frames exist for that gap, so counting it
+    toward the frame rate would stretch the clip into a slideshow (measured on
+    a live ring: 10 frames across a 6.34s window carrying only 1.70s of video).
+    """
+    # Segment 1: 3 frames over 1.0s. Gap: 4.0s. Segment 2: 3 frames over 1.0s.
+    times = iter([100.0, 100.5, 101.0, 105.0, 105.5, 106.0])
+    monkeypatch.setattr(ring_clip.time, "time", lambda: next(times))
+
+    hass = _Hass()
+    first = ring_clip.RingClipWriter(hass, tmp_path, "clip")
+    second = ring_clip.RingClipWriter(hass, tmp_path, "clip.part2")
+    for seq, writer in ((1, first), (2, first), (3, first)):
+        writer.on_video(_rtp(seq, bytes([0x65, seq])))
+    for seq, writer in ((1, second), (2, second), (3, second)):
+        writer.on_video(_rtp(seq, bytes([0x65, seq])))
+
+    captured: dict[str, object] = {}
+    process = _FakeProcess(returncode=0)
+
+    async def _spawn(*args, **_kwargs):
+        captured["args"] = args
+        Path(args[-1]).write_bytes(b"fake-mp4-bytes")
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    result = asyncio.run(first.finalize(extra_segments=[second]))
+
+    assert result.ok is True
+    assert result.frames == 6
+    assert result.segments == 2
+    # The reported window still spans the gap - that is the real elapsed time.
+    assert result.duration_s == pytest.approx(6.0)
+    # ...but the frame rate is derived from the 2.0s that carried video,
+    # not the 6.0s window, so playback runs at true speed.
+    assert result.fps == pytest.approx(3.0)
+    assert captured["args"][captured["args"].index("-r") + 1] == "3.0"

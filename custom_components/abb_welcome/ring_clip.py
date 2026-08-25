@@ -47,8 +47,8 @@ _MAX_BUFFER_BYTES = 64 * 1024 * 1024
 # Sane ffmpeg `-r` bounds: the measured fps is derived from wall-clock
 # deltas between RTP packets, so a degenerate frames/elapsed ratio (e.g.
 # one packet, or a near-zero elapsed time) must not reach ffmpeg raw.
-_MIN_FPS = 1
-_MAX_FPS = 30
+_MIN_FPS = 1.0
+_MAX_FPS = 30.0
 
 
 class H264Depacketizer:
@@ -184,7 +184,7 @@ class RingClipResult:
     duration_s: float
     started_at: float | None
     segments: int
-    fps: int
+    fps: float
     error: str = ""
 
 
@@ -320,6 +320,18 @@ class RingClipWriter:
         ends = [s.last_wall_time for s in segments if s.last_wall_time is not None]
         started_at = min(starts) if starts else None
         duration_s = max(ends) - min(starts) if starts and ends else 0.0
+        # Time actually spent RECEIVING video, which is not the window it spans:
+        # the station hangs up the moment the door is opened, and the
+        # continuation dial only gets media a few seconds later. That dead time
+        # is real, but no frames exist for it, so counting it toward the frame
+        # rate stretches the whole clip into a slideshow. Measured on a live
+        # ring: 10 frames across a 6.34 s window of which only 1.70 s carried
+        # video - 1.6 fps by the window, ~5.9 fps in truth.
+        capture_s = sum(
+            segment.elapsed_s
+            for segment in segments
+            if segment.bytes_written > 0 and segment.elapsed_s > 0
+        )
 
         if not non_empty:
             return RingClipResult(
@@ -356,7 +368,7 @@ class RingClipWriter:
                 error=f"could not write segment file: {err}",
             )
 
-        raw_fps = round(total_frames / duration_s) if duration_s > 0 else total_frames
+        raw_fps = round(total_frames / capture_s, 2) if capture_s > 0 else total_frames
         fps = min(_MAX_FPS, max(_MIN_FPS, raw_fps))
         output_path = self.path.with_suffix(".mp4")
 
