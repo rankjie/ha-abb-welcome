@@ -60,7 +60,7 @@ from .const import (
 )
 from .coordinator import ABBWelcomeCoordinator
 from .redaction import get_redacting_logger
-from .ring_clip import RingClipWriter
+from .ring_clip import RingClipResult, RingClipWriter
 from .rtsp_proxy import RtspTcpProxy
 from .sip_client import SIPClient
 from .sip_listener import IncomingCall, SipListener
@@ -435,105 +435,161 @@ async def _capture_ring_clip(
     entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if entry_data is None:
         return
-    coordinator = entry_data.get("stream_coordinators", {}).get(
-        (_safe_key(station_id), 0)
-    )
-    if coordinator is None:
-        raise HomeAssistantError(
-            f"No ABB Welcome stream coordinator for station {station_id!r}"
-        )
 
-    seconds = duration if duration is not None else ring_clip_seconds(entry.options)
-    target_dir = Path(
-        hass.config.path(
-            str(entry.options.get(CONF_RING_CLIP_DIR, "") or DEFAULT_RING_CLIP_DIR)
+    # A visitor pressing the button twice in quick succession fires two
+    # independent _on_ring calls against the same station; without this
+    # guard both would race a capture against the station's single call.
+    in_flight: set[str] = entry_data.setdefault("ring_clip_in_flight_stations", set())
+    if station_id in in_flight:
+        if reason == "service":
+            raise HomeAssistantError(
+                f"A ring clip capture is already running for station "
+                f"{station_id!r}; wait for it to finish before retrying"
+            )
+        _LOGGER.info(
+            "[abb] ring clip already capturing for station %s, ignoring re-ring",
+            station_id,
         )
-    )
-    base_name = filename or (
-        # Intentionally local wall-clock time, matching the documented
-        # abb_ringclip_<YYYYmmdd_HHMMSS local>_<station_id> filename scheme.
-        f"abb_ringclip_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{station_id}"  # noqa: DTZ005
-    )
-
+        return
+    in_flight.add(station_id)
     try:
-        writer = RingClipWriter(hass, target_dir, base_name)
-    except (PermissionError, OSError) as err:
-        raise HomeAssistantError(
-            f"Could not open ring clip capture file in {target_dir}: {err}"
-        ) from err
-
-    unload_event = asyncio.Event()
-    unsub_unload = entry.async_on_unload(unload_event.set)
-    extra_segments: list[RingClipWriter] = []
-    try:
-        call_ended = await _record_ring_segment(
-            coordinator, writer, max_seconds=seconds, stop_events=(unload_event,)
+        coordinator = entry_data.get("stream_coordinators", {}).get(
+            (_safe_key(station_id), 0)
         )
+        if coordinator is None:
+            raise HomeAssistantError(
+                f"No ABB Welcome stream coordinator for station {station_id!r}"
+            )
 
-        continue_after_hangup = bool(
-            entry.options.get(
-                CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
-                DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
+        seconds = (
+            duration if duration is not None else ring_clip_seconds(entry.options)
+        )
+        target_dir = Path(
+            hass.config.path(
+                str(entry.options.get(CONF_RING_CLIP_DIR, "") or DEFAULT_RING_CLIP_DIR)
             )
         )
-        if (
-            reason == "ring"
-            and continue_after_hangup
-            and call_ended
-            and not unload_event.is_set()
-            and writer.elapsed_s < seconds
-        ):
-            remaining = seconds - writer.elapsed_s
-            await asyncio.sleep(_RING_CLIP_REDIAL_DELAY_S)
-            if not unload_event.is_set():
-                wait_started = time.monotonic()
-                try:
-                    writer2 = RingClipWriter(hass, target_dir, f"{base_name}.part2")
-                except (PermissionError, OSError) as err:
-                    _LOGGER.error(
-                        "[abb] ring clip: could not open continuation segment "
-                        "for station=%s: %s",
-                        station_id,
-                        err,
-                    )
-                else:
-                    await _record_ring_segment(
-                        coordinator,
-                        writer2,
-                        max_seconds=remaining,
-                        stop_events=(unload_event,),
-                    )
-                    if writer2.first_wall_time is not None:
-                        _LOGGER.info(
-                            "[abb] ring clip: continuation wait->first-frame "
-                            "delta=%.3fs station=%s",
-                            writer2.first_wall_time - wait_started,
-                            station_id,
-                        )
-                    extra_segments.append(writer2)
-    finally:
-        unsub_unload()
-        # Idempotent: on the normal path finalize() below re-closes (a
-        # no-op) each writer; this only matters if something above raised
-        # or the task was cancelled, where it guarantees the file handle(s)
-        # do not leak open.
-        writer.close()
-        for segment in extra_segments:
-            segment.close()
+        base_name = filename or (
+            # Intentionally local wall-clock time, matching the documented
+            # abb_ringclip_<YYYYmmdd_HHMMSS local>_<station_id> filename scheme.
+            f"abb_ringclip_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{station_id}"  # noqa: DTZ005
+        )
 
-    result = await writer.finalize(extra_segments=extra_segments)
-    payload = _ring_clip_event_payload(hass, station_id, reason, result, target_dir)
-    hass.bus.async_fire(EVENT_RING_CLIP, payload)
-    _LOGGER.info(
-        "[abb] ring clip: %s station=%s file=%s duration=%.1fs frames=%d "
-        "segments=%d",
-        "captured" if result.ok else "failed",
-        station_id,
-        payload["filename"],
-        result.duration_s,
-        result.frames,
-        result.segments,
-    )
+        try:
+            writer = RingClipWriter(hass, target_dir, base_name)
+        except (PermissionError, OSError) as err:
+            raise HomeAssistantError(
+                f"Could not open ring clip capture file in {target_dir}: {err}"
+            ) from err
+
+        # A single unload Event, owned and set exactly once by
+        # async_setup_entry, is shared by every capture against this
+        # entry. The defensive fallback only matters if this ever runs
+        # before that event is stored (should not happen in practice).
+        unload_event = entry_data.get("ring_clip_unload_event")
+        if unload_event is None:
+            unload_event = asyncio.Event()
+
+        extra_segments: list[RingClipWriter] = []
+        try:
+            call_ended = await _record_ring_segment(
+                coordinator, writer, max_seconds=seconds, stop_events=(unload_event,)
+            )
+
+            continue_after_hangup = bool(
+                entry.options.get(
+                    CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
+                    DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
+                )
+            )
+            if (
+                reason == "ring"
+                and continue_after_hangup
+                and call_ended
+                and not unload_event.is_set()
+                and writer.elapsed_s < seconds
+            ):
+                remaining = seconds - writer.elapsed_s
+                await asyncio.sleep(_RING_CLIP_REDIAL_DELAY_S)
+                if not unload_event.is_set():
+                    # Same clock as RingClipWriter.first_wall_time (wall
+                    # time, not monotonic) — first_wall_time also anchors
+                    # the fired event's started_at, so it cannot switch
+                    # clocks without corrupting that timestamp too.
+                    wait_started = time.time()
+                    try:
+                        writer2 = RingClipWriter(
+                            hass, target_dir, f"{base_name}.part2"
+                        )
+                    except (PermissionError, OSError) as err:
+                        _LOGGER.error(
+                            "[abb] ring clip: could not open continuation segment "
+                            "for station=%s: %s",
+                            station_id,
+                            err,
+                        )
+                    else:
+                        await _record_ring_segment(
+                            coordinator,
+                            writer2,
+                            max_seconds=remaining,
+                            stop_events=(unload_event,),
+                        )
+                        if writer2.first_wall_time is not None:
+                            _LOGGER.info(
+                                "[abb] ring clip: continuation wait->first-frame "
+                                "delta=%.3fs station=%s",
+                                writer2.first_wall_time - wait_started,
+                                station_id,
+                            )
+                        extra_segments.append(writer2)
+        except Exception:  # the clip must still be finalized below
+            _LOGGER.exception(
+                "[abb] ring clip: capture failed unexpectedly station=%s",
+                station_id,
+            )
+        finally:
+            # Idempotent: on the normal path finalize() below re-closes (a
+            # no-op) each writer; this only matters if something above
+            # raised or the task was cancelled, so no writer is left
+            # accepting packets after this point.
+            writer.close()
+            for segment in extra_segments:
+                segment.close()
+
+        try:
+            result = await writer.finalize(extra_segments=extra_segments)
+        except Exception as err:  # the event must still fire
+            _LOGGER.exception(
+                "[abb] ring clip: finalize failed unexpectedly station=%s",
+                station_id,
+            )
+            result = RingClipResult(
+                ok=False,
+                output_path=writer.path,
+                frames=writer.frames,
+                nals=writer.nals,
+                bytes_written=writer.bytes_written,
+                duration_s=writer.elapsed_s,
+                started_at=writer.first_wall_time,
+                segments=1 + len(extra_segments),
+                fps=0,
+                error=str(err),
+            )
+        payload = _ring_clip_event_payload(hass, station_id, reason, result, target_dir)
+        hass.bus.async_fire(EVENT_RING_CLIP, payload)
+        _LOGGER.info(
+            "[abb] ring clip: %s station=%s file=%s duration=%.1fs frames=%d "
+            "segments=%d",
+            "captured" if result.ok else "failed",
+            station_id,
+            payload["filename"],
+            result.duration_s,
+            result.frames,
+            result.segments,
+        )
+    finally:
+        in_flight.discard(station_id)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -554,6 +610,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "coordinator": coordinator,
     }
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = entry_data
+
+    # One unload Event per entry, shared by every ring-clip capture that
+    # runs against it (see _capture_ring_clip). Registering it here, once,
+    # avoids leaking one entry.async_on_unload listener per ring capture
+    # and — since ConfigEntry.async_on_unload returns None, not an
+    # unsubscribe callable — avoids calling that None at capture teardown.
+    ring_clip_unload_event = asyncio.Event()
+    entry.async_on_unload(ring_clip_unload_event.set)
+    entry_data["ring_clip_unload_event"] = ring_clip_unload_event
+
     set_pickup_allowed(
         hass,
         entry.entry_id,

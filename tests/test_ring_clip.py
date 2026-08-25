@@ -186,6 +186,9 @@ class _Hass:
         self.config = _Config(allowed=allowed)
         self.ffmpeg = types.SimpleNamespace(binary=ffmpeg_binary)
 
+    async def async_add_executor_job(self, func, *args):
+        return func(*args)
+
 
 class _FakeProcess:
     def __init__(self, *, returncode: int = 0, stderr: bytes = b"") -> None:
@@ -214,11 +217,12 @@ def test_writer_enforces_is_allowed_path(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
-def test_writer_frames_nals_to_annex_b_file(tmp_path: Path) -> None:
+def test_writer_frames_nals_to_annex_b_buffer(tmp_path: Path) -> None:
     hass = _Hass()
     writer = ring_clip.RingClipWriter(hass, tmp_path, "clip")
     assert writer.path == tmp_path / "clip.h264"
-    assert writer.path.exists()
+    # Nothing touches disk until finalize(): on_video only buffers in RAM.
+    assert not writer.path.exists()
 
     writer.on_video(_rtp(1, b"\x67SPS"))
     writer.on_video(_rtp(2, b"\x68PPS"))
@@ -231,7 +235,8 @@ def test_writer_frames_nals_to_annex_b_file(tmp_path: Path) -> None:
         b"\x00\x00\x00\x01\x68PPS"
         b"\x00\x00\x00\x01\x65KEYFRAME"
     )
-    assert writer.path.read_bytes() == expected
+    assert bytes(writer._buffer) == expected
+    assert not writer.path.exists()  # still nothing on disk after close()
     assert writer.nals == 3
     assert writer.frames == 1  # only the IDR slice is a coded picture
     assert writer.bytes_written == len(expected)
@@ -249,9 +254,9 @@ def test_writer_close_is_idempotent_and_stops_accepting_packets(
     writer.close()
     writer.close()  # must not raise
 
-    size_before = writer.path.stat().st_size
+    size_before = len(writer._buffer)
     writer.on_video(_rtp(2, b"\x65Y"))
-    assert writer.path.stat().st_size == size_before
+    assert len(writer._buffer) == size_before
     assert writer.nals == 1
 
 
@@ -356,7 +361,15 @@ def test_finalize_concatenates_multi_segment_and_removes_both_h264(
     writer2.on_video(_rtp(2, b"\x65IDR2"))
     writer2.close()
 
-    expected_concat = writer1.path.read_bytes() + writer2.path.read_bytes()
+    # Segments are buffered in memory (never written per-segment to disk),
+    # so the expected concatenation is built from the same known bytes,
+    # not read back from either writer's (nonexistent, pre-finalize) path.
+    expected_concat = (
+        b"\x00\x00\x00\x01\x67SPS"
+        b"\x00\x00\x00\x01\x65IDR1"
+        b"\x00\x00\x00\x01\x67SPS"
+        b"\x00\x00\x00\x01\x65IDR2"
+    )
 
     captured: dict[str, object] = {}
     process = _FakeProcess(returncode=0)
@@ -377,6 +390,78 @@ def test_finalize_concatenates_multi_segment_and_removes_both_h264(
     assert captured["input_at_spawn_time"] == expected_concat
     assert not writer1.path.exists()
     assert not writer2.path.exists()
+
+
+def test_finalize_drops_empty_segment_and_leaves_no_stray_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A continuation re-dial that captured zero video must vanish cleanly.
+
+    This is what used to leave a 0-byte ``clip.part2.h264`` behind on the
+    live system: the segment file was created eagerly on construction and
+    then never cleaned up because finalize() never actually ran. With
+    in-memory buffering an empty segment never touches disk in the first
+    place, and finalize() drops it from the concat entirely.
+    """
+    hass = _Hass()
+    writer1 = ring_clip.RingClipWriter(hass, tmp_path, "clip")
+    writer1.on_video(_rtp(1, b"\x67SPS"))
+    writer1.on_video(_rtp(2, b"\x65IDR1"))
+    writer1.close()
+
+    # A continuation writer that never received any video (e.g. the
+    # re-dial was BYE'd before the first RTP packet arrived).
+    writer2 = ring_clip.RingClipWriter(hass, tmp_path, "clip.part2")
+    writer2.close()
+    assert not writer2.path.exists()
+
+    process = _FakeProcess(returncode=0)
+
+    async def _spawn(*args, **_kwargs):
+        Path(args[-1]).write_bytes(b"fake-mp4-bytes")
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    result = asyncio.run(writer1.finalize(extra_segments=[writer2]))
+
+    assert result.ok is True
+    assert result.segments == 1  # the empty continuation is dropped
+    assert result.nals == 2
+    assert result.frames == 1
+    assert not writer2.path.exists()  # never created, not just cleaned up
+    assert not writer1.path.exists()  # removed after a successful remux
+
+
+def test_finalize_clamps_fps_to_sane_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A degenerate frames/elapsed ratio must not reach ffmpeg's -r as-is."""
+    # 21 packets spread over 0.1s: round(21 / 0.1) = 210fps raw.
+    times = iter([100.0 + i * 0.005 for i in range(21)])
+    monkeypatch.setattr(ring_clip.time, "time", lambda: next(times))
+
+    hass = _Hass()
+    writer = ring_clip.RingClipWriter(hass, tmp_path, "clip")
+    for seq in range(1, 22):
+        writer.on_video(_rtp(seq, bytes([0x65, seq])))
+
+    captured: dict[str, object] = {}
+    process = _FakeProcess(returncode=0)
+
+    async def _spawn(*args, **_kwargs):
+        captured["args"] = args
+        Path(args[-1]).write_bytes(b"fake-mp4-bytes")
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+    result = asyncio.run(writer.finalize())
+
+    assert result.ok is True
+    assert result.frames == 21
+    assert result.duration_s == pytest.approx(0.1)
+    assert result.fps == 30  # clamped down from round(21 / 0.1) == 210
+    args = captured["args"]
+    assert args[args.index("-r") + 1] == "30"
 
 
 def test_finalize_is_cancellable_and_kills_the_ffmpeg_process(
@@ -409,3 +494,372 @@ def test_finalize_is_cancellable_and_kills_the_ffmpeg_process(
 
     asyncio.run(_run_and_cancel())
     assert process.killed
+
+
+# --------------------------------------------------------------------------- #
+# _capture_ring_clip (custom_components/abb_welcome/__init__.py)
+#
+# Loaded under its own synthetic package name (not "abb_welcome", which the
+# RingClipWriter tests above already own) with just enough of a
+# homeassistant/sibling-module stub surface to import it. const/redaction/
+# ring_clip are aliased to the exact same real modules used above (so
+# RingClipWriter/RingClipResult are the identical classes); everything
+# __init__.py imports that only exists to talk to real Home Assistant, or
+# to camera.py's heavier go2rtc-backed stream coordinator, is a bare stub —
+# none of it sits on _capture_ring_clip's execution path once a fake
+# per-station coordinator is supplied directly.
+# --------------------------------------------------------------------------- #
+
+_INIT_PACKAGE = "abb_welcome_capture_test"
+
+
+def _install_capture_homeassistant_stubs() -> None:
+    _install_homeassistant_stubs()  # homeassistant(.components(.ffmpeg))
+
+    def module(name: str, **attributes: object) -> types.ModuleType:
+        mod = sys.modules.get(name) or types.ModuleType(name)
+        mod.__dict__.update(attributes)
+        sys.modules[name] = mod
+        return mod
+
+    module("homeassistant.helpers").__path__ = []
+    module(
+        "homeassistant.components.tts",
+        generate_media_source_id=lambda *_a, **_k: "",
+    )
+    module("homeassistant.config_entries", ConfigEntry=object)
+    module(
+        "homeassistant.const",
+        Platform=types.SimpleNamespace(
+            BINARY_SENSOR="binary_sensor",
+            BUTTON="button",
+            CAMERA="camera",
+            IMAGE="image",
+            EVENT="event",
+            SENSOR="sensor",
+            SWITCH="switch",
+        ),
+    )
+    module(
+        "homeassistant.core",
+        HomeAssistant=object,
+        ServiceCall=object,
+        callback=lambda func: func,
+    )
+
+    class _HomeAssistantError(Exception):
+        pass
+
+    module("homeassistant.exceptions", HomeAssistantError=_HomeAssistantError)
+    module("homeassistant.helpers.event", async_track_time_interval=lambda *_a, **_k: None)
+    module("homeassistant.helpers.selector", MediaSelector=object)
+    module("homeassistant.helpers.start", async_at_start=lambda *_a, **_k: None)
+    module(
+        "homeassistant.helpers.dispatcher",
+        async_dispatcher_send=lambda *_a, **_k: None,
+    )
+    module("voluptuous")
+
+
+def _load_capture_module() -> types.ModuleType:
+    _install_capture_homeassistant_stubs()
+
+    package = types.ModuleType(_INIT_PACKAGE)
+    package.__path__ = [str(_PKG_DIR)]
+    sys.modules[_INIT_PACKAGE] = package
+
+    # Real, pure-Python siblings: reuse the exact modules already loaded
+    # above so RingClipWriter/RingClipResult stay the same classes.
+    sys.modules[f"{_INIT_PACKAGE}.const"] = _load("const")
+    sys.modules[f"{_INIT_PACKAGE}.redaction"] = _load("redaction")
+    sys.modules[f"{_INIT_PACKAGE}.text"] = _load("text")
+    sys.modules[f"{_INIT_PACKAGE}.ring_clip"] = ring_clip
+
+    def fake(name: str, **attributes: object) -> None:
+        mod = types.ModuleType(f"{_INIT_PACKAGE}.{name}")
+        mod.__dict__.update(attributes)
+        sys.modules[mod.__name__] = mod
+
+    # Siblings only ever touched by setup/service-registration code paths
+    # _capture_ring_clip itself never runs (async_setup_entry, the SIP
+    # listener, the other services) — bare placeholders are enough.
+    fake("coordinator", ABBWelcomeCoordinator=object)
+    fake("rtsp_proxy", RtspTcpProxy=object)
+    fake("sip_client", SIPClient=object)
+    fake("sip_listener", IncomingCall=object, SipListener=object)
+    fake(
+        "streaming_state",
+        ARM_REASON_MANUAL="manual",
+        ARM_REASON_RING="ring",
+        MANUAL_ARM_SECONDS=60,
+        RING_ARM_SECONDS=60,
+        arm=lambda *_a, **_k: None,
+        disarm=lambda *_a, **_k: None,
+        is_pickup_allowed=lambda *_a, **_k: True,
+        set_pickup_allowed=lambda *_a, **_k: None,
+    )
+    fake("talkback_audio", async_prepare_talkback_audio=lambda *_a, **_k: None)
+    # _capture_ring_clip's only use of camera.py is this lazily-imported
+    # key helper; the real one is heavier (go2rtc/WebRTC-dependent).
+    fake("camera", _safe_key=lambda station_id: station_id)
+
+    full_name = f"{_INIT_PACKAGE}.integration"
+    # submodule_search_locations=None forces this to load as a regular
+    # submodule of _INIT_PACKAGE rather than as a nested package: without
+    # it, importlib.util treats the file as a package purely because it
+    # is literally named __init__.py, and every `from .sibling import X`
+    # below resolves one level too deep (abb_welcome_capture_test.
+    # integration.sibling instead of abb_welcome_capture_test.sibling).
+    spec = importlib.util.spec_from_file_location(
+        full_name, _PKG_DIR / "__init__.py", submodule_search_locations=None
+    )
+    assert spec is not None and spec.loader is not None
+    module_obj = importlib.util.module_from_spec(spec)
+    sys.modules[full_name] = module_obj
+    spec.loader.exec_module(module_obj)
+    return module_obj
+
+
+capture = _load_capture_module()
+_CaptureHomeAssistantError = sys.modules["homeassistant.exceptions"].HomeAssistantError
+
+
+class _FakeConfigEntry:
+    def __init__(self, *, entry_id: str = "entry1", options: dict | None = None) -> None:
+        self.entry_id = entry_id
+        self.options = options or {}
+
+
+class _EventBus:
+    def __init__(self) -> None:
+        self.fired: list[tuple[str, dict]] = []
+
+    def async_fire(self, event_type: str, event_data: dict) -> None:
+        self.fired.append((event_type, event_data))
+
+
+class _CaptureConfig:
+    def __init__(self, config_dir: Path) -> None:
+        self._config_dir = config_dir
+
+    def path(self, *parts: str) -> str:
+        return str(Path(self._config_dir, *parts))
+
+    def is_allowed_path(self, _path: str) -> bool:
+        return True
+
+
+class _CaptureHass:
+    def __init__(self, entry_data: dict, *, config_dir: Path) -> None:
+        self.data = {capture.DOMAIN: {"entry1": entry_data}}
+        self.config = _CaptureConfig(config_dir)
+        self.bus = _EventBus()
+        self.ffmpeg = types.SimpleNamespace(binary="/configured/ffmpeg")
+
+    async def async_add_executor_job(self, func, *args):
+        return func(*args)
+
+
+class _FakeStationCoordinator:
+    """Stand-in for camera.StationStreamCoordinator: drives one packet sink."""
+
+    def __init__(
+        self,
+        *,
+        packets: list[bytes] | None = None,
+        open_error: Exception | None = None,
+    ) -> None:
+        self._packets = packets or []
+        self._open_error = open_error
+        self._sink = None
+        self._call_ended_callbacks: list = []
+        self.opened = False
+
+    def add_packet_sink(self, sink: object) -> None:
+        self._sink = sink
+
+    def remove_packet_sink(self, sink: object) -> None:
+        if self._sink is sink:
+            self._sink = None
+
+    def add_call_ended_callback(self, callback: object) -> None:
+        self._call_ended_callbacks.append(callback)
+
+    def remove_call_ended_callback(self, callback: object) -> None:
+        if callback in self._call_ended_callbacks:
+            self._call_ended_callbacks.remove(callback)
+
+    async def async_open_for_ring(self) -> None:
+        self.opened = True
+        if self._sink is not None:
+            for packet in self._packets:
+                self._sink.on_video(packet)
+        if self._open_error is not None:
+            raise self._open_error
+        for call_ended_callback in list(self._call_ended_callbacks):
+            call_ended_callback("call-id", "bye")
+
+
+def _patch_ffmpeg_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = _FakeProcess(returncode=0)
+
+    async def _spawn(*args, **_kwargs):
+        Path(args[-1]).write_bytes(b"fake-mp4-bytes")
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _spawn)
+
+
+def _entry_data(coordinator: _FakeStationCoordinator, station_id: str) -> dict:
+    return {"stream_coordinators": {(station_id, 0): coordinator}}
+
+
+def test_capture_ring_clip_happy_path_fires_event_and_clears_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_ffmpeg_success(monkeypatch)
+    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65IDR")])
+    entry_data = _entry_data(coordinator, "station1")
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+    entry = _FakeConfigEntry(
+        options={capture.CONF_RING_CLIP_DIR: str(tmp_path / "clips")}
+    )
+
+    asyncio.run(capture._capture_ring_clip(hass, entry, "station1"))
+
+    assert coordinator.opened is True
+    assert len(hass.bus.fired) == 1
+    event_type, payload = hass.bus.fired[0]
+    assert event_type == capture.EVENT_RING_CLIP
+    assert payload["ok"] is True
+    assert payload["frames"] == 1
+    # The in-flight marker must not outlive a completed capture.
+    assert entry_data["ring_clip_in_flight_stations"] == set()
+
+
+def test_capture_ring_clip_fires_event_even_when_body_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DEFECT 2: an unexpected exception must not swallow the clip.
+
+    Video already captured before the exception (here, during the same
+    async_open_for_ring call that then raises) must still be finalized
+    and reported — silence is worse than a reported failure.
+    """
+    _patch_ffmpeg_success(monkeypatch)
+    coordinator = _FakeStationCoordinator(
+        packets=[_rtp(1, b"\x65IDR")],
+        open_error=RuntimeError("SIP dial blew up"),
+    )
+    entry_data = _entry_data(coordinator, "station1")
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+    entry = _FakeConfigEntry(
+        options={capture.CONF_RING_CLIP_DIR: str(tmp_path / "clips")}
+    )
+
+    # Must not raise: the exception is logged, not propagated.
+    asyncio.run(capture._capture_ring_clip(hass, entry, "station1"))
+
+    assert len(hass.bus.fired) == 1
+    event_type, payload = hass.bus.fired[0]
+    assert event_type == capture.EVENT_RING_CLIP
+    # The IDR captured before the raise still made it into the clip.
+    assert payload["ok"] is True
+    assert payload["frames"] == 1
+    assert entry_data["ring_clip_in_flight_stations"] == set()
+
+
+def test_capture_ring_clip_reports_no_video_when_body_raises_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same as above but zero video precedes the raise: event still fires."""
+    _patch_ffmpeg_success(monkeypatch)
+    coordinator = _FakeStationCoordinator(open_error=RuntimeError("no answer"))
+    entry_data = _entry_data(coordinator, "station1")
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+    entry = _FakeConfigEntry(
+        options={capture.CONF_RING_CLIP_DIR: str(tmp_path / "clips")}
+    )
+
+    asyncio.run(capture._capture_ring_clip(hass, entry, "station1"))
+
+    assert len(hass.bus.fired) == 1
+    event_type, payload = hass.bus.fired[0]
+    assert event_type == capture.EVENT_RING_CLIP
+    assert payload["ok"] is False
+    assert entry_data["ring_clip_in_flight_stations"] == set()
+
+
+def test_capture_ring_clip_ring_reason_skips_when_station_already_capturing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DEFECT 4: a second _on_ring for the same station must not race it."""
+    _patch_ffmpeg_success(monkeypatch)
+    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65IDR")])
+    entry_data = _entry_data(coordinator, "station1")
+    entry_data["ring_clip_in_flight_stations"] = {"station1"}
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+    entry = _FakeConfigEntry(
+        options={capture.CONF_RING_CLIP_DIR: str(tmp_path / "clips")}
+    )
+
+    asyncio.run(capture._capture_ring_clip(hass, entry, "station1", reason="ring"))
+
+    # Skipped entirely: no second capture, no event, marker left as-is
+    # for whichever capture actually owns it.
+    assert coordinator.opened is False
+    assert hass.bus.fired == []
+    assert entry_data["ring_clip_in_flight_stations"] == {"station1"}
+
+
+def test_capture_ring_clip_service_reason_raises_when_station_already_capturing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DEFECT 4: the record_clip service must not silently corrupt a run."""
+    _patch_ffmpeg_success(monkeypatch)
+    coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65IDR")])
+    entry_data = _entry_data(coordinator, "station1")
+    entry_data["ring_clip_in_flight_stations"] = {"station1"}
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+    entry = _FakeConfigEntry(
+        options={capture.CONF_RING_CLIP_DIR: str(tmp_path / "clips")}
+    )
+
+    with pytest.raises(_CaptureHomeAssistantError):
+        asyncio.run(
+            capture._capture_ring_clip(hass, entry, "station1", reason="service")
+        )
+
+    assert coordinator.opened is False
+    assert hass.bus.fired == []
+    assert entry_data["ring_clip_in_flight_stations"] == {"station1"}
+
+
+def test_capture_ring_clip_service_reason_allowed_for_a_different_station(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard is per-station: a busy station must not block another."""
+    _patch_ffmpeg_success(monkeypatch)
+    busy_coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65IDR")])
+    free_coordinator = _FakeStationCoordinator(packets=[_rtp(1, b"\x65IDR")])
+    entry_data = {
+        "stream_coordinators": {
+            ("station1", 0): busy_coordinator,
+            ("station2", 0): free_coordinator,
+        },
+        "ring_clip_in_flight_stations": {"station1"},
+    }
+    hass = _CaptureHass(entry_data, config_dir=tmp_path / "config")
+    entry = _FakeConfigEntry(
+        options={capture.CONF_RING_CLIP_DIR: str(tmp_path / "clips")}
+    )
+
+    asyncio.run(
+        capture._capture_ring_clip(hass, entry, "station2", reason="service")
+    )
+
+    assert free_coordinator.opened is True
+    assert len(hass.bus.fired) == 1
+    assert hass.bus.fired[0][1]["ok"] is True
+    # The other station's marker is untouched by station2's capture.
+    assert entry_data["ring_clip_in_flight_stations"] == {"station1"}

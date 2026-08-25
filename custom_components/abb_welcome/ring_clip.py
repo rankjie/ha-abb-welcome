@@ -26,9 +26,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .media_pipeline import _is_rtcp_packet, _rtp_payload
+from .redaction import get_redacting_logger
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
+
+_LOGGER = get_redacting_logger(__name__)
 
 _FINALIZE_TIMEOUT = 20.0
 _ANNEX_B_START_CODE = b"\x00\x00\x00\x01"
@@ -36,6 +39,16 @@ _ANNEX_B_START_CODE = b"\x00\x00\x00\x01"
 # the single-slice-per-frame packetization ABB stations use.
 _NAL_TYPE_NON_IDR_SLICE = 1
 _NAL_TYPE_IDR_SLICE = 5
+# Per-segment in-memory Annex-B buffer cap. RTP video is buffered in RAM
+# (see RingClipWriter) rather than written per-packet, so a runaway or
+# stuck call must not grow unbounded; a ring call this long is already
+# far past MAX_RING_CLIP_SECONDS and something upstream has gone wrong.
+_MAX_BUFFER_BYTES = 64 * 1024 * 1024
+# Sane ffmpeg `-r` bounds: the measured fps is derived from wall-clock
+# deltas between RTP packets, so a degenerate frames/elapsed ratio (e.g.
+# one packet, or a near-zero elapsed time) must not reach ffmpeg raw.
+_MIN_FPS = 1
+_MAX_FPS = 30
 
 
 class H264Depacketizer:
@@ -175,14 +188,40 @@ class RingClipResult:
     error: str = ""
 
 
+def _write_h264_file(path: Path, buffers: Sequence[bytes]) -> None:
+    """Blocking: write concatenated Annex-B ``buffers`` to ``path``.
+
+    Runs inside ``hass.async_add_executor_job``, never on the event loop.
+    Callers only ever pass non-empty buffers, so an empty segment never
+    creates a file on disk.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        for buffer in buffers:
+            handle.write(buffer)
+
+
+def _unlink_if_exists(path: Path) -> None:
+    """Blocking best-effort delete; runs inside an executor job."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 class RingClipWriter:
-    """Depacketizes RTP video into an Annex-B ``.h264`` file, then to mp4.
+    """Depacketizes RTP video into an in-memory Annex-B buffer, then to mp4.
 
     One instance covers one recording *segment* (one open media session).
     Register :meth:`on_video` as a coordinator packet sink; call
     :meth:`close` when the segment ends, then :meth:`finalize` (on the
     first segment) to remux — optionally concatenating later segments
     produced by a continuation re-dial.
+
+    ``on_video`` runs on the event loop once per RTP packet, so it only
+    ever appends to an in-memory buffer. All filesystem work (writing the
+    concatenated ``.h264`` file, then cleanup) happens inside
+    :meth:`finalize`, off the loop via ``hass.async_add_executor_job``.
     """
 
     def __init__(self, hass: HomeAssistant, target_dir: Path, name: str) -> None:
@@ -194,9 +233,9 @@ class RingClipWriter:
                 f"ring clip directory is not an allowed Home Assistant path: "
                 f"{target_dir}"
             )
-        target_dir.mkdir(parents=True, exist_ok=True)
         self.path = target_dir / f"{name}.h264"
-        self._file = self.path.open("wb")
+        self._buffer = bytearray()
+        self._buffer_capped = False
         self._depacketizer = H264Depacketizer()
         self.nals = 0
         self.frames = 0
@@ -223,10 +262,20 @@ class RingClipWriter:
         """Packet-sink callback: ring clips are video-only, audio is ignored."""
 
     def _write_nal(self, nal: bytes, now: float) -> None:
-        if not nal:
+        if not nal or self._buffer_capped:
             return
         chunk = _ANNEX_B_START_CODE + nal
-        self._file.write(chunk)
+        if len(self._buffer) + len(chunk) > _MAX_BUFFER_BYTES:
+            self._buffer_capped = True
+            _LOGGER.warning(
+                "[abb] ring clip: %s hit the %d MB in-memory buffer cap; "
+                "dropping further video for this segment, keeping what was "
+                "already captured",
+                self.name,
+                _MAX_BUFFER_BYTES // (1024 * 1024),
+            )
+            return
+        self._buffer += chunk
         self.nals += 1
         self.bytes_written += len(chunk)
         if (nal[0] & 0x1F) in (_NAL_TYPE_NON_IDR_SLICE, _NAL_TYPE_IDR_SLICE):
@@ -239,7 +288,6 @@ class RingClipWriter:
         if self._closed:
             return
         self._closed = True
-        self._file.close()
 
     async def finalize(
         self,
@@ -250,14 +298,21 @@ class RingClipWriter:
         """Concatenate segments (if any) and remux to mp4 via ffmpeg.
 
         Always closes this writer and every segment in ``extra_segments``
-        first. On ffmpeg failure the ``.h264`` file is kept and ``ok`` is
-        False; on success the ``.h264`` file is removed.
+        first. Segments that captured zero bytes are dropped and never
+        reach disk — this is what used to leave stray zero-byte
+        ``.part2.h264`` files behind after a continuation re-dial got
+        BYE'd before any video arrived. All filesystem work (writing the
+        concatenated ``.h264`` file, and — on success — removing it) runs
+        via ``hass.async_add_executor_job`` so this coroutine never blocks
+        the event loop. On ffmpeg failure the ``.h264`` file is kept and
+        ``ok`` is False; on success it is removed.
         """
         self.close()
         for segment in extra_segments:
             segment.close()
 
         segments = [self, *extra_segments]
+        non_empty = [segment for segment in segments if segment.bytes_written > 0]
         total_nals = sum(segment.nals for segment in segments)
         total_frames = sum(segment.frames for segment in segments)
         total_bytes = sum(segment.bytes_written for segment in segments)
@@ -266,7 +321,7 @@ class RingClipWriter:
         started_at = min(starts) if starts else None
         duration_s = max(ends) - min(starts) if starts and ends else 0.0
 
-        if total_nals == 0:
+        if not non_empty:
             return RingClipResult(
                 ok=False,
                 output_path=self.path,
@@ -280,39 +335,29 @@ class RingClipWriter:
                 error="no video captured",
             )
 
-        if extra_segments:
-            # Annex-B streams concatenate trivially at the byte level: each
-            # segment starts with its own in-band SPS/PPS.
-            try:
-                with self.path.open("ab") as combined:
-                    for segment in extra_segments:
-                        combined.write(segment.path.read_bytes())
-            except OSError as err:
-                return RingClipResult(
-                    ok=False,
-                    output_path=self.path,
-                    frames=total_frames,
-                    nals=total_nals,
-                    bytes_written=total_bytes,
-                    duration_s=duration_s,
-                    started_at=started_at,
-                    segments=len(segments),
-                    fps=0,
-                    error=f"segment concatenation failed: {err}",
-                )
-            # Each segment's own file is now fully redundant — its bytes
-            # live in self.path regardless of what ffmpeg does next.
-            for segment in extra_segments:
-                try:
-                    segment.path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        # Annex-B streams concatenate trivially at the byte level: each
+        # segment starts with its own in-band SPS/PPS.
+        buffers = [bytes(segment._buffer) for segment in non_empty]
+        try:
+            await self.hass.async_add_executor_job(
+                _write_h264_file, self.path, buffers
+            )
+        except OSError as err:
+            return RingClipResult(
+                ok=False,
+                output_path=self.path,
+                frames=total_frames,
+                nals=total_nals,
+                bytes_written=total_bytes,
+                duration_s=duration_s,
+                started_at=started_at,
+                segments=len(non_empty),
+                fps=0,
+                error=f"could not write segment file: {err}",
+            )
 
-        fps = (
-            max(1, round(total_frames / duration_s))
-            if duration_s > 0
-            else max(1, total_frames)
-        )
+        raw_fps = round(total_frames / duration_s) if duration_s > 0 else total_frames
+        fps = min(_MAX_FPS, max(_MIN_FPS, raw_fps))
         output_path = self.path.with_suffix(".mp4")
 
         # Deferred so importing this module never requires homeassistant.
@@ -346,7 +391,7 @@ class RingClipWriter:
                 bytes_written=total_bytes,
                 duration_s=duration_s,
                 started_at=started_at,
-                segments=len(segments),
+                segments=len(non_empty),
                 fps=fps,
                 error=error,
             )
@@ -376,10 +421,7 @@ class RingClipWriter:
             detail = stderr.decode("utf-8", errors="replace").strip()
             return _failure(f"ffmpeg exited {process.returncode}: {detail[:300]}")
 
-        try:
-            self.path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        await self.hass.async_add_executor_job(_unlink_if_exists, self.path)
 
         return RingClipResult(
             ok=True,
@@ -389,6 +431,6 @@ class RingClipWriter:
             bytes_written=total_bytes,
             duration_s=duration_s,
             started_at=started_at,
-            segments=len(segments),
+            segments=len(non_empty),
             fps=fps,
         )
