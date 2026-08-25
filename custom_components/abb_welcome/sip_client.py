@@ -153,12 +153,41 @@ class SipStream:
             headers.append((key.strip(), value.strip()))
         return SipFrame(start_line=start_line, headers=headers, body=body)
 
-    def recv_final_response(self) -> SipFrame:
+    def recv_response(
+        self,
+        *,
+        call_id: str,
+        cseq_number: int,
+        cseq_method: str,
+    ) -> SipFrame:
+        """Return the next response for one exact outbound transaction."""
         while True:
             frame = self.recv_frame()
-            if frame.is_response() and (frame.status_code() or 0) // 100 == 1:
+            if not frame.is_response():
+                continue
+            if frame.header("Call-ID") != call_id:
+                continue
+            cseq = frame.header("CSeq").split()
+            if cseq != [str(cseq_number), cseq_method.upper()]:
                 continue
             return frame
+
+    def recv_final_response(
+        self,
+        *,
+        call_id: str,
+        cseq_number: int,
+        cseq_method: str,
+    ) -> SipFrame:
+        """Return the final response for one exact outbound transaction."""
+        while True:
+            frame = self.recv_response(
+                call_id=call_id,
+                cseq_number=cseq_number,
+                cseq_method=cseq_method,
+            )
+            if (frame.status_code() or 0) // 100 != 1:
+                return frame
 
 
 def _sip_request(method: str, uri: str, headers: list[str], body: str = "") -> bytes:
@@ -335,7 +364,11 @@ def _register_client(
         "User-Agent: ABB-Welcome-HA/1.0",
     ]
     stream.sock.sendall(_sip_request("REGISTER", reg_uri, headers))
-    response = stream.recv_final_response()
+    response = stream.recv_final_response(
+        call_id=call_id,
+        cseq_number=1,
+        cseq_method="REGISTER",
+    )
 
     raw_headers = "\r\n".join(
         [response.start_line, *(f"{k}: {v}" for k, v in response.headers)]
@@ -361,7 +394,11 @@ def _register_client(
         headers[5] = "CSeq: 2 REGISTER"
         headers.append(auth)
         stream.sock.sendall(_sip_request("REGISTER", reg_uri, headers))
-        response = stream.recv_final_response()
+        response = stream.recv_final_response(
+            call_id=call_id,
+            cseq_number=2,
+            cseq_method="REGISTER",
+        )
 
     if response.status_code() != 200:
         raise RuntimeError(f"REGISTER failed: {response.start_line}")
@@ -415,7 +452,27 @@ def _maybe_auth_resend(
     headers[cseq_index] = f"CSeq: {cseq_num} {method}"
     headers.append(auth)
     stream.sock.sendall(_sip_request(method, uri, headers, body))
-    return stream.recv_frame(), headers
+    call_id = next(
+        (
+            line.split(":", 1)[1].strip()
+            for line in headers
+            if line.lower().startswith("call-id:")
+        ),
+        "",
+    )
+    if not call_id:
+        raise RuntimeError(f"{method} request is missing Call-ID")
+    receive_response = (
+        stream.recv_response if method == "INVITE" else stream.recv_final_response
+    )
+    return (
+        receive_response(
+            call_id=call_id,
+            cseq_number=cseq_num,
+            cseq_method=method,
+        ),
+        headers,
+    )
 
 
 def _send_plain_message(
@@ -430,18 +487,23 @@ def _send_plain_message(
 ) -> SipFrame:
     transport = gw.transport.upper()
     transport_param = f";transport={gw.transport}" if gw.transport == "tls" else ""
+    call_id = f"{uuid.uuid4().hex[:16]}@{gw.sip_domain}"
     headers = [
         f"Via: SIP/2.0/{transport} {local_ip}:{local_port};branch=z9hG4bK-{uuid.uuid4().hex[:12]};rport",
         "Max-Forwards: 70",
         f"From: <sip:{sip_user}@{gw.sip_domain}{transport_param}>;tag={uuid.uuid4().hex[:8]}",
         f"To: <{target_uri}>",
-        f"Call-ID: {uuid.uuid4().hex[:16]}@{gw.sip_domain}",
+        f"Call-ID: {call_id}",
         "CSeq: 1 MESSAGE",
         "Content-Type: text/plain",
         "User-Agent: ABB-Welcome-HA/1.0",
     ]
     stream.sock.sendall(_sip_request("MESSAGE", target_uri, headers, body))
-    response = stream.recv_final_response()
+    response = stream.recv_final_response(
+        call_id=call_id,
+        cseq_number=1,
+        cseq_method="MESSAGE",
+    )
     if response.status_code() in (401, 407):
         response, headers = _maybe_auth_resend(
             stream,
@@ -457,8 +519,6 @@ def _send_plain_message(
             local_port,
             5,
         )
-        while response.is_response() and (response.status_code() or 0) // 100 == 1:
-            response = stream.recv_frame()
     return response
 
 

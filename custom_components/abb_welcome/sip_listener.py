@@ -898,7 +898,15 @@ class SipListener:
         ]
         await self._send_request(writer, "REGISTER", reg_uri, base_headers, "")
 
-        frame = await self._read_final_response(reader)
+        frame = await self._read_final_response(
+            reader,
+            call_id=call_id,
+            cseq_number=cseq,
+            cseq_method="REGISTER",
+            writer=writer,
+            local_ip=local_ip,
+            local_port=local_port,
+        )
         if frame.status_code == 401:
             challenge = _header(frame.headers, "WWW-Authenticate")
             if not challenge.lower().startswith("digest"):
@@ -918,7 +926,15 @@ class SipListener:
             base_headers[5] = f"CSeq: {cseq} REGISTER"
             base_headers.append(f"Authorization: {auth}")
             await self._send_request(writer, "REGISTER", reg_uri, base_headers, "")
-            frame = await self._read_final_response(reader)
+            frame = await self._read_final_response(
+                reader,
+                call_id=call_id,
+                cseq_number=cseq,
+                cseq_method="REGISTER",
+                writer=writer,
+                local_ip=local_ip,
+                local_port=local_port,
+            )
 
         if frame.status_code != 200:
             raise RuntimeError(f"REGISTER rejected: {frame.start_line}")
@@ -1240,13 +1256,30 @@ class SipListener:
         setattr(frame, "_received_at", time.time())
         return frame
 
-    async def _read_final_response(self, reader: asyncio.StreamReader) -> "_SipFrame":
+    async def _read_final_response(
+        self,
+        reader: asyncio.StreamReader,
+        *,
+        call_id: str,
+        cseq_number: int,
+        cseq_method: str,
+        writer: asyncio.StreamWriter,
+        local_ip: str,
+        local_port: int,
+    ) -> "_SipFrame":
+        """Return the final response while dispatching unrelated requests."""
         while True:
             frame = await self._read_frame(reader)
-            # Emit every frame, provisional or final, so subscribers see the
-            # full REGISTER round-trip (challenge + retry).
+            if not frame.is_response:
+                await self._dispatch(frame, writer, local_ip, local_port)
+                continue
             self._emit_frame("in", frame)
-            if frame.is_response and 100 <= (frame.status_code or 0) < 200:
+            if _header(frame.headers, "Call-ID") != call_id:
+                continue
+            cseq = _header(frame.headers, "CSeq").split()
+            if cseq != [str(cseq_number), cseq_method.upper()]:
+                continue
+            if 100 <= (frame.status_code or 0) < 200:
                 continue
             return frame
 
