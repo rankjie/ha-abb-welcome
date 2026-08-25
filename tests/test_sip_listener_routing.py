@@ -87,3 +87,61 @@ def test_record_routes_are_not_copied_outside_invite_2xx(
     frame, code: int, reason: str
 ) -> None:
     assert "Record-Route:" not in _respond(frame, code, reason)
+
+
+def test_register_wait_dispatches_requests_and_matches_exact_response() -> None:
+    listener = sip_listener.SipListener(
+        "gateway.invalid", "ha", "secret", "example.invalid"
+    )
+    incoming = _request()
+    frames = [
+        incoming,
+        sip_listener._SipFrame(
+            start_line="SIP/2.0 200 OK",
+            headers=[("Call-ID", "other"), ("CSeq", "7 REGISTER")],
+            body=b"",
+            raw=b"",
+        ),
+        sip_listener._SipFrame(
+            start_line="SIP/2.0 180 Ringing",
+            headers=[("Call-ID", "register"), ("CSeq", "7 REGISTER")],
+            body=b"",
+            raw=b"",
+        ),
+        sip_listener._SipFrame(
+            start_line="SIP/2.0 200 OK",
+            headers=[("Call-ID", "register"), ("CSeq", "7 REGISTER")],
+            body=b"",
+            raw=b"",
+        ),
+    ]
+    dispatched = []
+
+    async def read_frame(_reader):
+        return frames.pop(0)
+
+    async def dispatch(frame, _writer, _local_ip, _local_port):
+        dispatched.append(frame)
+
+    listener._read_frame = read_frame
+    listener._dispatch = dispatch
+    listener._emit_frame = lambda *_args: None
+
+    async def run():
+        return await listener._read_final_response(
+            None,
+            call_id="register",
+            cseq_number=7,
+            cseq_method="REGISTER",
+            writer=_Writer(),
+            local_ip="192.0.2.20",
+            local_port=40000,
+        )
+
+    result = asyncio.run(run())
+
+    assert dispatched == [incoming]
+    assert result.status_code == 200
+    assert sip_listener._header(result.headers, "Call-ID") == "register"
+    assert sip_listener._header(result.headers, "CSeq") == "7 REGISTER"
+    assert frames == []
