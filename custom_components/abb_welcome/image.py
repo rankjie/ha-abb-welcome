@@ -104,6 +104,9 @@ class ABBWelcomeScreenshotImage(ImageEntity):
             return
         self._image = data.latest_screenshot
         self._last_event_id = data.latest_screenshot_event_id
+        # The signed image URL is the browser cache key, so rotate it with the
+        # bytes instead of waiting for Home Assistant's periodic token update.
+        self.async_update_token()
 
         raw_ts = ""
         ts: datetime | None = None
