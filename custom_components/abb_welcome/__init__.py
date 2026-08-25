@@ -1,22 +1,26 @@
 """ABB Welcome integration — LAN door unlock + cloud event history via SIP."""
 
+import asyncio
 import base64
 import binascii
 import json
 import logging
 import re
 import socket
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import requests
 import voluptuous as vol
+from homeassistant.components.tts import generate_media_source_id
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.selector import MediaSelector
 from homeassistant.helpers.start import async_at_start
 
 from .const import (
@@ -24,16 +28,25 @@ from .const import (
     CONF_DEFAULT_UNLOCK_STATION_ID,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
+    CONF_RECORD_RING_CLIPS,
+    CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
+    CONF_RING_CLIP_DIR,
+    CONF_TALKBACK_OUTPUT_GAIN_DB,
     CONF_UNLOCK_STRATEGY,
     DEFAULT_ALLOW_PICKUP,
     DEFAULT_LAN_RTSP_BIND_HOST,
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS,
+    DEFAULT_RECORD_RING_CLIPS,
+    DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
+    DEFAULT_RING_CLIP_DIR,
     DOMAIN,
     EVENT_DISCOVERY_CHANGED,
     GATEWAY_PROFILE_APP_MANAGED,
     GO2RTC_RTSP_HOST,
     GO2RTC_RTSP_PORT,
+    MAX_RING_CLIP_SECONDS,
+    MIN_RING_CLIP_SECONDS,
     SIP_PORT_TLS,
     TOPOLOGY_REFRESH_ACTION_ERROR,
     TOPOLOGY_REFRESH_ACTION_REFRESH,
@@ -41,11 +54,13 @@ from .const import (
     gateway_capabilities,
     gateway_profile,
     normalized_unlock_routing,
+    ring_clip_seconds,
     topology_refresh_action,
     topology_refresh_error,
 )
 from .coordinator import ABBWelcomeCoordinator
 from .redaction import get_redacting_logger
+from .ring_clip import RingClipResult, RingClipWriter
 from .rtsp_proxy import RtspTcpProxy
 from .sip_client import SIPClient
 from .sip_listener import IncomingCall, SipListener
@@ -59,6 +74,7 @@ from .streaming_state import (
     is_pickup_allowed,
     set_pickup_allowed,
 )
+from .talkback_audio import async_prepare_talkback_audio
 from .text import decode_gateway_text, repair_utf8_mojibake
 
 _LOGGER = get_redacting_logger(__name__)
@@ -178,6 +194,7 @@ _RELOAD_OPTION_KEYS = (
     CONF_DEFAULT_UNLOCK_STATION_ID,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
+    CONF_TALKBACK_OUTPUT_GAIN_DB,
     CONF_UNLOCK_STRATEGY,
 )
 
@@ -198,6 +215,14 @@ EVENT_SIP_FRAME = f"{DOMAIN}_sip_frame"
 # Bus event fired whenever the SIP listener transitions state
 # (stopped/connecting/registered/disconnected).
 EVENT_LISTENER_STATE = f"{DOMAIN}_listener_state"
+
+# Bus event fired once per native ring-clip capture attempt (automatic ring
+# capture or the record_clip service), after the mp4 remux finishes.
+EVENT_RING_CLIP = f"{DOMAIN}_ring_clip"
+
+# Mandatory settle time before re-dialing for a continuation segment.
+# Measured live: immediate re-dials return zero video and get BYE'd.
+_RING_CLIP_REDIAL_DELAY_S = 2.5
 
 
 def _fire_discovery_changed(
@@ -312,6 +337,261 @@ async def _async_start_rtsp_proxy(
     return proxy
 
 
+async def _wait_for_first(timeout: float, *events: asyncio.Event) -> None:
+    """Return as soon as ``timeout`` elapses or any event is set."""
+    waiters = [asyncio.ensure_future(event.wait()) for event in events]
+    try:
+        await asyncio.wait(
+            waiters, timeout=max(0.0, timeout), return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.cancel()
+
+
+async def _record_ring_segment(
+    coordinator,
+    writer: RingClipWriter,
+    *,
+    max_seconds: float,
+    stop_events: tuple[asyncio.Event, ...],
+) -> bool:
+    """Record one segment onto ``writer``; return whether the call ended."""
+    call_ended = asyncio.Event()
+
+    def _on_call_ended(_call_id: str, _reason: str) -> None:
+        call_ended.set()
+
+    coordinator.add_packet_sink(writer)
+    coordinator.add_call_ended_callback(_on_call_ended)
+    try:
+        await coordinator.async_open_for_ring()
+        await _wait_for_first(max_seconds, call_ended, *stop_events)
+    finally:
+        coordinator.remove_call_ended_callback(_on_call_ended)
+        coordinator.remove_packet_sink(writer)
+    return call_ended.is_set()
+
+
+def _ring_clip_public_url(hass: HomeAssistant, target_dir: Path, filename: str) -> str:
+    """Return the /local/ URL for a file under HA's www directory, else ''."""
+    try:
+        relative = target_dir.resolve().relative_to(Path(hass.config.path("www")).resolve())
+    except (OSError, ValueError):
+        return ""
+    suffix = "/".join(relative.parts)
+    return f"/local/{suffix}/{filename}" if suffix else f"/local/{filename}"
+
+
+def _ring_clip_event_payload(
+    hass: HomeAssistant,
+    station_id: str,
+    reason: str,
+    result,
+    target_dir: Path,
+) -> dict[str, object]:
+    filename = result.output_path.name
+    started_at = (
+        datetime.fromtimestamp(result.started_at, tz=timezone.utc).isoformat()
+        if result.started_at is not None
+        else None
+    )
+    return {
+        "station_id": station_id,
+        "filename": filename,
+        "path": str(result.output_path),
+        "url": _ring_clip_public_url(hass, target_dir, filename),
+        "duration_s": round(result.duration_s, 3),
+        "frames": result.frames,
+        "segments": result.segments,
+        "started_at": started_at,
+        "reason": reason,
+        "ok": result.ok,
+    }
+
+
+async def _capture_ring_clip(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    station_id: str,
+    *,
+    reason: str = "ring",
+    duration: float | None = None,
+    filename: str | None = None,
+) -> None:
+    """Capture the ring-moment video natively and remux it to mp4.
+
+    Must only ever run as a background task, never awaited inline from the
+    SIP listener's read loop: opening a pending incoming call waits for
+    that same loop to process the caller's ACK, so an inline await here
+    would deadlock the listener.
+    """
+    # Deferred import: __init__.py otherwise never needs camera.py's
+    # (heavier, go2rtc/WebRTC-dependent) module at import time — this
+    # only runs after camera.py's platform setup has already completed.
+    from .camera import _safe_key
+
+    entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if entry_data is None:
+        return
+
+    # A visitor pressing the button twice in quick succession fires two
+    # independent _on_ring calls against the same station; without this
+    # guard both would race a capture against the station's single call.
+    in_flight: set[str] = entry_data.setdefault("ring_clip_in_flight_stations", set())
+    if station_id in in_flight:
+        if reason == "service":
+            raise HomeAssistantError(
+                f"A ring clip capture is already running for station "
+                f"{station_id!r}; wait for it to finish before retrying"
+            )
+        _LOGGER.info(
+            "[abb] ring clip already capturing for station %s, ignoring re-ring",
+            station_id,
+        )
+        return
+    in_flight.add(station_id)
+    try:
+        coordinator = entry_data.get("stream_coordinators", {}).get(
+            (_safe_key(station_id), 0)
+        )
+        if coordinator is None:
+            raise HomeAssistantError(
+                f"No ABB Welcome stream coordinator for station {station_id!r}"
+            )
+
+        seconds = (
+            duration if duration is not None else ring_clip_seconds(entry.options)
+        )
+        target_dir = Path(
+            hass.config.path(
+                str(entry.options.get(CONF_RING_CLIP_DIR, "") or DEFAULT_RING_CLIP_DIR)
+            )
+        )
+        base_name = filename or (
+            # Intentionally local wall-clock time, matching the documented
+            # abb_ringclip_<YYYYmmdd_HHMMSS local>_<station_id> filename scheme.
+            f"abb_ringclip_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{station_id}"  # noqa: DTZ005
+        )
+
+        try:
+            writer = RingClipWriter(hass, target_dir, base_name)
+        except (PermissionError, OSError) as err:
+            raise HomeAssistantError(
+                f"Could not open ring clip capture file in {target_dir}: {err}"
+            ) from err
+
+        # A single unload Event, owned and set exactly once by
+        # async_setup_entry, is shared by every capture against this
+        # entry. The defensive fallback only matters if this ever runs
+        # before that event is stored (should not happen in practice).
+        unload_event = entry_data.get("ring_clip_unload_event")
+        if unload_event is None:
+            unload_event = asyncio.Event()
+
+        extra_segments: list[RingClipWriter] = []
+        try:
+            call_ended = await _record_ring_segment(
+                coordinator, writer, max_seconds=seconds, stop_events=(unload_event,)
+            )
+
+            continue_after_hangup = bool(
+                entry.options.get(
+                    CONF_RING_CLIP_CONTINUE_AFTER_HANGUP,
+                    DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP,
+                )
+            )
+            if (
+                reason == "ring"
+                and continue_after_hangup
+                and call_ended
+                and not unload_event.is_set()
+                and writer.elapsed_s < seconds
+            ):
+                remaining = seconds - writer.elapsed_s
+                await asyncio.sleep(_RING_CLIP_REDIAL_DELAY_S)
+                if not unload_event.is_set():
+                    # Same clock as RingClipWriter.first_wall_time (wall
+                    # time, not monotonic) — first_wall_time also anchors
+                    # the fired event's started_at, so it cannot switch
+                    # clocks without corrupting that timestamp too.
+                    wait_started = time.time()
+                    try:
+                        writer2 = RingClipWriter(
+                            hass, target_dir, f"{base_name}.part2"
+                        )
+                    except (PermissionError, OSError) as err:
+                        _LOGGER.error(
+                            "[abb] ring clip: could not open continuation segment "
+                            "for station=%s: %s",
+                            station_id,
+                            err,
+                        )
+                    else:
+                        await _record_ring_segment(
+                            coordinator,
+                            writer2,
+                            max_seconds=remaining,
+                            stop_events=(unload_event,),
+                        )
+                        if writer2.first_wall_time is not None:
+                            _LOGGER.info(
+                                "[abb] ring clip: continuation wait->first-frame "
+                                "delta=%.3fs station=%s",
+                                writer2.first_wall_time - wait_started,
+                                station_id,
+                            )
+                        extra_segments.append(writer2)
+        except Exception:  # the clip must still be finalized below
+            _LOGGER.exception(
+                "[abb] ring clip: capture failed unexpectedly station=%s",
+                station_id,
+            )
+        finally:
+            # Idempotent: on the normal path finalize() below re-closes (a
+            # no-op) each writer; this only matters if something above
+            # raised or the task was cancelled, so no writer is left
+            # accepting packets after this point.
+            writer.close()
+            for segment in extra_segments:
+                segment.close()
+
+        try:
+            result = await writer.finalize(extra_segments=extra_segments)
+        except Exception as err:  # the event must still fire
+            _LOGGER.exception(
+                "[abb] ring clip: finalize failed unexpectedly station=%s",
+                station_id,
+            )
+            result = RingClipResult(
+                ok=False,
+                output_path=writer.path,
+                frames=writer.frames,
+                nals=writer.nals,
+                bytes_written=writer.bytes_written,
+                duration_s=writer.elapsed_s,
+                started_at=writer.first_wall_time,
+                segments=1 + len(extra_segments),
+                fps=0,
+                error=str(err),
+            )
+        payload = _ring_clip_event_payload(hass, station_id, reason, result, target_dir)
+        hass.bus.async_fire(EVENT_RING_CLIP, payload)
+        _LOGGER.info(
+            "[abb] ring clip: %s station=%s file=%s duration=%.1fs frames=%d "
+            "segments=%d",
+            "captured" if result.ok else "failed",
+            station_id,
+            payload["filename"],
+            result.duration_s,
+            result.frames,
+            result.segments,
+        )
+    finally:
+        in_flight.discard(station_id)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up ABB Welcome from a config entry."""
     try:
@@ -336,6 +616,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "coordinator": coordinator,
     }
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = entry_data
+
+    # One unload Event per entry, shared by every ring-clip capture that
+    # runs against it (see _capture_ring_clip). Registering it here, once,
+    # avoids leaking one entry.async_on_unload listener per ring capture
+    # and — since ConfigEntry.async_on_unload returns None, not an
+    # unsubscribe callable — avoids calling that None at capture teardown.
+    ring_clip_unload_event = asyncio.Event()
+    entry.async_on_unload(ring_clip_unload_event.set)
+    entry_data["ring_clip_unload_event"] = ring_clip_unload_event
+
     set_pickup_allowed(
         hass,
         entry.entry_id,
@@ -402,6 +692,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "call_id": call.call_id,
                 "received_at": call.received_at,
             }
+            if (
+                entry.options.get(CONF_RECORD_RING_CLIPS, DEFAULT_RECORD_RING_CLIPS)
+                and is_pickup_allowed(hass, entry.entry_id)
+            ):
+                # Background task only — see _capture_ring_clip's docstring.
+                # _on_ring itself stays synchronous and is never awaited by
+                # _handle_invite, so this cannot deadlock the SIP read loop.
+                hass.async_create_background_task(
+                    _capture_ring_clip(hass, entry, station_id),
+                    name=f"abb_ring_clip_{station_id or 'unknown'}",
+                )
             hass.bus.async_fire(EVENT_RING, payload)
             sensor = entry_data.get("ringing_sensor")
             if sensor is not None:
@@ -593,6 +894,9 @@ SERVICE_TALK_START = "talk_start"
 SERVICE_TALK_STOP = "talk_stop"
 SERVICE_TALK_PCM16LE = "talk_pcm16le"
 SERVICE_TALK_TONE = "talk_tone"
+SERVICE_PLAY_AUDIO = "play_audio"
+SERVICE_ANNOUNCE = "announce"
+SERVICE_RECORD_CLIP = "record_clip"
 EXPORT_FIELDS = (
     "gateway_ip",
     "sip_username",
@@ -1188,6 +1492,152 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     vol.Optional("amplitude", default=0.35): vol.All(
                         vol.Coerce(float), vol.Range(min=0.0, max=1.0)
                     ),
+                }
+            ),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_PLAY_AUDIO):
+
+        async def _play_audio(call: ServiceCall) -> None:
+            talkback_session_id = str(
+                call.data.get("talkback_session_id")
+                or call.data.get("session_id")
+                or ""
+            ).strip()
+            media = call.data["media"]
+            camera = _cameras_for_talk_service(hass, call)[0]
+            play = getattr(camera, "async_talkback_play_audio", None)
+            if not callable(play):
+                raise HomeAssistantError(
+                    "Selected camera does not support talkback audio"
+                )
+            if not bool(getattr(camera, "talkback_ready", False)):
+                raise HomeAssistantError(
+                    "Talkback is not ready; open the selected camera stream first"
+                )
+            pcm = await async_prepare_talkback_audio(
+                hass, media["media_content_id"]
+            )
+            try:
+                await play(pcm, talkback_session_id)
+            except HomeAssistantError:
+                raise
+            except (OSError, RuntimeError, ValueError) as err:
+                raise HomeAssistantError(
+                    "Unable to play audio through the selected camera"
+                ) from err
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_PLAY_AUDIO,
+            _play_audio,
+            schema=vol.Schema(
+                {
+                    **talk_target_schema,
+                    vol.Required("media"): MediaSelector(
+                        {"accept": ["audio/*"]}
+                    ),
+                }
+            ),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_ANNOUNCE):
+
+        async def _announce(call: ServiceCall) -> None:
+            talkback_session_id = str(
+                call.data.get("talkback_session_id")
+                or call.data.get("session_id")
+                or ""
+            ).strip()
+            camera = _cameras_for_talk_service(hass, call)[0]
+            announce = getattr(camera, "async_temporary_talkback_audio", None)
+            if not callable(announce):
+                raise HomeAssistantError(
+                    "Selected camera does not support unattended announcements"
+                )
+
+            try:
+                media_content_id = generate_media_source_id(
+                    hass,
+                    call.data["message"],
+                    engine=call.data.get("tts_entity_id") or None,
+                    language=call.data.get("language") or None,
+                    cache=True,
+                )
+                pcm = await async_prepare_talkback_audio(hass, media_content_id)
+            except HomeAssistantError:
+                raise
+            except (OSError, RuntimeError, TypeError, ValueError) as err:
+                raise HomeAssistantError(
+                    "Unable to prepare the unattended announcement"
+                ) from err
+
+            try:
+                await announce(pcm, talkback_session_id)
+            except HomeAssistantError:
+                raise
+            except (OSError, RuntimeError, ValueError) as err:
+                raise HomeAssistantError(
+                    "Unable to play the unattended announcement; the selected "
+                    "station may already be in use"
+                ) from err
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_ANNOUNCE,
+            _announce,
+            schema=vol.Schema(
+                {
+                    **talk_target_schema,
+                    vol.Required("message"): vol.All(
+                        str,
+                        lambda value: value.strip(),
+                        vol.Length(min=1, max=500),
+                    ),
+                    vol.Optional("tts_entity_id"): str,
+                    vol.Optional("language"): str,
+                }
+            ),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_RECORD_CLIP):
+
+        async def _record_clip(call: ServiceCall) -> None:
+            camera = _cameras_for_talk_service(hass, call)[0]
+            entry_id = getattr(camera, "_entry_id", None)
+            door = getattr(camera, "_door", None)
+            station_id = str(getattr(door, "station_id", "") or "").strip()
+            target_entry = (
+                hass.config_entries.async_get_entry(entry_id) if entry_id else None
+            )
+            if target_entry is None or not station_id:
+                raise HomeAssistantError(
+                    "Selected camera has no ABB Welcome station to record"
+                )
+            filename = str(call.data.get("filename") or "").strip() or None
+            await _capture_ring_clip(
+                hass,
+                target_entry,
+                station_id,
+                reason="service",
+                duration=call.data.get("duration"),
+                filename=filename,
+            )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_RECORD_CLIP,
+            _record_clip,
+            schema=vol.Schema(
+                {
+                    **talk_target_schema,
+                    vol.Optional("duration"): vol.All(
+                        vol.Coerce(float),
+                        vol.Range(
+                            min=MIN_RING_CLIP_SECONDS, max=MAX_RING_CLIP_SECONDS
+                        ),
+                    ),
+                    vol.Optional("filename"): str,
                 }
             ),
         )

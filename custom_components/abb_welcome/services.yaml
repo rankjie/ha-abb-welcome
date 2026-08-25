@@ -230,3 +230,142 @@ talk_tone:
           max: 1
           step: 0.05
           mode: slider
+
+play_audio:
+  name: Play talkback audio
+  description: >-
+    Play a local media-source or TTS audio item through the active ABB camera
+    stream's talkback leg. The camera stream must already be open.
+  fields:
+    entity_id:
+      name: Camera
+      description: Optional camera entity. Defaults to the active ABB camera stream.
+      required: false
+      selector:
+        entity:
+          domain: camera
+    station_id:
+      name: Station ID
+      description: Optional outdoor station id to target when no camera entity is supplied.
+      required: false
+      selector:
+        text:
+    entry_id:
+      name: Entry ID
+      description: Optional ABB Welcome config-entry id.
+      required: false
+      selector:
+        text:
+    talkback_session_id:
+      name: Talkback session ID
+      description: Optional client session id. Audio from stale sessions is ignored.
+      required: false
+      selector:
+        text:
+    media:
+      name: Audio
+      description: Local media-source or Home Assistant TTS audio to play.
+      required: true
+      selector:
+        media:
+          accept:
+            - audio/*
+
+record_clip:
+  name: Record a ring clip
+  description: >-
+    Record a short native H.264 clip from the selected station and remux it
+    to mp4 without waiting on HA's stream/go2rtc pipeline. Dials the station
+    if it is not already in a call. Fires the same abb_welcome_ring_clip
+    event as an automatic ring capture, with reason "service".
+  fields:
+    entity_id:
+      name: Camera
+      description: Optional camera entity. Defaults to the active ABB camera stream.
+      required: false
+      selector:
+        entity:
+          domain: camera
+    station_id:
+      name: Station ID
+      description: Optional outdoor station id to target when no camera entity is supplied.
+      required: false
+      selector:
+        text:
+    entry_id:
+      name: Entry ID
+      description: Optional ABB Welcome config-entry id.
+      required: false
+      selector:
+        text:
+    duration:
+      name: Duration
+      description: Clip duration in seconds. Defaults to the configured ring clip duration.
+      required: false
+      selector:
+        number:
+          min: 2
+          max: 60
+          mode: box
+          unit_of_measurement: s
+    filename:
+      name: Filename
+      description: >-
+        Optional output filename stem (no extension). Defaults to
+        abb_ringclip_<timestamp>_<station_id>.
+      required: false
+      selector:
+        text:
+
+announce:
+  name: Announce at a door
+  description: >-
+    Generate speech and play it through a short-lived intercom call without
+    requiring an active camera stream. Refuses to interrupt active streams,
+    calls, talkback owners, or other announcements.
+  fields:
+    entity_id:
+      name: Camera
+      description: Optional ABB Welcome camera entity to announce through.
+      required: false
+      selector:
+        entity:
+          domain: camera
+    station_id:
+      name: Station ID
+      description: Optional outdoor station id when no camera entity is supplied.
+      required: false
+      selector:
+        text:
+    entry_id:
+      name: Entry ID
+      description: Optional ABB Welcome config-entry id.
+      required: false
+      selector:
+        text:
+    talkback_session_id:
+      name: Talkback session ID
+      description: Optional owner id held only for this announcement.
+      required: false
+      selector:
+        text:
+    message:
+      name: Message
+      description: Speech text, from 1 to 500 characters after trimming.
+      required: true
+      selector:
+        text:
+          multiline: true
+    tts_entity_id:
+      name: TTS entity
+      description: Optional TTS entity. Uses Home Assistant's default when omitted.
+      required: false
+      selector:
+        entity:
+          domain: tts
+    language:
+      name: Language
+      description: Optional language code supported by the selected TTS entity.
+      required: false
+      selector:
+        text:

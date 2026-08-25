@@ -589,12 +589,18 @@ def test_acl_parsing_builds_doors_before_confirmation() -> None:
     ]
 
 
-def _options_input(module, strategy: str, default_station: str = "") -> dict:
+def _options_input(
+    module,
+    strategy: str,
+    default_station: str = "",
+    talkback_output_gain_db: float = 3.0,
+) -> dict:
     data = {
         module.CONF_UNLOCK_STRATEGY: strategy,
         module.CONF_LAN_RTSP_HOST: "",
         module.CONF_LAN_RTSP_PORT: 18556,
         module.CONF_ALLOW_PICKUP: True,
+        module.CONF_TALKBACK_OUTPUT_GAIN_DB: talkback_output_gain_db,
     }
     if default_station:
         data[module.CONF_DEFAULT_UNLOCK_STATION_ID] = default_station
@@ -682,6 +688,7 @@ def test_app_multi_door_options_reject_fast_and_require_hybrid_default() -> None
     )
     assert hybrid_valid["data"][module.CONF_LAN_RTSP_PORT] == 19000
     assert hybrid_valid["data"][module.CONF_ALLOW_PICKUP] is False
+    assert hybrid_valid["data"][module.CONF_TALKBACK_OUTPUT_GAIN_DB] == 3.0
 
 
 def test_app_single_door_options_allow_fast() -> None:
@@ -701,3 +708,32 @@ def test_app_single_door_options_allow_fast() -> None:
     assert result["data"][module.CONF_UNLOCK_STRATEGY] == (
         module.UNLOCK_STRATEGY_FAST
     )
+
+
+def test_talkback_gain_options_use_profile_defaults_and_persist_value() -> None:
+    module = _load_config_flow()
+    app_entry = _options_entry(
+        module,
+        [{"name": "Synthetic Front", "station_id": "station-front"}],
+    )
+    app_flow = module.ABBWelcomeOptionsFlow(app_entry)
+    app_form = asyncio.run(app_flow.async_step_init())
+    assert _schema_default(
+        app_form, module.CONF_TALKBACK_OUTPUT_GAIN_DB
+    ) == 3.0
+
+    web_entry = types.SimpleNamespace(data={"doors": []}, options={})
+    web_flow = module.ABBWelcomeOptionsFlow(web_entry)
+    web_form = asyncio.run(web_flow.async_step_init())
+    assert _schema_default(
+        web_form, module.CONF_TALKBACK_OUTPUT_GAIN_DB
+    ) == 0.0
+
+    submitted = _options_input(
+        module,
+        module.UNLOCK_STRATEGY_STANDARD,
+        talkback_output_gain_db=1.5,
+    )
+    saved = asyncio.run(app_flow.async_step_init(submitted))
+    assert saved["type"] == "create_entry"
+    assert saved["data"][module.CONF_TALKBACK_OUTPUT_GAIN_DB] == 1.5

@@ -312,14 +312,105 @@ are mainly intended for the Scrypted plugin.
 - `abb_welcome.talk_stop`
 - `abb_welcome.talk_pcm16le`
 - `abb_welcome.talk_tone`
+- `abb_welcome.play_audio`
+- `abb_welcome.announce`
 
 The audio format for `talk_pcm16le` is base64-encoded 8 kHz mono signed 16-bit
 little-endian PCM. HA converts it to continuous PCMA/G.711 A-law RTP on the
 active call's audio leg. Idle talkback sends silence continuously, and voice
 frames are queued into the same RTP sequence.
 
+**Talkback output gain** is configurable from **ABB Welcome options** between
+0.0 and 3.0 dB. App-managed M2240x/ASI22 devices default to 3.0 dB; web-admin
+gateways and legacy entries default to 0.0 dB, which preserves the previous
+talkback bytes exactly. The setting applies to every outbound talkback source,
+including live microphone PCM, client-generated speech/audio, and the explicit
+`talk_tone` service. A small stateful peak limiter prevents the gain from
+overflowing loud PCM frames and releases smoothly afterward. This is fixed gain
+with peak protection, not an implementation or equivalent of FFmpeg
+`loudnorm`, and it does not add an automatic chime or pre-tone.
+
 Scrypted assigns a per-client `talkback_session_id` so stale clients cannot stop
 or overwrite a newer microphone session.
+
+`abb_welcome.play_audio` resolves an audio selection through Home Assistant's
+media-source system, converts it to the talkback format, and plays it in real
+time. It supports local media and Home Assistant TTS media-source output only;
+arbitrary URLs and filesystem paths are rejected. The selected camera stream
+must already be active. Input is limited to 20 MiB and playback to 30 seconds,
+and the configured talkback output gain applies.
+
+Front-door example:
+
+```yaml
+action: abb_welcome.play_audio
+data:
+  entity_id: camera.abb_welcome_front_door
+  media:
+    media_content_id: media-source://media_source/local/front-door-message.mp3
+    media_content_type: audio/mpeg
+```
+
+Back-door example using a TTS media-source selection:
+
+```yaml
+action: abb_welcome.play_audio
+data:
+  entity_id: camera.abb_welcome_back_door
+  talkback_session_id: back-door-announcement
+  media:
+    media_content_id: media-source://tts/example-provider/example-message
+    media_content_type: audio/mpeg
+```
+
+Choose the TTS item with Home Assistant's media picker; the TTS identifier above
+is only a generic placeholder.
+
+`abb_welcome.announce` is the unattended alternative: Home Assistant generates
+and fully decodes the speech first, then opens a short-lived intercom call,
+plays the message, and hangs up. It refuses to run while any related camera
+stream, visitor call, RTSP client, talkback owner, or another announcement is
+active; it never reuses or interrupts an existing stream. Messages are limited
+to 500 characters, decoded playback is limited to 30 seconds, and the configured
+talkback output gain and peak limiter apply.
+
+Default TTS provider example (replace the camera and message placeholders):
+
+```yaml
+action: abb_welcome.announce
+data:
+  entity_id: camera.abb_welcome_front_door
+  message: "<message to announce>"
+  talkback_session_id: "<optional-automation-id>"
+```
+
+Explicit TTS entity and language example:
+
+```yaml
+action: abb_welcome.announce
+data:
+  entity_id: camera.abb_welcome_back_door
+  message: "<message to announce>"
+  tts_entity_id: tts.example_provider
+  language: en
+```
+
+AppDaemon should request the unlock first and announce only after the unlock
+action reports success. The exact success check belongs in the AppDaemon app;
+the compact example below leaves that application-specific check explicit:
+
+```python
+def unlock_and_announce(self, _event_name, _data, _kwargs):
+    unlock_succeeded = self.unlock_selected_door()
+    if not unlock_succeeded:
+        return
+    self.call_service(
+        "abb_welcome/announce",
+        entity_id="camera.abb_welcome_front_door",
+        message="The door is open.",
+        talkback_session_id="appdaemon-entry",
+    )
+```
 
 ## Scrypted RTSP Endpoint
 
@@ -361,6 +452,11 @@ uses that event to refresh its station list and RTSP URLs.
   silence.
 - `abb_welcome.talk_pcm16le` - queue base64 PCM16LE microphone audio.
 - `abb_welcome.talk_tone` - send a short generated tone for testing.
+- `abb_welcome.play_audio` - play local media or Home Assistant TTS audio on the
+  active camera stream (maximum 30 seconds and 20 MiB source size).
+- `abb_welcome.announce` - generate up to 500 characters of speech, play at most
+  30 seconds through a new temporary call, then hang up; active streams or calls
+  are never interrupted.
 - `abb_welcome.export_credentials` - export stored SIP/gateway credentials to a
   JSON file for local debugging. This output contains secrets.
 

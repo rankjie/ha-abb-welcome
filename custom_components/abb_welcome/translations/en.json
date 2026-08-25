@@ -75,13 +75,18 @@
     "step": {
       "init": {
         "title": "ABB Welcome options",
-        "description": "Door unlock behavior and the LAN RTSP endpoint used by Scrypted/HomeKit. On app-managed devices, Hybrid requires the physical panel default door to be selected explicitly. Home Assistant cannot discover this setting.",
+        "description": "Door unlock behavior, talkback output gain, and the LAN RTSP endpoint used by Scrypted/HomeKit. On app-managed devices, Hybrid requires the physical panel default door to be selected explicitly. Home Assistant cannot discover this setting.",
         "data": {
           "unlock_strategy": "Unlock strategy",
           "default_unlock_station_id": "Physical default door for Hybrid fast path",
           "lan_rtsp_host": "Advertised Home Assistant LAN host (blank = auto)",
           "lan_rtsp_port": "Preferred LAN RTSP proxy port",
-          "allow_pickup": "Allow pickup from streams"
+          "allow_pickup": "Allow pickup from streams",
+          "talkback_output_gain_db": "Talkback output gain (dB)",
+          "record_ring_clips": "Record ring clips",
+          "ring_clip_seconds": "Ring clip duration (seconds)",
+          "ring_clip_dir": "Ring clip storage directory (relative to the Home Assistant config folder)",
+          "ring_clip_continue_after_hangup": "Continue recording after the ring call ends (re-dials the station)"
         }
       }
     },

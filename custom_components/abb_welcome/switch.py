@@ -26,7 +26,12 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP
+from .const import (
+    CONF_ALLOW_PICKUP,
+    CONF_RECORD_RING_CLIPS,
+    DEFAULT_ALLOW_PICKUP,
+    DEFAULT_RECORD_RING_CLIPS,
+)
 from .device import gateway_device_info
 from .redaction import get_redacting_logger
 from .streaming_state import (
@@ -55,6 +60,7 @@ async def async_setup_entry(
         [
             ABBStreamingArmedSwitch(hass, entry),
             ABBAllowPickupSwitch(hass, entry),
+            ABBRecordRingClipsSwitch(hass, entry),
         ]
     )
 
@@ -171,6 +177,70 @@ class ABBAllowPickupSwitch(SwitchEntity):
                 options={
                     **dict(self._entry.options),
                     CONF_ALLOW_PICKUP: allowed,
+                },
+            )
+        self.async_write_ha_state()
+
+
+class ABBRecordRingClipsSwitch(SwitchEntity):
+    """Per-gateway switch enabling native ring-clip recording.
+
+    The config entry's options are the single store: the ring hook in
+    ``__init__`` reads ``record_ring_clips`` live on every ring, and the
+    key is not reload-relevant, so flipping this takes effect on the very
+    next ring with no integration reload.  ``Allow pickup`` remains the
+    master gate — with pickup off, no ring is answered and no clip exists
+    regardless of this switch.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Record ring clips"
+    _attr_icon = "mdi:record-rec"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        self.hass = hass
+        self._entry = entry
+        gateway_uuid = entry.data.get("gateway_uuid", "unknown")
+        self._attr_unique_id = f"{gateway_uuid}_record_ring_clips"
+        self._attr_device_info = gateway_device_info(entry.data)
+        self._unsub: Callable[[], None] | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        # Keep the entity in sync when the same option changes through the
+        # options flow instead of this switch.
+        self._unsub = self._entry.add_update_listener(self._on_entry_updated)
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsub is not None:
+            self._unsub()
+            self._unsub = None
+
+    async def _on_entry_updated(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        self.async_write_ha_state()
+
+    @property
+    def is_on(self) -> bool:
+        return bool(
+            self._entry.options.get(CONF_RECORD_RING_CLIPS, DEFAULT_RECORD_RING_CLIPS)
+        )
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self._set_enabled(True)
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self._set_enabled(False)
+
+    def _set_enabled(self, enabled: bool) -> None:
+        if (
+            self._entry.options.get(CONF_RECORD_RING_CLIPS, DEFAULT_RECORD_RING_CLIPS)
+            != enabled
+        ):
+            self.hass.config_entries.async_update_entry(
+                self._entry,
+                options={
+                    **dict(self._entry.options),
+                    CONF_RECORD_RING_CLIPS: enabled,
                 },
             )
         self.async_write_ha_state()

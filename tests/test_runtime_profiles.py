@@ -34,6 +34,8 @@ def test_legacy_entries_default_to_web_admin() -> None:
     assert capabilities.admin_available is True
     assert capabilities.topology_refresh is True
     assert capabilities.model == "IP Gateway (MRANGE)"
+    assert capabilities.default_talkback_output_gain_db == 0.0
+    assert const.talkback_output_gain_db({}, {}) == 0.0
 
 
 def test_app_managed_capabilities_and_refresh_policy() -> None:
@@ -45,6 +47,8 @@ def test_app_managed_capabilities_and_refresh_policy() -> None:
     assert capabilities.topology_refresh is False
     assert "M2240x / ASI22" in capabilities.model
     assert capabilities.default_unlock_strategy == const.UNLOCK_STRATEGY_STANDARD
+    assert capabilities.default_talkback_output_gain_db == 3.0
+    assert const.talkback_output_gain_db(data, {}) == 3.0
     assert "re-pair" in const.topology_refresh_error(data)
     assert const.topology_refresh_error({}) is None
     assert const.topology_refresh_action({}) == (
@@ -56,6 +60,22 @@ def test_app_managed_capabilities_and_refresh_policy() -> None:
     assert const.topology_refresh_action(data, explicitly_targeted=True) == (
         const.TOPOLOGY_REFRESH_ACTION_ERROR
     )
+
+
+def test_talkback_gain_option_overrides_and_clamps_profile_default() -> None:
+    app_data = {const.CONF_GATEWAY_PROFILE: const.GATEWAY_PROFILE_APP_MANAGED}
+    assert const.talkback_output_gain_db(
+        app_data, {const.CONF_TALKBACK_OUTPUT_GAIN_DB: 1.5}
+    ) == 1.5
+    assert const.talkback_output_gain_db(
+        app_data, {const.CONF_TALKBACK_OUTPUT_GAIN_DB: -1}
+    ) == 0.0
+    assert const.talkback_output_gain_db(
+        {}, {const.CONF_TALKBACK_OUTPUT_GAIN_DB: 10}
+    ) == 3.0
+    assert const.talkback_output_gain_db(
+        app_data, {const.CONF_TALKBACK_OUTPUT_GAIN_DB: "invalid"}
+    ) == 3.0
 
 
 def test_device_info_uses_app_managed_model() -> None:

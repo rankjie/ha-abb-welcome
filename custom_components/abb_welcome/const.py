@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -50,6 +51,27 @@ DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS = 100
 CONF_ALLOW_PICKUP = "allow_pickup"
 DEFAULT_ALLOW_PICKUP = True
 
+CONF_TALKBACK_OUTPUT_GAIN_DB = "talkback_output_gain_db"
+MIN_TALKBACK_OUTPUT_GAIN_DB = 0.0
+MAX_TALKBACK_OUTPUT_GAIN_DB = 3.0
+
+# Native ring-clip recorder: captures the ring-moment video directly from
+# RTP (see ring_clip.py) instead of relying on HA's stream/go2rtc pipeline,
+# which is too slow to produce a first frame before a short ring call ends.
+CONF_RECORD_RING_CLIPS = "record_ring_clips"
+DEFAULT_RECORD_RING_CLIPS = False
+
+CONF_RING_CLIP_SECONDS = "ring_clip_seconds"
+DEFAULT_RING_CLIP_SECONDS = 10
+MIN_RING_CLIP_SECONDS = 2
+MAX_RING_CLIP_SECONDS = 60
+
+CONF_RING_CLIP_DIR = "ring_clip_dir"
+DEFAULT_RING_CLIP_DIR = "www/abb_doorbell"
+
+CONF_RING_CLIP_CONTINUE_AFTER_HANGUP = "ring_clip_continue_after_hangup"
+DEFAULT_RING_CLIP_CONTINUE_AFTER_HANGUP = False
+
 # Per-integration option: which unlock strategy to use.
 #   hybrid   — fast plain MESSAGE for an explicit physical-default station,
 #              INVITE-then-MESSAGE for the rest. Legacy web-admin entries use
@@ -88,6 +110,7 @@ class GatewayCapabilities:
     topology_refresh: bool
     model: str
     default_unlock_strategy: str
+    default_talkback_output_gain_db: float
 
 
 GATEWAY_CAPABILITIES = {
@@ -98,6 +121,7 @@ GATEWAY_CAPABILITIES = {
         topology_refresh=True,
         model="IP Gateway (MRANGE)",
         default_unlock_strategy=UNLOCK_STRATEGY_HYBRID,
+        default_talkback_output_gain_db=0.0,
     ),
     GATEWAY_PROFILE_APP_MANAGED: GatewayCapabilities(
         probe_port=SIP_PORT_TLS,
@@ -106,6 +130,7 @@ GATEWAY_CAPABILITIES = {
         topology_refresh=False,
         model="Wi-Fi Indoor Station (M2240x / ASI22)",
         default_unlock_strategy=UNLOCK_STRATEGY_STANDARD,
+        default_talkback_output_gain_db=3.0,
     ),
 }
 
@@ -123,6 +148,32 @@ def gateway_profile(data: Mapping[str, object]) -> str:
 def gateway_capabilities(data: Mapping[str, object]) -> GatewayCapabilities:
     """Return capabilities for a config-entry-like data mapping."""
     return GATEWAY_CAPABILITIES[gateway_profile(data)]
+
+
+def talkback_output_gain_db(
+    data: Mapping[str, object], options: Mapping[str, object]
+) -> float:
+    """Return the persisted talkback gain or the profile-specific default."""
+    default = gateway_capabilities(data).default_talkback_output_gain_db
+    try:
+        gain_db = float(options.get(CONF_TALKBACK_OUTPUT_GAIN_DB, default))
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(gain_db):
+        return default
+    return max(
+        MIN_TALKBACK_OUTPUT_GAIN_DB,
+        min(MAX_TALKBACK_OUTPUT_GAIN_DB, gain_db),
+    )
+
+
+def ring_clip_seconds(options: Mapping[str, object]) -> int:
+    """Return the configured ring-clip duration, clamped to a safe range."""
+    try:
+        seconds = int(options.get(CONF_RING_CLIP_SECONDS, DEFAULT_RING_CLIP_SECONDS))
+    except (TypeError, ValueError):
+        return DEFAULT_RING_CLIP_SECONDS
+    return max(MIN_RING_CLIP_SECONDS, min(MAX_RING_CLIP_SECONDS, seconds))
 
 
 def unlockable_station_ids(doors: object) -> tuple[str, ...]:
