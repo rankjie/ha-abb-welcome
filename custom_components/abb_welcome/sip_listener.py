@@ -22,8 +22,8 @@ the dialog closes without leaking transactions.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
-import logging
 import re
 import ssl
 import time
@@ -31,14 +31,20 @@ import uuid
 import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from .intercom_dialer import ParsedSdp, parse_sdp
+from .intercom_dialer import (
+    MediaEncryptionKeys,
+    ParsedSdp,
+    generate_media_encryption_keys,
+    parse_sdp,
+)
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
+from .redaction import get_redacting_logger
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_redacting_logger(__name__)
 
 # REGISTER lifetime requested from the gateway.  We refresh at half this
 # value to leave headroom for jitter / retries.
@@ -83,6 +89,7 @@ class AcceptedIncomingCall:
     remote_sdp: ParsedSdp
     audio_local_port: int
     video_local_port: int
+    local_send_keys: MediaEncryptionKeys | None = field(default=None, repr=False)
     ack_received: bool = False
 
 
@@ -97,58 +104,87 @@ class _AcceptedDialog:
 
 RingCallback = Callable[[IncomingCall], Awaitable[None] | None]
 FrameCallback = Callable[[dict[str, Any]], None]
+MessageCallback = Callable[["_SipFrame"], None]
+
+_KNOWN_SIP_METHODS = frozenset(
+    {
+        "ACK",
+        "BYE",
+        "CANCEL",
+        "INFO",
+        "INVITE",
+        "MESSAGE",
+        "NOTIFY",
+        "OPTIONS",
+        "PRACK",
+        "PUBLISH",
+        "REFER",
+        "REGISTER",
+        "SUBSCRIBE",
+        "UPDATE",
+    }
+)
+_KNOWN_CONTENT_TYPES = frozenset(
+    {
+        "application/dtmf-relay",
+        "application/pidf+xml",
+        "application/sdp",
+        "application/simple-message-summary",
+        "message/sipfrag",
+        "text/plain",
+    }
+)
+
+
+def _safe_method(value: str) -> str:
+    """Return a fixed SIP method label, never an attacker-controlled token."""
+    method = value.strip().upper()
+    return method if method in _KNOWN_SIP_METHODS else "UNKNOWN"
+
+
+def _safe_content_type(headers: list[tuple[str, str]]) -> str | None:
+    """Return a known media type without user-controlled parameters."""
+    value = _header(headers, "Content-Type")
+    if not value:
+        return None
+    media_type = value.partition(";")[0].strip().lower()
+    return media_type if media_type in _KNOWN_CONTENT_TYPES else "other"
 
 
 def _summarise_frame(frame: "_SipFrame") -> dict[str, Any]:
-    """Convert a SIP frame to a JSON-serialisable dict for HA event payloads.
+    """Return privacy-safe protocol metadata for an HA event payload.
 
-    Lossless on purpose: every header is preserved (multi-valued ones as a
-    list), the full body is included as text (UTF-8 with replacement on
-    non-text), and the complete wire bytes are exposed as ``raw`` so the
-    event subscriber can rebuild the original frame byte-for-byte.
+    SIP headers, URIs, dialog identifiers, bodies, and the decoded wire frame
+    contain private installation data and credentials.  They deliberately do
+    not cross the Home Assistant event-bus boundary.  Byte counts and a small
+    allow-list of fixed protocol labels retain enough detail for diagnostics.
     """
     summary: dict[str, Any] = {
-        "start_line": frame.start_line,
         "is_response": frame.is_response,
+        "protocol": "SIP/2.0",
+        "header_count": len(frame.headers),
+        "via_count": len(_all_headers(frame.headers, "Via")),
+        "body_bytes": len(frame.body),
+        "raw_bytes": len(frame.raw),
     }
     if frame.is_response:
-        summary["status_code"] = frame.status_code
-    else:
-        summary["method"] = frame.method
-        summary["request_uri"] = (
-            frame.start_line.split(" ", 2)[1] if " " in frame.start_line else ""
+        status_code = frame.status_code
+        summary["status_code"] = status_code
+        summary["start_line"] = (
+            f"SIP/2.0 {status_code}" if status_code is not None else "SIP/2.0"
         )
-
-    # Group headers preserving order; multi-valued headers (Via, Route, etc)
-    # become lists.  Header names are case-insensitive in SIP, so we
-    # canonicalise on first-seen capitalisation.
-    headers: dict[str, Any] = {}
-    seen_case: dict[str, str] = {}
-    for key, value in frame.headers:
-        canonical = seen_case.setdefault(key.lower(), key)
-        if canonical in headers:
-            current = headers[canonical]
-            if isinstance(current, list):
-                current.append(value)
-            else:
-                headers[canonical] = [current, value]
-        else:
-            headers[canonical] = value
-    summary["headers"] = headers
-
-    body_bytes = frame.body
-    if body_bytes:
-        summary["body"] = body_bytes.decode("utf-8", errors="replace")
-        summary["body_bytes"] = len(body_bytes)
     else:
-        summary["body"] = ""
-        summary["body_bytes"] = 0
+        method = _safe_method(frame.method)
+        summary["method"] = method
+        summary["start_line"] = f"{method} <redacted> SIP/2.0"
 
-    # Full wire bytes — handy when a future bug needs an exact byte-by-byte
-    # reproduction.  Decoded with replacement so the event payload stays
-    # JSON-safe.
-    summary["raw"] = frame.raw.decode("utf-8", errors="replace")
-    summary["raw_bytes"] = len(frame.raw)
+    content_type = _safe_content_type(frame.headers)
+    if content_type is not None:
+        summary["content_type"] = content_type
+
+    cseq = _header(frame.headers, "CSeq").split()
+    if len(cseq) >= 2:
+        summary["cseq_method"] = _safe_method(cseq[-1])
     return summary
 
 
@@ -232,7 +268,7 @@ def _preferred_payload(
     offer: ParsedSdp,
     media: str,
     preferred: tuple[str, ...],
-) -> tuple[int, str, str | None, str] | None:
+) -> tuple[int, str, str | None, str, bool] | None:
     for desc in offer.medias:
         if desc.media != media:
             continue
@@ -240,10 +276,22 @@ def _preferred_payload(
             for pt in desc.payload_types:
                 rtpmap = desc.rtpmap.get(pt, "")
                 if codec.lower() in rtpmap.lower():
-                    return pt, rtpmap, desc.fmtp.get(pt), desc.proto or "RTP/AVP"
+                    return (
+                        pt,
+                        rtpmap,
+                        desc.fmtp.get(pt),
+                        desc.proto or "RTP/AVP",
+                        desc.rtcp_mux,
+                    )
         if desc.payload_types:
             pt = desc.payload_types[0]
-            return pt, desc.rtpmap.get(pt, ""), desc.fmtp.get(pt), desc.proto or "RTP/AVP"
+            return (
+                pt,
+                desc.rtpmap.get(pt, ""),
+                desc.fmtp.get(pt),
+                desc.proto or "RTP/AVP",
+                desc.rtcp_mux,
+            )
     return None
 
 
@@ -254,6 +302,7 @@ def _build_answer_sdp(
     media_ip: str,
     audio_port: int,
     video_port: int,
+    local_send_keys: MediaEncryptionKeys | None = None,
 ) -> str:
     """Build a conservative SDP answer for an incoming door-station INVITE."""
     sid = int(time.time() * 1000)
@@ -268,27 +317,89 @@ def _build_answer_sdp(
 
     audio = _preferred_payload(offer, "audio", ("PCMA/8000", "PCMU/8000"))
     if audio is not None:
-        pt, rtpmap, _fmtp, proto = audio
-        lines.extend([
-            f"m=audio {audio_port} {proto} {pt}",
-            f"a=rtpmap:{pt} {rtpmap or 'PCMA/8000'}",
-            "a=ptime:20",
-            "a=sendrecv",
-        ])
+        pt, rtpmap, _fmtp, proto, rtcp_mux = audio
+        lines.extend(
+            [
+                f"m=audio {audio_port} {proto} {pt}",
+                f"a=rtpmap:{pt} {rtpmap or 'PCMA/8000'}",
+                "a=ptime:20",
+                "a=sendrecv",
+            ]
+        )
+        if rtcp_mux:
+            lines.append("a=rtcp-mux")
+        _append_abb_encryption_attributes(
+            lines,
+            offer,
+            "audio",
+            local_send_keys.audio if local_send_keys is not None else None,
+        )
 
     video = _preferred_payload(offer, "video", ("H264/90000",))
     if video is not None:
-        pt, rtpmap, fmtp, proto = video
-        lines.extend([
-            f"m=video {video_port} {proto} {pt}",
-            f"a=rtpmap:{pt} {rtpmap or 'H264/90000'}",
-        ])
+        pt, rtpmap, fmtp, proto, rtcp_mux = video
+        lines.extend(
+            [
+                f"m=video {video_port} {proto} {pt}",
+                f"a=rtpmap:{pt} {rtpmap or 'H264/90000'}",
+            ]
+        )
         if fmtp:
             lines.append(f"a=fmtp:{pt} {fmtp}")
         lines.append("a=sendrecv")
+        if rtcp_mux:
+            lines.append("a=rtcp-mux")
+        _append_abb_encryption_attributes(
+            lines,
+            offer,
+            "video",
+            local_send_keys.video if local_send_keys is not None else None,
+        )
 
     lines.append("")
     return "\r\n".join(lines)
+
+
+def _append_abb_encryption_attributes(
+    lines: list[str],
+    offer: ParsedSdp,
+    media: str,
+    local_send_key: bytes | None = None,
+) -> None:
+    """Answer ABB's per-media encryption negotiation without exposing keys."""
+    description = next((item for item in offer.medias if item.media == media), None)
+    if description is None or not description.abb_encrypt:
+        return
+    if description.crypto_tag is not None:
+        if (
+            len(description.crypto_inline_key) not in (16, 24, 32)
+            or b"\x00" in description.crypto_inline_key
+        ):
+            raise ValueError("invalid SDP crypto key")
+        answer_key = (
+            local_send_key
+            if local_send_key is not None
+            else description.crypto_inline_key
+        )
+        if len(answer_key) != 16 or not all(0x20 <= byte < 0x7F for byte in answer_key):
+            raise ValueError("invalid local SDP crypto key")
+        encoded_key = base64.b64encode(answer_key).decode("ascii")
+        attribute = (
+            f"a=crypto:{description.crypto_tag} {description.crypto_suite} "
+            f"inline:{encoded_key}"
+        )
+        if description.crypto_params:
+            attribute += f" {description.crypto_params}"
+        lines.append(attribute)
+        return
+    if len(description.abb_encrypt_key) not in (16, 24, 32):
+        raise ValueError("invalid ABB media encryption key length")
+    lines.extend(
+        (
+            "a=abb_encrypt:1",
+            "a=abb_encrypt_key:" + description.abb_encrypt_key.decode("utf-8"),
+        )
+    )
 
 
 def _parse_challenge(value: str) -> dict[str, str]:
@@ -358,6 +469,8 @@ class SipListener:
         on_ring: RingCallback | None = None,
         on_state_change: Callable[[str], None] | None = None,
         on_frame: FrameCallback | None = None,
+        on_message: MessageCallback | None = None,
+        custom_media_crypto: bool = False,
     ) -> None:
         if transport not in ("tls", "tcp"):
             raise ValueError("transport must be 'tls' or 'tcp'")
@@ -370,6 +483,8 @@ class SipListener:
         self._on_ring = on_ring
         self._on_state_change = on_state_change
         self._on_frame = on_frame
+        self._on_message = on_message
+        self._custom_media_crypto = custom_media_crypto
 
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
@@ -390,7 +505,7 @@ class SipListener:
 
     @property
     def state(self) -> str:
-        """Current high-level state: stopped / connecting / registered / disconnected."""
+        """Return the current high-level listener state."""
         return self._state
 
     def pending_call_for_station(self, station_id: str) -> bool:
@@ -424,13 +539,74 @@ class SipListener:
                 return None
 
             call_id = _header(frame.headers, "Call-ID")
-            offer = parse_sdp(frame.body)
+            offer = parse_sdp(frame.body, custom_media_crypto=self._custom_media_crypto)
+            _LOGGER.info(
+                "[abb] listener: SDP encryption metadata media_count=%d "
+                "crypto_attrs=%d crypto_parsed_media=%d "
+                "crypto_activated_media=%d audio_key_bytes=%d "
+                "video_key_bytes=%d custom_crypto=%s",
+                len(offer.medias),
+                offer.crypto_attribute_count,
+                sum(1 for media in offer.medias if media.crypto_tag is not None),
+                sum(1 for media in offer.medias if media.abb_encrypt),
+                next(
+                    (
+                        len(media.crypto_inline_key)
+                        for media in offer.medias
+                        if media.media == "audio" and media.abb_encrypt
+                    ),
+                    0,
+                ),
+                next(
+                    (
+                        len(media.crypto_inline_key)
+                        for media in offer.medias
+                        if media.media == "video" and media.abb_encrypt
+                    ),
+                    0,
+                ),
+                self._custom_media_crypto,
+            )
+            for media in offer.medias:
+                if media.crypto_attribute_count == 0:
+                    continue
+                _LOGGER.info(
+                    "[abb] listener: SDP crypto descriptor media_kind=%s "
+                    "proto=%s tag=%d suite=%s b64_len=%d decoded_len=%d "
+                    "printable_bool=%s has_session_params=%s activated=%s",
+                    media.media,
+                    media.proto,
+                    media.crypto_tag or 0,
+                    media.crypto_suite or "none",
+                    media.crypto_b64_length,
+                    len(media.crypto_inline_key),
+                    media.crypto_key_printable,
+                    media.crypto_has_session_params,
+                    media.abb_encrypt,
+                )
+            offered_media = [
+                media
+                for media in offer.medias
+                if media.media in ("audio", "video") and media.port > 0
+            ]
+            directional_crypto = (
+                self._custom_media_crypto
+                and bool(offered_media)
+                and all(
+                    media.abb_encrypt and media.crypto_tag is not None
+                    for media in offered_media
+                )
+            )
+            local_send_keys = (
+                generate_media_encryption_keys() if directional_crypto else None
+            )
             answer = _build_answer_sdp(
                 offer,
                 username=self.username,
                 media_ip=media_ip,
                 audio_port=audio_port,
                 video_port=video_port,
+                local_send_keys=local_send_keys,
             )
             local_tag = uuid.uuid4().hex[:8]
             local_contact = (
@@ -459,6 +635,7 @@ class SipListener:
                 remote_sdp=offer,
                 audio_local_port=audio_port,
                 video_local_port=video_port,
+                local_send_keys=local_send_keys,
             )
             dialog = _AcceptedDialog(call=accepted)
             self._ended_dialog_reasons.pop(call_id, None)
@@ -623,7 +800,8 @@ class SipListener:
                 delay = RECONNECT_BACKOFF[min(attempt, len(RECONNECT_BACKOFF) - 1)]
                 _LOGGER.warning(
                     "[abb] SIP listener error (%s); reconnecting in %ds",
-                    err, delay,
+                    err,
+                    delay,
                 )
                 attempt += 1
                 try:
@@ -703,8 +881,7 @@ class SipListener:
         from_tag = uuid.uuid4().hex[:8]
         call_id = uuid.uuid4().hex[:16] + "@" + self.domain
         contact = (
-            f"<sip:{self.username}@{local_ip}:{local_port};"
-            f"transport={self.transport}>"
+            f"<sip:{self.username}@{local_ip}:{local_port};transport={self.transport}>"
         )
         branch = "z9hG4bK-" + uuid.uuid4().hex[:12]
 
@@ -725,8 +902,10 @@ class SipListener:
         if frame.status_code == 401:
             challenge = _header(frame.headers, "WWW-Authenticate")
             if not challenge.lower().startswith("digest"):
-                raise RuntimeError(f"REGISTER 401 without Digest challenge: {challenge!r}")
-            params = _parse_challenge(challenge[len("Digest"):].strip())
+                raise RuntimeError(
+                    f"REGISTER 401 without Digest challenge: {challenge!r}"
+                )
+            params = _parse_challenge(challenge[len("Digest") :].strip())
             cseq += 1
             auth = _digest_response(
                 self.username, self.password, "REGISTER", reg_uri, params
@@ -745,7 +924,10 @@ class SipListener:
             raise RuntimeError(f"REGISTER rejected: {frame.start_line}")
         _LOGGER.info(
             "[abb] SIP listener registered as %s on %s:%d (Expires=%d)",
-            self.username, self.host, self.port, expires,
+            self.username,
+            self.host,
+            self.port,
+            expires,
         )
         return cseq
 
@@ -785,6 +967,15 @@ class SipListener:
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("[abb] on_frame callback raised: %s", err)
 
+    def _emit_message(self, frame: "_SipFrame") -> None:
+        """Pass an inbound MESSAGE to internal consumers outside the HA bus."""
+        if self._on_message is None:
+            return
+        try:
+            self._on_message(frame)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("[abb] on_message callback raised: %s", err)
+
     async def _dispatch(
         self,
         frame: "_SipFrame",
@@ -800,8 +991,10 @@ class SipListener:
             await self._respond(writer, frame, 200, "OK")
         elif method == "MESSAGE":
             # Some gateways push status MESSAGEs (e.g. door-open broadcasts).
-            # Acknowledge politely.
-            _LOGGER.debug("[abb] Inbound MESSAGE: %s", frame.body[:200])
+            # Deliver the private parsed frame only to the internal callback;
+            # the HA event receives the metadata-only summary emitted above.
+            self._emit_message(frame)
+            _LOGGER.debug("[abb] Inbound MESSAGE (%d body bytes)", len(frame.body))
             await self._respond(writer, frame, 200, "OK")
         elif method == "NOTIFY":
             await self._respond(writer, frame, 200, "OK")
@@ -820,7 +1013,9 @@ class SipListener:
                     _header(frame.headers, "Call-ID"),
                 )
         elif method == "BYE":
-            self._finish_accepted_dialog(_header(frame.headers, "Call-ID"), "remote_bye")
+            self._finish_accepted_dialog(
+                _header(frame.headers, "Call-ID"), "remote_bye"
+            )
             await self._respond(writer, frame, 200, "OK")
         elif method == "ACK":
             dialog = self._accepted_dialogs.get(_header(frame.headers, "Call-ID"))
@@ -833,7 +1028,8 @@ class SipListener:
             # Stray response for a transaction we no longer track — ignore.
             _LOGGER.debug(
                 "[abb] Stray response: %s (CSeq=%s)",
-                frame.start_line, _header(frame.headers, "CSeq"),
+                frame.start_line,
+                _header(frame.headers, "CSeq"),
             )
         else:
             _LOGGER.debug("[abb] Unhandled SIP method %s", method)
@@ -861,7 +1057,8 @@ class SipListener:
         )
         _LOGGER.info(
             "[abb] Incoming INVITE from %s (call_id=%s)",
-            call.caller_uri, call.call_id,
+            call.caller_uri,
+            call.call_id,
         )
 
         # Remember the INVITE so we can issue 487 if a CANCEL arrives later.
@@ -900,6 +1097,13 @@ class SipListener:
         for via in _all_headers(frame.headers, "Via"):
             lines.append(f"Via: {via}")
             out_headers.append(("Via", via))
+        # A 2xx response to an INVITE establishes the dialog's route set.
+        # Echo every Record-Route value in wire order so the caller's ACK and
+        # subsequent in-dialog requests return over the registered SIP route.
+        if frame.method == "INVITE" and 200 <= code < 300:
+            for route in _all_headers(frame.headers, "Record-Route"):
+                lines.append(f"Record-Route: {route}")
+                out_headers.append(("Record-Route", route))
         from_value = _header(frame.headers, "From")
         lines.append(f"From: {from_value}")
         out_headers.append(("From", from_value))
@@ -1030,7 +1234,9 @@ class SipListener:
             length = int(cl_match.group(1))
             if length > 0:
                 body = await reader.readexactly(length)
-        frame = _SipFrame(start_line=start_line, headers=headers, body=body, raw=head + body)
+        frame = _SipFrame(
+            start_line=start_line, headers=headers, body=body, raw=head + body
+        )
         setattr(frame, "_received_at", time.time())
         return frame
 

@@ -6,18 +6,17 @@ These show up in the HA logbook and can trigger automations.
 
 from __future__ import annotations
 
-import logging
-
 from homeassistant.components.event import EventEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import ABBWelcomeCoordinator
+from .device import gateway_device_info
+from .redaction import get_redacting_logger
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_redacting_logger(__name__)
 
 EVENT_TYPES = [
     "ring",
@@ -46,6 +45,7 @@ async def async_setup_entry(
             coordinator,
             gateway_uuid,
             entry.data.get("doors", []) or [],
+            gateway_device_info(entry.data),
         )
     ])
 
@@ -63,6 +63,7 @@ class ABBWelcomeEventEntity(EventEntity):
         coordinator: ABBWelcomeCoordinator,
         gateway_uuid: str,
         doors: list[dict],
+        device_info,
     ) -> None:
         self._coordinator = coordinator
         self._station_names = {
@@ -73,15 +74,13 @@ class ABBWelcomeEventEntity(EventEntity):
             if str(door.get("station_id", "")).strip()
         }
         self._attr_unique_id = f"{gateway_uuid}_intercom_events"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = device_info
         self._last_seen_id = ""
 
     async def async_added_to_hass(self) -> None:
+        data = self._coordinator.data
+        if data and data.events:
+            self._last_seen_id = data.events[0].event_id
         self._coordinator.async_add_listener(self._handle_update)
 
     @callback

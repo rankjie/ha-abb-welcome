@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from homeassistant.components.binary_sensor import (
@@ -11,13 +10,14 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later
 
 from .const import DOMAIN
+from .device import gateway_device_info
+from .redaction import get_redacting_logger
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_redacting_logger(__name__)
 
 # How long the binary_sensor stays ON after a ring (the SIP leg only lasts
 # a few hundred ms; users want a visible ring for at least this long so
@@ -35,7 +35,7 @@ async def async_setup_entry(
     if "sip_listener" not in data:
         return
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
-    sensor = ABBWelcomeRingingSensor(gateway_uuid)
+    sensor = ABBWelcomeRingingSensor(gateway_uuid, gateway_device_info(entry.data))
     data["ringing_sensor"] = sensor
     async_add_entities([sensor])
 
@@ -53,14 +53,9 @@ class ABBWelcomeRingingSensor(BinarySensorEntity):
     _attr_icon = "mdi:bell-ring"
     _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
 
-    def __init__(self, gateway_uuid: str) -> None:
+    def __init__(self, gateway_uuid: str, device_info) -> None:
         self._attr_unique_id = f"{gateway_uuid}_ringing"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = device_info
         self._attr_is_on = False
         self._caller: dict[str, Any] = {}
         self._cancel_off: Any = None

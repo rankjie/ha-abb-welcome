@@ -3,8 +3,8 @@
 [![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=rankjie&repository=ha-abb-welcome&category=integration)
 
 Local controls, ring detection, and live intercom streams for ABB Welcome /
-Busch-Jaeger building intercoms backed by an **IP gateway** (system type
-`mrange`).
+Busch-Jaeger building intercoms backed by a web-admin **IP gateway** (system
+type `mrange`) or an app-managed M2240x/ASI22 Wi-Fi indoor station.
 
 This integration is LAN-first. Pairing uses the ABB MyBuildings cloud portal
 once, then unlocks, realtime ring detection, and live video/audio run directly
@@ -43,18 +43,22 @@ doorbell notifications, and two-way audio.
 - **Image entity** with the latest gateway screenshot from event history.
 - **Event entity** and **last-event sensor** for ring / call / door-open history.
 - **Refresh Events** button for a manual portal event poll.
-- **Refresh outdoor stations** service for re-reading the gateway door list.
+- **Refresh outdoor stations** service for re-reading the door list on
+  web-admin gateways. App-managed topology currently requires re-pairing.
 - Switchable unlock strategy for gateways that need a different SIP unlock path.
 - LAN RTSP proxy for Scrypted/HomeKit, with automatic free-port selection and
   discovery refresh events.
 
 ## Requirements
 
-- An ABB Welcome **IP gateway** reachable on your local network, such as ABB
-  **83342** or another `mrange` IP gateway.
+- A supported ABB Welcome device reachable on your local network:
+  - ABB **83342** or another `mrange` IP gateway with web admin, or
+  - an **M2240x/ASI22 Wi-Fi indoor station** with SIP-TLS port 5061 reachable.
 - An **ABB-Welcome / Busch-Jaeger MyBuildings** account already linked to that
   gateway.
-- The gateway **web admin password** used at `https://<gateway-ip>/`.
+- For web-admin gateways only, the gateway admin password used at
+  `https://<gateway-ip>/`.
+- For app-managed devices, the private MyBuildings **system ID / Portal UUID**.
 - For Apple Home: a working Scrypted installation and the
   [ABB HA Doorbell Scrypted plugin][scrypted-bridge].
 
@@ -80,30 +84,58 @@ Copy `custom_components/abb_welcome/` into Home Assistant's
 
 Open Settings -> **Devices & Services** -> **Add Integration** -> **ABB Welcome**.
 
-Fill in:
+First choose a device profile:
+
+- **Web-admin IP gateway (83342 / MRANGE)** keeps the existing HTTPS/CGI setup.
+- **App-managed Wi-Fi indoor station (M2240x / ASI22)** uses SIP-TLS port 5061
+  and MyBuildings app pairing; it never contacts port 443
+  or asks for a gateway admin password.
+
+Then fill in:
 
 - MyBuildings portal **username**
 - MyBuildings portal **password**
 - Gateway local **IP address**
-- Gateway **web admin password**
+- Gateway **web admin password** (web-admin profile only)
+- Gateway **Portal UUID / MyBuildings system ID** (required for app-managed)
 
 Optional: if automatic setup cannot read the gateway UUID from the local
 `portalclient.cgi` endpoint, fill in **Gateway Portal UUID** from the gateway web
 admin Portal page or ABB Welcome mobile app, then retry.
 
-The integration then:
+Both profiles:
 
 1. Generates a fresh RSA keypair and requests a client certificate from the
    MyBuildings portal.
-2. Reads the gateway UUID from the local gateway admin API.
-3. Computes the gateway integrity code from the certificate fingerprint.
-4. Sends a `welcome.connect` event so the gateway sees a pending pairing entry.
-5. Logs into the gateway admin API, finds that pending entry, sets permissions,
-   and submits the integrity code.
-6. Polls for the gateway ACL update, decrypts the SIP password, reads the door
+2. Computes the gateway integrity code from the certificate fingerprint.
+3. Sends one `welcome.connect` event so the device sees a pending pairing.
+4. Polls for the gateway ACL update, decrypts the SIP password, reads the door
    list, and creates HA entities.
 
-A successful pairing typically completes in under 15 seconds.
+For a web-admin gateway, setup reads the gateway UUID from its CGI (unless an
+override was supplied), then logs into the CGI to approve the pending client.
+For an app-managed device, setup uses the required Portal UUID directly and
+immediately polls for the ACL produced by MyBuildings app pairing. It never calls
+the local CGI or waits for a panel approval action.
+
+A successful web-admin pairing typically completes in under 15 seconds.
+
+For an app-managed device, the integration creates one `ha-*` client and shows
+its client name and integrity code, persists the identity, then immediately polls
+for its ACL update. M2240x/ASI22 additional apps normally pair automatically when
+they use the same MyBuildings account. The M22403-W does not expose an approval
+screen on the panel; ABB's generic pairing email also describes other product
+families that do. If polling times out, wait and submit again. If the official
+Welcome app shows the station as unpaired and offers **Resend pairing request**,
+use that option; do not unpair an `ha-*` client already shown as paired.
+
+The pending private identity is stored in Home Assistant's private storage. A
+later config flow can resume the same certificate, client identity, and
+`welcome.connect` request after a browser reload or Home Assistant restart; it
+does not consume another client slot. MyBuildings credentials are used only for
+the initial certificate request and the password is not stored. The recovery
+screen also provides an explicitly confirmed discard path for clients that have
+already been removed/unpaired.
 
 ## Apple Home / HomeKit
 
@@ -318,8 +350,9 @@ uses that event to refresh its station list and RTSP URLs.
 
 ## Services
 
-- `abb_welcome.refresh_doors` - re-read outdoor stations from the gateway admin
-  CGI and reload the entry if the list changed.
+- `abb_welcome.refresh_doors` - re-read outdoor stations from a web-admin
+  gateway and reload the entry if the list changed. App-managed devices return
+  an unsupported error; re-pair after topology changes.
 - `abb_welcome.arm_streaming` - arm streaming for all stations or one
   `station_id`.
 - `abb_welcome.talk_start` - start sending queued microphone audio on the active
@@ -364,6 +397,9 @@ Open the integration's **Configure** menu to change behavior after setup.
 Options:
 
 - **Unlock strategy**
+- **Physical default door for Hybrid fast path**: app-managed devices only.
+  Select the door that the physical indoor panel itself opens by default.
+  Home Assistant cannot discover this setting.
 - **Advertised Home Assistant LAN host**: blank means auto-detect.
 - **Preferred LAN RTSP proxy port**: tried first; HA falls back to another free
   port if it is occupied.
@@ -373,17 +409,33 @@ Options:
 
 | Strategy | What it does | When to use |
 |---|---|---|
-| **Hybrid** *(default)* | Plain SIP `MESSAGE` for the first outdoor station, `INVITE`-then-`MESSAGE` for the rest. | Best of both worlds on most setups. |
-| **Fast** | Plain SIP `MESSAGE` for every door. | Lowest latency. Some gateways do not accept a `MESSAGE` without an active call session. |
-| **Standard** | `INVITE` to bring the call up, then `MESSAGE`, then `BYE`. | Most compatible. Adds roughly 1-2 seconds per unlock. |
+| **Hybrid** *(web-admin default)* | Plain SIP `MESSAGE` for the physical default station, `INVITE`-then-`MESSAGE` for every other station. | App-managed devices require an explicit physical-default selection. Web-admin legacy entries retain their first-stored-door behavior. |
+| **Fast** | Plain SIP `MESSAGE` without first establishing a targeted call. | Allowed for app-managed devices only when one unlockable door exists. It is blocked with multiple doors because the panel may ignore the requested target. |
+| **Standard** *(app-managed default)* | TLS `INVITE` to bring the call up, then `MESSAGE`, then `BYE`. | Uses the required SIP-TLS port 5061 and avoids assuming port 5060 is available. Adds roughly 1-2 seconds per unlock. |
 
-If a door does not open with Hybrid, switch to **Standard** first. If every door
-works with **Fast**, you can leave it there for the lowest-latency setup.
+If a door does not open with Hybrid, switch to **Standard**. Do not use Fast to
+test targeting on a multi-door app-managed device: the physical panel may
+ignore the requested station and open its own default door.
+The app-managed profile defaults to **Standard**. Its physical indoor-panel
+default is not exposed by the protocol, so Home Assistant does not guess from
+door-list order. To use Hybrid, first confirm which door the physical panel
+opens by default and select that exact door in Configure. If the selected
+station disappears after re-pairing or topology changes, every Hybrid unlock
+falls back to Standard; another door is never selected silently.
 
 ## Troubleshooting
 
 - **Cannot reach the gateway web admin on HTTPS port 443**: check the gateway IP
   and that Home Assistant can route to it.
+- **Cannot reach SIP-TLS port 5061**: for an app-managed device, check its local
+  IP, Wi-Fi connection, and routing from Home Assistant.
+- **No ACL update after app pairing**: wait briefly and submit again. M2240x/ASI22
+  pairing is normally automatic for clients on the same MyBuildings account; the
+  M22403-W has no panel approval screen. If the official Welcome app offers
+  **Resend pairing request** for an unpaired station, use it. If the config-flow
+  page disappears, start ABB Welcome setup again and choose the app-managed
+  profile; Home Assistant offers to resume the saved request without sending
+  another `welcome.connect`.
 - **Invalid portal credentials**: the MyBuildings portal rejected the username or
   password.
 - **Gateway admin password is wrong**: log into `https://<gateway-ip>/` manually
@@ -410,6 +462,13 @@ works with **Fast**, you can leave it there for the lowest-latency setup.
 
 - **ABB 83342 IP Gateway**, firmware `ASM04_GW_V6.25_20250513_MP_TIDM365`,
   system type `mrange`, 3 outdoor stations.
+- **ABB M22403-W Wi-Fi indoor station**, firmware
+  `ASI22_V1.23_20251225_PP_IMX6SOLO`, system type `ASI22`, 2 outdoor stations.
+  Validated with automatic MyBuildings app pairing and recovery, SIP-TLS
+  registration after restart, per-station ring detection and unlock, H.264
+  video, PCMA/G.711 audio, portal history and screenshots, call pickup, and
+  two-way talkback. App-managed door topology refresh remains the documented
+  exception and requires re-pairing.
 
 Reports for other models and firmware versions are welcome.
 

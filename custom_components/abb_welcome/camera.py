@@ -22,7 +22,6 @@ Streaming is gated and lazy:
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
 from collections.abc import Callable
 from http import HTTPStatus
@@ -32,13 +31,19 @@ from urllib.parse import urljoin, urlparse
 from aiohttp import ClientError, ClientSession, ClientTimeout
 from go2rtc_client.ws import (
     Go2RtcWsClient,
+)
+from go2rtc_client.ws import (
     WebRTCAnswer as Go2RTCAnswer,
+)
+from go2rtc_client.ws import (
     WebRTCCandidate as Go2RTCCandidate,
+)
+from go2rtc_client.ws import (
     WebRTCOffer as Go2RTCOffer,
+)
+from go2rtc_client.ws import (
     WsError as Go2RTCWsError,
 )
-from webrtc_models import RTCIceCandidateInit
-
 from homeassistant.components.camera import (
     Camera,
     CameraCapabilities,
@@ -52,13 +57,21 @@ from homeassistant.components.camera import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from webrtc_models import RTCIceCandidateInit
 
-from .const import DOMAIN, GO2RTC_RTSP_HOST, GO2RTC_RTSP_PORT
+from .const import (
+    DOMAIN,
+    GATEWAY_PROFILE_APP_MANAGED,
+    GO2RTC_RTSP_HOST,
+    GO2RTC_RTSP_PORT,
+    gateway_profile,
+)
+from .device import gateway_device_info
 from .intercom_dialer import Door, IntercomDialer
 from .media_pipeline import StreamSession
+from .redaction import get_redacting_logger
 from .rtsp_server import (
     AUDIO_RTP_CHANNEL,
     VIDEO_RTP_CHANNEL,
@@ -73,7 +86,7 @@ from .streaming_state import (
     signal_armed_changed,
 )
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_redacting_logger(__name__)
 
 _GO2RTC_DOMAIN = "go2rtc"
 _REQUEST_TIMEOUT = ClientTimeout(total=10)
@@ -126,6 +139,10 @@ async def async_setup_entry(
         return
 
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
+    exact_door_targets = (
+        gateway_profile(entry.data) == GATEWAY_PROFILE_APP_MANAGED
+    )
+    device_info = gateway_device_info(entry.data)
     door_meta: dict[str, tuple[Door, str, bool | str | int | None]] = {}
     camera_entities: dict[tuple[str, int], ABBWelcomeCamera] = {}
     created_indexes: dict[str, set[int]] = {}
@@ -166,6 +183,7 @@ async def async_setup_entry(
             camera_count=camera_count,
             station_type=station_type,
             can_unlock=can_unlock,
+            device_info=device_info,
         )
         camera_entities[(key, camera_index)] = camera
         created_indexes.setdefault(key, set()).add(camera_index)
@@ -259,6 +277,7 @@ async def async_setup_entry(
         password=sip_pass,
         domain=sip_domain,
         on_camera_count=_on_camera_count_detected,
+        custom_media_crypto=exact_door_targets,
     )
     data["intercom_dialer"] = dialer
 
@@ -283,6 +302,8 @@ async def async_setup_entry(
             name=raw.get("name") or addr,
             address=addr,
             station_id=str(raw.get("station_id", "")),
+            local_id=str(raw.get("local_id") or ""),
+            exact_target=exact_door_targets,
         )
         camera_count = _camera_count_from_raw(raw)
         station_type = str(raw.get("type", "")).strip()
@@ -291,9 +312,8 @@ async def async_setup_entry(
         door_meta[key] = (door, station_type, can_unlock)
         detected_counts[key] = camera_count
         _LOGGER.info(
-            "[abb] camera setup: station name=%s address=%s station_id=%s "
+            "[abb] camera setup: station metadata redacted "
             "type=%s can_unlock=%s initial_camera_count=%d",
-            door.name, door.address, door.station_id,
             station_type or "unknown", can_unlock, camera_count,
         )
         for camera_index in range(1, camera_count + 1):
@@ -646,6 +666,7 @@ class ABBWelcomeCamera(Camera):
         camera_count: int,
         station_type: str,
         can_unlock: bool | str | int | None,
+        device_info,
     ) -> None:
         super().__init__()
         self.hass = hass
@@ -669,12 +690,7 @@ class ABBWelcomeCamera(Camera):
             else door.name
         )
         self._attr_unique_id = f"{gateway_uuid}_camera_{station_key}{camera_suffix}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = device_info
         self._stream_name = f"abb_{station_key}{camera_suffix}"
 
         self._rtsp = RtspServer(
@@ -732,6 +748,21 @@ class ABBWelcomeCamera(Camera):
             "talkback_packets": int(talkback_stats.get("packets", 0) or 0),
             "talkback_voice_packets": int(
                 talkback_stats.get("voice_packets", 0) or 0
+            ),
+            "talkback_underrun_packets": int(
+                talkback_stats.get("underrun_packets", 0) or 0
+            ),
+            "talkback_dropped_frames": int(
+                talkback_stats.get("dropped_frames", 0) or 0
+            ),
+            "talkback_send_errors": int(
+                talkback_stats.get("send_errors", 0) or 0
+            ),
+            "talkback_send_gaps_over_30ms": int(
+                talkback_stats.get("send_gaps_over_30ms", 0) or 0
+            ),
+            "talkback_max_send_gap_ms": float(
+                talkback_stats.get("max_send_gap_ms", 0.0) or 0.0
             ),
             "talkback_owner": talkback_stats.get("owner") or "",
             "camera_count": self._camera_count,

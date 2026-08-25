@@ -14,11 +14,15 @@ to run as a regular asyncio task inside HA.  Single connection per
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import logging
 import re
+import secrets
 import socket
 import ssl
+import string
 import time
 import uuid
 import warnings
@@ -26,11 +30,15 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-_LOGGER = logging.getLogger(__name__)
+from .redaction import get_redacting_logger
+
+_LOGGER = get_redacting_logger(__name__)
 
 USER_AGENT = "LinphoneAndroid/3.10.9"
 DEFAULT_REGISTER_EXPIRES = 600
 _CAMERA_COUNT_RE = re.compile(r"(?:^|[\s;,])c:(\d+)(?:$|[\s;,])")
+_CUSTOM_CRYPTO_SUITE = "AES_CM_128_HMAC_SHA1_32"
+_CUSTOM_CRYPTO_KEY_ALPHABET = string.ascii_letters + string.digits
 
 
 @dataclass
@@ -156,15 +164,36 @@ class MediaDescription:
     rtpmap: dict[int, str] = field(default_factory=dict)
     fmtp: dict[int, str] = field(default_factory=dict)
     direction: str = ""  # sendrecv | sendonly | recvonly | inactive
+    rtcp_port: int | None = None
+    rtcp_ip: str = ""
+    rtcp_mux: bool = False
+    abb_encrypt: bool = False
+    abb_encrypt_key: bytes = field(default=b"", repr=False)
+    crypto_attribute_count: int = 0
+    crypto_tag: int | None = None
+    crypto_suite: str = ""
+    crypto_inline_key: bytes = field(default=b"", repr=False)
+    crypto_params: str = field(default="", repr=False)
+    crypto_b64_length: int = 0
+    crypto_key_printable: bool = False
+    crypto_has_session_params: bool = False
 
 
 @dataclass
 class ParsedSdp:
     session_ip: str = ""
     medias: list[MediaDescription] = field(default_factory=list)
+    crypto_attribute_count: int = 0
 
 
-def parse_sdp(body: bytes | str) -> ParsedSdp:
+_CRYPTO_ATTRIBUTE_RE = re.compile(
+    r"^a=crypto:(\d+)\s+(\S+)\s+inline:([^\s]+)(?:\s+(.*))?$"
+)
+
+
+def parse_sdp(
+    body: bytes | str, *, custom_media_crypto: bool = False
+) -> ParsedSdp:
     text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
     sdp = ParsedSdp()
     current: MediaDescription | None = None
@@ -201,6 +230,68 @@ def parse_sdp(body: bytes | str) -> ParsedSdp:
                 current.fmtp[int(pt_str)] = params.strip()
             except ValueError:
                 continue
+        elif current is not None and line.startswith("a=rtcp:"):
+            parts = line[len("a=rtcp:"):].strip().split()
+            try:
+                rtcp_port = int(parts[0])
+            except (IndexError, ValueError):
+                continue
+            if not 1 <= rtcp_port <= 65535:
+                continue
+            current.rtcp_port = rtcp_port
+            if (
+                len(parts) >= 4
+                and parts[1].upper() == "IN"
+                and parts[2].upper() == "IP4"
+            ):
+                current.rtcp_ip = parts[3]
+        elif current is not None and line.rstrip() == "a=rtcp-mux":
+            current.rtcp_mux = True
+        elif current is not None and line.startswith("a=abb_encrypt:"):
+            current.abb_encrypt = (
+                line[len("a=abb_encrypt:"):].strip() == "1"
+            )
+        elif current is not None and line.startswith("a=abb_encrypt_key:"):
+            current.abb_encrypt_key = line[
+                len("a=abb_encrypt_key:"):
+            ].strip().encode("utf-8")
+        elif current is not None and line.startswith("a=crypto:"):
+            current.crypto_attribute_count += 1
+            sdp.crypto_attribute_count += 1
+            if not custom_media_crypto:
+                continue
+            if current.crypto_attribute_count > 1:
+                raise ValueError("multiple SDP crypto attributes for one media")
+            if "\x00" in line:
+                raise ValueError("invalid SDP crypto attribute")
+            match = _CRYPTO_ATTRIBUTE_RE.fullmatch(line.rstrip())
+            if match is None:
+                raise ValueError("invalid SDP crypto attribute")
+            tag = int(match.group(1))
+            suite = match.group(2)
+            encoded_key = match.group(3).split("|", 1)[0]
+            try:
+                decoded_key = base64.b64decode(encoded_key, validate=True)
+            except (binascii.Error, ValueError) as err:
+                raise ValueError("invalid SDP crypto key encoding") from err
+            if base64.b64encode(decoded_key).decode("ascii") != encoded_key:
+                raise ValueError("invalid SDP crypto key encoding")
+            if len(decoded_key) not in (16, 24, 32) or b"\x00" in decoded_key:
+                raise ValueError("invalid SDP crypto key")
+            current.crypto_tag = tag
+            current.crypto_suite = suite
+            current.crypto_inline_key = decoded_key
+            current.crypto_params = (match.group(4) or "").strip()
+            current.crypto_b64_length = len(encoded_key)
+            current.crypto_key_printable = all(
+                0x20 <= byte < 0x7F for byte in decoded_key
+            )
+            current.crypto_has_session_params = bool(current.crypto_params)
+            if tag != 1:
+                continue
+            if current.proto.upper() in ("RTP/AVP", "RTP/AVPF"):
+                current.abb_encrypt = True
+                current.abb_encrypt_key = decoded_key
         elif current is not None and line.startswith("a=") and line[2:].rstrip() in (
             "sendrecv", "sendonly", "recvonly", "inactive"
         ):
@@ -211,8 +302,43 @@ def parse_sdp(body: bytes | str) -> ParsedSdp:
 @dataclass
 class Door:
     name: str
-    address: str
+    address: str = field(repr=False)
     station_id: str = ""
+    local_id: str = field(default="", repr=False)
+    exact_target: bool = False
+
+
+def _quote_display_name(value: str) -> str:
+    """Return a SIP quoted-string safe for use as a display name."""
+    sanitized = "".join(
+        char if ord(char) >= 0x20 and ord(char) != 0x7F else " "
+        for char in value
+    ).strip()
+    escaped = sanitized.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"' if escaped else ""
+
+
+def _door_sip_target(door: Door) -> tuple[str, str]:
+    """Return the request URI and To value for a door.
+
+    App-managed ACL addresses are complete Linphone targets and must be used
+    verbatim.  Legacy web-admin entries retain the historical ``user=phone``
+    URI parameter.
+    """
+    if door.exact_target:
+        request_uri = door.address
+        display_name = _quote_display_name(door.local_id) if door.local_id else ""
+        to_header = (
+            f"{display_name} <{request_uri}>" if display_name else f"<{request_uri}>"
+        )
+        return request_uri, to_header
+
+    request_uri = (
+        door.address
+        if ";user=phone" in door.address
+        else door.address + ";user=phone"
+    )
+    return request_uri, f"<{request_uri}>"
 
 
 @dataclass
@@ -220,6 +346,39 @@ class CallTarget:
     door: Door
     call_id: str
     created_at: float
+
+
+@dataclass(frozen=True)
+class MediaEncryptionKeys:
+    """Local per-media keys advertised for the remote RTP receive direction."""
+
+    audio: bytes = field(repr=False)
+    video: bytes = field(repr=False)
+
+
+def generate_media_encryption_keys() -> MediaEncryptionKeys:
+    """Generate independent printable AES-128 keys for one SIP dialog."""
+
+    def _key() -> bytes:
+        return "".join(
+            secrets.choice(_CUSTOM_CRYPTO_KEY_ALPHABET) for _ in range(16)
+        ).encode("ascii")
+
+    audio = _key()
+    video = _key()
+    while video == audio:
+        video = _key()
+    return MediaEncryptionKeys(audio=audio, video=video)
+
+
+def _custom_crypto_attribute(key: bytes) -> str:
+    """Build an app-managed SDP crypto attribute."""
+    if len(key) != 16 or not all(0x20 <= byte < 0x7F for byte in key):
+        raise ValueError("invalid local media encryption key")
+    return (
+        f"a=crypto:1 {_CUSTOM_CRYPTO_SUITE} inline:"
+        + base64.b64encode(key).decode("ascii")
+    )
 
 
 @dataclass
@@ -234,6 +393,7 @@ class CallState:
     audio_local_port: int
     video_local_port: int
     answer: ParsedSdp
+    local_send_keys: MediaEncryptionKeys | None = field(default=None, repr=False)
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -254,7 +414,11 @@ def _ssl_context() -> ssl.SSLContext:
 
 
 def _build_offer_sdp(
-    media_ip: str, audio_port: int, video_port: int, user: str
+    media_ip: str,
+    audio_port: int,
+    video_port: int,
+    user: str,
+    local_send_keys: MediaEncryptionKeys | None = None,
 ) -> str:
     """Build a Linphone-like audio+video SDP offer."""
     sid = int(time.time() * 1000)
@@ -278,6 +442,11 @@ def _build_offer_sdp(
             "a=fmtp:101 0-16",
             "a=rtcp-fb:* trr-int 1000",
             "a=rtcp-fb:* ccm tmmbr",
+            *(
+                [_custom_crypto_attribute(local_send_keys.audio)]
+                if local_send_keys is not None
+                else []
+            ),
             f"m=video {video_port} RTP/AVPF 96 97",
             "a=rtpmap:96 H264/90000",
             "a=fmtp:96 profile-level-id=42801F",
@@ -288,6 +457,11 @@ def _build_offer_sdp(
             "a=rtcp-fb:97 nack pli",
             "a=rtcp-fb:97 ccm fir",
             "a=rtcp-fb:97 ccm tmmbr",
+            *(
+                [_custom_crypto_attribute(local_send_keys.video)]
+                if local_send_keys is not None
+                else []
+            ),
             "",
         ]
     )
@@ -304,6 +478,7 @@ class IntercomDialer:
         domain: str,
         port: int = 5061,
         on_camera_count: Callable[[Door, int, str], None] | None = None,
+        custom_media_crypto: bool = False,
     ) -> None:
         self.host = host
         self.username = username
@@ -311,6 +486,7 @@ class IntercomDialer:
         self.domain = domain
         self.port = port
         self._on_camera_count = on_camera_count
+        self._custom_media_crypto = custom_media_crypto
 
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -722,21 +898,26 @@ class IntercomDialer:
     async def _dial_locked(
         self, door: Door, audio_port: int, video_port: int
     ) -> CallState:
-        base_addr = door.address
-        request_uri = (
-            base_addr if ";user=phone" in base_addr else base_addr + ";user=phone"
-        )
+        request_uri, to_header = _door_sip_target(door)
         local_tag = uuid.uuid4().hex[:8]
         call_id = uuid.uuid4().hex[:16] + "@" + self.domain
         invite_branch = "z9hG4bK-" + uuid.uuid4().hex[:12]
         from_header = f"<sip:{self.username}@{self.domain};transport=tls>"
-        to_header = f"<{request_uri}>"
         local_contact = f"<sip:{self.username}@{self._local_ip}:{self._local_port};transport=tls>"
         self._pending_camera_count_target = CallTarget(
             door=door, call_id=call_id, created_at=time.monotonic()
         )
 
-        sdp = _build_offer_sdp(self.media_ip, audio_port, video_port, self.username)
+        local_send_keys = (
+            generate_media_encryption_keys() if self._custom_media_crypto else None
+        )
+        sdp = _build_offer_sdp(
+            self.media_ip,
+            audio_port,
+            video_port,
+            self.username,
+            local_send_keys,
+        )
         invite_cseq = self._cseq
         headers = [
             f"Via: SIP/2.0/TLS {self._local_ip}:{self._local_port};branch={invite_branch};rport",
@@ -812,7 +993,54 @@ class IntercomDialer:
         await self._send_request("ACK", remote_contact or request_uri, ack_headers)
 
         try:
-            answer = parse_sdp(frame.body)
+            answer = parse_sdp(
+                frame.body, custom_media_crypto=self._custom_media_crypto
+            )
+            audio_key_bytes = next(
+                (
+                    len(media.crypto_inline_key)
+                    for media in answer.medias
+                    if media.media == "audio" and media.abb_encrypt
+                ),
+                0,
+            )
+            video_key_bytes = next(
+                (
+                    len(media.crypto_inline_key)
+                    for media in answer.medias
+                    if media.media == "video" and media.abb_encrypt
+                ),
+                0,
+            )
+            _LOGGER.info(
+                "[abb] dialer: SDP encryption metadata media_count=%d "
+                "crypto_attrs=%d crypto_parsed_media=%d crypto_activated_media=%d "
+                "audio_key_bytes=%d video_key_bytes=%d custom_crypto=%s",
+                len(answer.medias),
+                answer.crypto_attribute_count,
+                sum(1 for media in answer.medias if media.crypto_tag is not None),
+                sum(1 for media in answer.medias if media.abb_encrypt),
+                audio_key_bytes,
+                video_key_bytes,
+                self._custom_media_crypto,
+            )
+            for media in answer.medias:
+                if media.crypto_attribute_count == 0:
+                    continue
+                _LOGGER.info(
+                    "[abb] dialer: SDP crypto descriptor media_kind=%s "
+                    "proto=%s tag=%d suite=%s b64_len=%d decoded_len=%d "
+                    "printable_bool=%s has_session_params=%s activated=%s",
+                    media.media,
+                    media.proto,
+                    media.crypto_tag or 0,
+                    media.crypto_suite or "none",
+                    media.crypto_b64_length,
+                    len(media.crypto_inline_key),
+                    media.crypto_key_printable,
+                    media.crypto_has_session_params,
+                    media.abb_encrypt,
+                )
             self._call = CallState(
                 door=door,
                 call_id=call_id,
@@ -824,6 +1052,7 @@ class IntercomDialer:
                 audio_local_port=audio_port,
                 video_local_port=video_port,
                 answer=answer,
+                local_send_keys=local_send_keys,
             )
             self._pending_camera_count_target = None
             self._cseq += 1

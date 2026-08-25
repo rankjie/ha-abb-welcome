@@ -65,9 +65,10 @@ from .const import (
     GATEWAY_CLIENT_TYPE,
     GEO_URL,
 )
+from .redaction import get_redacting_logger
 from .text import decode_gateway_text, repair_utf8_mojibake
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_redacting_logger(__name__)
 
 DEFAULT_TIMEOUT = 30
 
@@ -90,18 +91,75 @@ def _log(level: int, msg: str, *args: Any) -> None:
 
 _TRUNCATE_LIMIT = 800
 _REDACT_JSON_RE = re.compile(
-    r'("(?:password|securitycode|client-csr)"\s*:\s*)"[^"]*"'
+    r'("(?:password|securitycode|client-csr|client-certificate|certificate|'
+    r'payload|uuid|sid|sender|destination|source|address|station_id|name)"\s*:\s*)'
+    r'("[^"]*"|\[[^\]]*\])',
+    re.IGNORECASE,
 )
 _REDACT_FORM_RE = re.compile(r'(password=)[^&\s]*')
+_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_IPV4_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+_IPV6_RE = re.compile(
+    r"\[(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\]"
+    r"|(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,7}"
+    r"[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:])"
+)
+_URL_HOST_RE = re.compile(
+    r"(?P<scheme>https?://)(?P<host>\[[^\]]+\]|[^/:?\s]+)",
+    re.IGNORECASE,
+)
+_PEM_RE = re.compile(
+    r"-----BEGIN [^-]+-----.*?-----END [^-]+-----", re.DOTALL
+)
+_SENSITIVE_TRACE_LABELS = ("cert/request", "connect", "acl-poll", "discovery")
+
+
+def _redact_url_host(match: re.Match[str]) -> str:
+    """Keep ABB portal hosts useful while hiding local gateway hostnames."""
+    host = match.group("host").strip("[]").lower()
+    if host == "abb.com" or host.endswith(".abb.com"):
+        return match.group(0)
+    return f"{match.group('scheme')}<redacted-host>"
 
 
 def _redact_body(text: str) -> str:
-    """Mask passwords / integrity codes / CSRs in a body string."""
+    """Mask credentials and device identifiers in a body string."""
     if not text:
         return text
     text = _REDACT_JSON_RE.sub(r'\1"***"', text)
     text = _REDACT_FORM_RE.sub(r'\1***', text)
+    text = _PEM_RE.sub("<redacted-pem>", text)
+    text = _UUID_RE.sub("<redacted-uuid>", text)
+    text = _IPV4_RE.sub("<redacted-ip>", text)
+    text = _IPV6_RE.sub("<redacted-ip>", text)
+    text = _URL_HOST_RE.sub(_redact_url_host, text)
     return text
+
+
+def _redact_headers(headers: Any) -> dict[str, str]:
+    """Return request/response headers without authentication material."""
+    redacted: dict[str, str] = {}
+    for key, value in dict(headers).items():
+        if key.lower() in {
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "set-cookie",
+        }:
+            redacted[key] = "***"
+        else:
+            redacted[key] = _redact_body(str(value))
+    return redacted
+
+
+def _trace_body(label: str, body: str) -> str:
+    """Never expose certificate, discovery, connect, or ACL event bodies."""
+    if any(label.startswith(prefix) for prefix in _SENSITIVE_TRACE_LABELS):
+        return "<redacted-sensitive-payload>"
+    return _truncate(_redact_body(body))
 
 
 def _truncate(text: str, limit: int = _TRUNCATE_LIMIT) -> str:
@@ -113,10 +171,8 @@ def _truncate(text: str, limit: int = _TRUNCATE_LIMIT) -> str:
 def _http_trace(resp: requests.Response, label: str = "") -> None:
     """Emit a DEBUG-level full request/response trace for ``resp``.
 
-    Logs request method/URL, request headers (Authorization redacted, Cookie
-    intact so session loss is visible), request body (secrets redacted,
-    truncated), then response status, headers (including ``Set-Cookie``),
-    and body (redacted, truncated).  Early-exits cheaply when DEBUG is off.
+    Cookies, authorization, identities, certificates, and event payloads are
+    never emitted. Early-exits cheaply when DEBUG is off.
     """
     if not _LOGGER.isEnabledFor(logging.DEBUG):
         return
@@ -131,26 +187,21 @@ def _http_trace(resp: requests.Response, label: str = "") -> None:
             body = repr(body)
     body_text = body or ""
 
-    req_headers = dict(req.headers)
-    if "Authorization" in req_headers:
-        scheme = req_headers["Authorization"].split(" ", 1)[0]
-        req_headers["Authorization"] = f"{scheme} ***"
-
-    _log(logging.DEBUG, "%s>> %s %s", tag, req.method, req.url)
-    _log(logging.DEBUG, "%s>> req headers: %s", tag, req_headers)
+    _log(logging.DEBUG, "%s>> %s %s", tag, req.method, _redact_body(req.url))
+    _log(logging.DEBUG, "%s>> req headers: %s", tag, _redact_headers(req.headers))
     if body_text:
         _log(logging.DEBUG, "%s>> req body: %s",
-             tag, _truncate(_redact_body(str(body_text))))
+             tag, _trace_body(label, str(body_text)))
 
     _log(logging.DEBUG, "%s<< HTTP %d %s (%d bytes)",
          tag, resp.status_code, resp.reason or "", len(resp.content))
-    _log(logging.DEBUG, "%s<< resp headers: %s", tag, dict(resp.headers))
+    _log(logging.DEBUG, "%s<< resp headers: %s", tag, _redact_headers(resp.headers))
     try:
         resp_text = decode_gateway_text(resp.content)
     except Exception as err:  # noqa: BLE001
         resp_text = f"<undecodable: {err}>"
     _log(logging.DEBUG, "%s<< resp body: %s",
-         tag, _truncate(_redact_body(resp_text)))
+         tag, _trace_body(label, resp_text))
 
 
 class PortalError(Exception):
@@ -162,7 +213,7 @@ def generate_keypair_and_csr(username: str) -> tuple[bytes, bytes, rsa.RSAPrivat
 
     Returns ``(private_key_pem, csr_pem, private_key_object)``.
     """
-    _log(logging.INFO, "[step 1/8] Generating RSA-2048 keypair + CSR (CN=%s)", username)
+    _log(logging.INFO, "[step 1/8] Generating RSA-2048 keypair + CSR")
     priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     priv_pem = priv.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -183,7 +234,7 @@ def generate_keypair_and_csr(username: str) -> tuple[bytes, bytes, rsa.RSAPrivat
 def resolve_portal_url(username: str) -> str:
     """Look up the regional portal URL via the GEO service."""
     sha = hashlib.sha256(username.encode()).hexdigest()
-    _log(logging.INFO, "[step 2/8] GEO lookup for username sha256=%s", sha)
+    _log(logging.INFO, "[step 2/8] GEO lookup (username hash redacted)")
     try:
         resp = requests.get(
             f"{GEO_URL}/api/config/services",
@@ -233,9 +284,9 @@ def request_certificate(
     if resp.status_code == 401:
         raise PortalError("Portal authentication failed (HTTP 401) — check MyBuildings username/password")
     if resp.status_code not in (200, 201):
-        _log(logging.ERROR, "Cert request failed body: %s", resp.text[:500])
+        _log(logging.ERROR, "Certificate request failed (body redacted)")
         raise PortalError(
-            f"Certificate request failed: HTTP {resp.status_code} {resp.text[:200]}"
+            f"Certificate request failed: HTTP {resp.status_code}"
         )
 
     body = resp.text.strip()
@@ -275,10 +326,7 @@ def derive_identity(cert_pem: bytes, portal_username: str) -> dict[str, str]:
         raise PortalError("Could not extract own_portal_uuid from certificate SAN")
 
     sip_username = f"{portal_username}_{gruu}"
-    _log(logging.INFO,
-        "Identity: sip_username=%s gruu=%s own_portal_uuid=%s sha1=%s",
-        sip_username, gruu, own_uuid, sha1[:16] + "...",
-    )
+    _log(logging.INFO, "Identity derived successfully (values redacted)")
     return {
         "fingerprint_sha1": sha1,
         "gruu": gruu,
@@ -305,7 +353,7 @@ def compute_integrity_code(fingerprint_sha1: str, rand: int | None = None) -> tu
     hhhh = hashlib.md5(f"{rand_str}:{decorated}".encode()).hexdigest().upper()[:4]
     eight = f"{rand_str}{hhhh}"
     display = f"{rand_str} {hhhh}"
-    _log(logging.INFO, "[step 5/8] Computed integrity code: %s (gateway will recompute and verify)", display)
+    _log(logging.INFO, "[step 5/8] Computed integrity code (value redacted)")
     return eight, display
 
 
@@ -404,11 +452,13 @@ def send_connect_event(
         "source": own_uuid,
         "payload": integrity_code,
     }
-    _log(logging.INFO,
-        "[step 6/8] POST %s/event type=%s destination=[%s] source=%s",
-        portal_url, EVENT_TYPE_CONNECT, gateway_uuid, own_uuid,
+    _log(
+        logging.INFO,
+        "[step 6/8] POST %s/event type=%s (identifiers redacted)",
+        portal_url,
+        EVENT_TYPE_CONNECT,
     )
-    _log(logging.DEBUG, "Connect event body id=%s timestamp=%s", body["id"], body["timestamp"])
+    _log(logging.DEBUG, "Connect event metadata redacted")
     session, temps = _mtls_session(cert_pem, key_pem)
     try:
         resp = session.post(
@@ -417,9 +467,9 @@ def send_connect_event(
         _http_trace(resp, "connect")
         _log(logging.INFO, "Connect event response: HTTP %d", resp.status_code)
         if resp.status_code not in (200, 201):
-            _log(logging.ERROR, "Connect event failure body: %s", resp.text[:500])
+            _log(logging.ERROR, "Connect event rejected (body redacted)")
             raise PortalError(
-                f"Connect event rejected: HTTP {resp.status_code} {resp.text[:200]}"
+                f"Connect event rejected: HTTP {resp.status_code}"
             )
     finally:
         session.close()
@@ -438,9 +488,13 @@ def poll_acl_update(
 
     Returns the base64-decoded payload as text, or None on timeout.
     """
-    _log(logging.INFO,
-        "[step 8/8] Polling /event?type=%s for own_uuid=%s (max %d attempts, %.1fs interval)",
-        EVENT_TYPE_ACL_UPDATE, own_uuid, attempts, interval,
+    _log(
+        logging.INFO,
+        "[step 8/8] Polling /event?type=%s (client id redacted; max %d "
+        "attempts, %.1fs interval)",
+        EVENT_TYPE_ACL_UPDATE,
+        attempts,
+        interval,
     )
     session, temps = _mtls_session(cert_pem, key_pem)
     try:
@@ -488,7 +542,10 @@ def parse_acl_update(
     """Decode an ACL-update payload.
 
     Returns ``(sip_password, sip_domain, doors)`` where each door includes
-    ``name``, ``address``, ``station_id``, and optional station metadata.
+    ``name``, ``address``, ``station_id``, and optional station metadata.  If
+    the ACL provides ``[network] localid``, it is copied to every door as
+    ``local_id`` because the official app uses it as the SIP target's display
+    name.
     """
     _log(logging.INFO, "Parsing ACL-update payload (%d bytes)", len(payload))
     lines = payload.splitlines()
@@ -519,6 +576,11 @@ def parse_acl_update(
         if config.has_section("network")
         else ""
     )
+    local_id = (
+        config.get("network", "localid", fallback="").strip()
+        if config.has_section("network")
+        else ""
+    )
 
     doors: list[dict[str, Any]] = []
     for sec in config.sections():
@@ -536,15 +598,21 @@ def parse_acl_update(
             "address": address,
             "station_id": station_id,
         }
+        if local_id:
+            door["local_id"] = local_id
         if station_type:
             door["type"] = station_type
             if station_type != "1":
                 door["can_unlock"] = False
         doors.append(door)
 
-    _log(logging.INFO, "ACL-update parsed: sip_domain=%s, %d door(s)", sip_domain, len(doors))
+    _log(
+        logging.INFO,
+        "ACL-update parsed: SIP domain redacted, %d door(s)",
+        len(doors),
+    )
     for d in doors:
-        _log(logging.DEBUG, "  door: %s -> %s", d["name"], d["address"])
+        _log(logging.DEBUG, "  door metadata redacted")
 
     if not sip_domain or not doors:
         raise PortalError("ACL-update payload missing network domain or doors")
@@ -640,8 +708,7 @@ def _gw_post(
         _http_trace(resp, f"gw{path}?op={op_label}[{variant}]")
         if resp.status_code != 200:
             raise GatewayAdminError(
-                f"{path} returned HTTP {resp.status_code}: "
-                f"{decode_gateway_text(resp.content)[:200]}"
+                f"{path} returned HTTP {resp.status_code} (body redacted)"
             )
 
         text = decode_gateway_text(resp.content).strip()
@@ -706,11 +773,11 @@ def _gateway_login(
     )
     _http_trace(resp, "checklogin")
     body = decode_gateway_text(resp.content).strip()
-    _log(logging.DEBUG, "Gateway login response: HTTP %d body=%r", resp.status_code, body)
+    _log(logging.DEBUG, "Gateway login response: HTTP %d (body redacted)", resp.status_code)
     if resp.status_code != 200 or body not in ("1", "2"):
         session.close()
         raise GatewayAdminError(
-            f"Gateway login failed (HTTP {resp.status_code}, body {body!r})"
+            f"Gateway login failed (HTTP {resp.status_code}; body redacted)"
         )
     cookie_names = list(session.cookies.keys())
     _log(logging.INFO,
@@ -744,7 +811,7 @@ def gateway_local_info(
     session = _gateway_login(gateway_ip, admin_username, admin_password)
     try:
         info = _gw_post(session, gateway_ip, "/cgi-bin/portalclient.cgi", {"op": "6"})
-        _log(logging.INFO, "Gateway op=6 returned: %s", info)
+        _log(logging.INFO, "Gateway op=6 returned gateway metadata (values redacted)")
         if isinstance(info.get("portalname"), str):
             info = {**info, "portalname": repair_utf8_mojibake(info["portalname"])}
         if "uuid" not in info:
@@ -776,7 +843,7 @@ def gateway_authorize(
     if permissions:
         perms.update(permissions)
 
-    _log(logging.INFO, "[step 7/8] Auto-approving pairing on gateway as friendlyname=%s", client_name)
+    _log(logging.INFO, "[step 7/8] Auto-approving pairing (client name redacted)")
     session = _gateway_login(gateway_ip, admin_username, admin_password)
     try:
         time.sleep(request_pause)
@@ -786,9 +853,6 @@ def gateway_authorize(
         listing = _gw_post(session, gateway_ip, "/cgi-bin/portalclient.cgi", {"op": "10"})
         apps = listing.get("apps") or []
         _log(logging.DEBUG, "Gateway lists %d apps", len(apps))
-        for app in apps:
-            _log(logging.DEBUG, "  app: sid=%s friendlyname=%s state=%s uuid=%s",
-                 app.get("sid"), app.get("friendlyname"), app.get("state"), app.get("uuid"))
         sid = ""
         for app in apps:
             if app.get("friendlyname") == client_name and app.get("state") == "unpaired":
@@ -799,34 +863,34 @@ def gateway_authorize(
                 f"No pending app named {client_name!r} on the gateway "
                 "(connect event may not have arrived yet — try again)"
             )
-        _log(logging.INFO, "Found pending app: sid=%s friendlyname=%s", sid, client_name)
+        _log(logging.INFO, "Found pending app (identifiers redacted)")
         time.sleep(request_pause)
 
         # 3. Save permissions for the pending entry (op=2).
         perms_body = {"op": "2", "sid": sid, "state": "unpaired", **perms}
-        _log(logging.INFO, "Setting permissions via op=2 for sid=%s: %s", sid, perms)
+        _log(logging.INFO, "Setting permissions for pending app (identifiers redacted)")
         perms_result = _gw_post(
             session, gateway_ip, "/cgi-bin/portalclient.cgi", perms_body
         )
-        _log(logging.DEBUG, "op=2 returned %r", perms_result)
+        _log(logging.DEBUG, "op=2 returned a response (body redacted)")
         if perms_result.get("result") != 1:
             raise GatewayAdminError(
-                f"Setting permissions failed: gateway returned {perms_result!r}"
+                "Setting permissions failed (gateway body redacted)"
             )
         time.sleep(request_pause)
 
         # 4. Submit the integrity code (op=3).
-        _log(logging.INFO, "Submitting integrity code via op=3 for sid=%s", sid)
+        _log(logging.INFO, "Submitting integrity code for pending app")
         code_body = {"op": "3", "sid": sid, "securitycode": integrity_code}
         code_result = _gw_post(
             session, gateway_ip, "/cgi-bin/portalclient.cgi", code_body
         )
-        _log(logging.DEBUG, "op=3 returned %r", code_result)
+        _log(logging.DEBUG, "op=3 returned a response (body redacted)")
         if code_result.get("result") != 1:
             raise GatewayAdminError(
-                f"Integrity code rejected: gateway returned {code_result!r}"
+                "Integrity code rejected (gateway body redacted)"
             )
-        _log(logging.INFO, "Gateway accepted integrity code; sid=%s now paired", sid)
+        _log(logging.INFO, "Gateway accepted integrity code; app is paired")
         return sid
     finally:
         session.close()

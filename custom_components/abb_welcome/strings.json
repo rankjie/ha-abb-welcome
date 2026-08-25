@@ -2,19 +2,45 @@
   "config": {
     "step": {
       "user": {
-        "title": "ABB Welcome",
-        "description": "Pair this Home Assistant instance with your ABB Welcome IP gateway.\n\nRequired fields:\n• MyBuildings portal username and password (same as the official ABB Welcome mobile app).\n• Gateway local IP address.\n• Gateway web admin password (the one used at https://gateway-ip/).\n\nOptional:\n• Gateway Portal UUID — only fill this in if the automatic setup fails (some firmware versions have a broken portal-client endpoint). You can find this value in the gateway web admin under the Portal page (label “Portal Client UUID”), or in the ABB Welcome mobile app settings. Leave blank otherwise.\n\nAfter you submit, the integration finishes pairing automatically — no need to open the gateway web admin yourself.",
+        "title": "Choose ABB Welcome device type",
+        "description": "Choose **Web-admin IP gateway** for an ABB 83342/MRANGE gateway with a local web admin. Choose **App-managed Wi-Fi indoor station** for an M2240x/ASI22 device managed through MyBuildings/Welcome.",
         "data": {
-          "abb_username": "Portal Username",
-          "abb_password": "Portal Password",
-          "gateway_ip": "Gateway IP Address",
-          "gateway_password": "Gateway Admin Password",
-          "gateway_uuid_override": "Gateway Portal UUID (optional)"
+          "gateway_profile": "Device type"
+        }
+      },
+      "credentials": {
+        "title": "ABB Welcome credentials",
+        "description": "Enter the credentials required for the selected {profile} profile. App-managed devices require the MyBuildings system ID as Gateway Portal UUID and are checked on SIP-TLS port 5061; no gateway admin password is used or stored.",
+        "data": {
+          "abb_username": "MyBuildings username",
+          "abb_password": "MyBuildings password",
+          "gateway_ip": "Local device IP address",
+          "gateway_password": "Gateway admin password",
+          "gateway_uuid_override": "Gateway Portal UUID / MyBuildings system ID"
         }
       },
       "manual_authorize": {
         "title": "Approve pairing on the gateway",
         "description": "Auto-approval failed, but the pairing request was sent successfully and is waiting on your gateway. Please finish the approval manually:\n\n1. Open https://{gateway_ip}/ in a browser and log in as `admin`.\n2. Navigate to the **Portal / Portal Client** page.\n3. Find the pending app named:\n\n    **{client_name}**\n\n4. When prompted for an integrity code, enter:\n\n    **{integrity_code}**\n\n5. Confirm / Approve in the gateway UI.\n6. Click **Submit** below to continue.\n\nHome Assistant will wait up to 5 minutes for the gateway to confirm the pairing.\n\n_Diagnostic detail: {error_detail}_"
+      },
+      "app_authorize": {
+        "title": "Waiting for automatic app pairing",
+        "description": "No ACL update has arrived yet for:\n\n**Client:** {client_name}\n\n**Integrity code:** {integrity_code}\n\nM2240x/ASI22 stations normally pair an additional app automatically when it uses the same MyBuildings account. The M22403-W has no panel approval screen; the generic ABB email mentioning panel approval also covers other products. If the official Welcome app shows this client as paired, do not unpair it. If it shows the station as unpaired and offers **Resend pairing request**, use that option. Wait a moment, then click **Submit** to poll again with the same saved identity."
+      },
+      "pending_pairing": {
+        "title": "Recover unfinished pairing",
+        "description": "Home Assistant has a saved app-managed pairing request. Resuming immediately polls for its ACL update, reuses the existing certificate, and does not send another pairing request.\n\n**Client:** {client_name}\n\n**Integrity code:** {integrity_code}\n\nChoose **Resume saved pairing** unless this client has already been removed from the Welcome client list and MyBuildings.",
+        "data": {
+          "pending_pairing_action": "Recovery action"
+        }
+      },
+      "discard_pending_pairing": {
+        "title": "Discard saved pairing?",
+        "description": "This permanently forgets the saved Home Assistant key and certificate. The associated client cannot be recovered afterward. First remove or unpair that client from the official Welcome app/client management and MyBuildings, then click **Submit** to confirm."
+      },
+      "pending_pairing_invalid": {
+        "title": "Saved pairing cannot be recovered",
+        "description": "The saved pending identity is unreadable or from an unsupported storage version. Its contents have not been logged. Remove the orphaned Home Assistant client from the official Welcome app/client management and MyBuildings, then click **Submit** to clear the unusable state and start again."
       },
       "confirm": {
         "title": "Confirm Setup",
@@ -23,6 +49,7 @@
     },
     "error": {
       "cannot_connect": "Cannot reach the gateway web admin on HTTPS port 443. Check the IP address and that Home Assistant is on the same network.",
+      "sip_tls_unavailable": "Cannot reach SIP-TLS port 5061 on the app-managed device. Check the IP address, device Wi-Fi, and network routing.",
       "invalid_auth": "Invalid portal credentials.",
       "gateway_not_found": "No IP gateway is visible to this portal account.",
       "gateway_admin_auth_failed": "Gateway admin password is wrong (login at https://gateway-ip/ as `admin` failed).",
@@ -31,12 +58,16 @@
       "gateway_admin_failed": "Talking to the gateway admin CGI failed — see the Home Assistant log.",
       "gateway_op6_failed": "Could not read the gateway's portal UUID. Some firmware versions have a broken portal-client endpoint. Fill in the optional 'Gateway Portal UUID' field and try again.",
       "invalid_uuid": "Gateway Portal UUID must look like 8d24f178-9c41-4aed-97e1-6008bb6aef82 (8-4-4-4-12 hex). Leave blank to auto-detect.",
+      "uuid_required": "A valid Gateway Portal UUID / MyBuildings system ID is required for app-managed devices.",
+      "invalid_profile": "Choose one of the supported device types.",
+      "acl_timeout_retry": "No ACL update arrived yet. Wait for automatic app pairing or use Resend pairing request in the official Welcome app if offered, then submit again; the saved identity will be reused.",
       "unknown": "Unexpected error — see the Home Assistant log."
     },
     "abort": {
       "already_configured": "This gateway is already configured.",
       "acl_timeout": "The gateway did not push a configuration after pairing. Try again.",
       "acl_parse_failed": "The gateway sent a configuration but it could not be parsed. Check the Home Assistant log.",
+      "pending_storage_failed": "Home Assistant could not securely save or clear the pending pairing identity. No new pairing should be started; check the Home Assistant storage/log state.",
       "unknown": "Unexpected error during ACL polling — see the Home Assistant log."
     }
   },
@@ -44,22 +75,39 @@
     "step": {
       "init": {
         "title": "ABB Welcome options",
-        "description": "Door unlock behavior and the LAN RTSP endpoint used by Scrypted/HomeKit.",
+        "description": "Door unlock behavior and the LAN RTSP endpoint used by Scrypted/HomeKit. On app-managed devices, Hybrid requires the physical panel default door to be selected explicitly. Home Assistant cannot discover this setting.",
         "data": {
           "unlock_strategy": "Unlock strategy",
+          "default_unlock_station_id": "Physical default door for Hybrid fast path",
           "lan_rtsp_host": "Advertised Home Assistant LAN host (blank = auto)",
           "lan_rtsp_port": "Preferred LAN RTSP proxy port",
           "allow_pickup": "Allow pickup from streams"
         }
       }
+    },
+    "error": {
+      "fast_multi_door_unsupported": "Fast cannot safely target a specific door on an app-managed device with multiple doors. Use Standard, or Hybrid with the physical default door selected.",
+      "invalid_default_unlock_station": "Select the door configured as the physical indoor panel default before enabling Hybrid."
     }
   },
   "selector": {
+    "gateway_profile": {
+      "options": {
+        "web_admin": "Web-admin IP gateway (83342 / MRANGE)",
+        "app_managed": "App-managed Wi-Fi indoor station (M2240x / ASI22)"
+      }
+    },
+    "pending_pairing_action": {
+      "options": {
+        "resume": "Resume saved pairing",
+        "discard": "Discard saved pairing"
+      }
+    },
     "unlock_strategy": {
       "options": {
-        "hybrid": "Hybrid (fast for first door, standard for others) — recommended",
+        "hybrid": "Hybrid (app-managed physical default; web-admin first door)",
         "fast": "Fast (always plain MESSAGE) — lowest latency, may not work everywhere",
-        "standard": "Standard (always INVITE first) — most compatible"
+        "standard": "Standard (always INVITE first) — app-managed default"
       }
     }
   }

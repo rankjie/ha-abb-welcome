@@ -1,19 +1,19 @@
 """Button platform for ABB Welcome door unlock."""
 
-import logging
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import ABBWelcomeCoordinator
+from .device import gateway_device_info
+from .redaction import get_redacting_logger
 
-_LOGGER = logging.getLogger(__name__)
+_LOGGER = get_redacting_logger(__name__)
 
 
 def _door_can_unlock(door: dict) -> bool:
@@ -50,15 +50,20 @@ async def async_setup_entry(
     sip_client = data["sip_client"]
     coordinator: ABBWelcomeCoordinator | None = data.get("coordinator")
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
+    device_info = gateway_device_info(entry.data)
     doors = entry.data.get("doors", [])
 
     entities: list[ButtonEntity] = [
-        ABBWelcomeDoorButton(sip_client, door, gateway_uuid, entry.entry_id)
+        ABBWelcomeDoorButton(
+            sip_client, door, gateway_uuid, entry.entry_id, device_info
+        )
         for door in doors
         if _door_can_unlock(door)
     ]
     if coordinator is not None and coordinator.has_certs:
-        entities.append(ABBWelcomeRefreshButton(coordinator, gateway_uuid))
+        entities.append(
+            ABBWelcomeRefreshButton(coordinator, gateway_uuid, device_info)
+        )
     async_add_entities(entities)
 
 
@@ -68,17 +73,14 @@ class ABBWelcomeDoorButton(ButtonEntity):
     _attr_icon = "mdi:door-open"
     _attr_has_entity_name = True
 
-    def __init__(self, sip_client, door: dict, gateway_uuid: str, entry_id: str) -> None:
+    def __init__(
+        self, sip_client, door: dict, gateway_uuid: str, entry_id: str, device_info
+    ) -> None:
         self._sip_client = sip_client
         self._door = door
         self._attr_name = door["name"]
         self._attr_unique_id = f"{gateway_uuid}_{_door_station_key(door)}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = device_info
 
     async def async_press(self) -> None:
         """Unlock the door."""
@@ -106,15 +108,12 @@ class ABBWelcomeRefreshButton(ButtonEntity):
     _attr_name = "Refresh Events"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
-    def __init__(self, coordinator: ABBWelcomeCoordinator, gateway_uuid: str) -> None:
+    def __init__(
+        self, coordinator: ABBWelcomeCoordinator, gateway_uuid: str, device_info
+    ) -> None:
         self._coordinator = coordinator
         self._attr_unique_id = f"{gateway_uuid}_refresh_events"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, gateway_uuid)},
-            name="ABB Welcome Gateway",
-            manufacturer="ABB / Busch-Jaeger",
-            model="IP Gateway (MRANGE)",
-        )
+        self._attr_device_info = device_info
 
     async def async_press(self) -> None:
         await self._coordinator.async_request_refresh()
