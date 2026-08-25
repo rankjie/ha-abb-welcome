@@ -314,6 +314,12 @@ async def _async_start_rtsp_proxy(
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up ABB Welcome from a config entry."""
+    try:
+        gateway_capabilities(entry.data)
+    except ValueError:
+        _LOGGER.error("[abb] refusing config entry with an unsupported gateway profile")
+        return False
+
     # Repair names persisted by older versions before entities are created.
     _repair_entry_door_names(hass, entry)
 

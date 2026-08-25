@@ -111,11 +111,13 @@ GATEWAY_CAPABILITIES = {
 
 
 def gateway_profile(data: Mapping[str, object]) -> str:
-    """Return a persisted profile, defaulting legacy entries to web-admin."""
-    value = data.get(CONF_GATEWAY_PROFILE, GATEWAY_PROFILE_WEB_ADMIN)
-    if value not in GATEWAY_CAPABILITIES:
+    """Return a supported persisted profile, defaulting only legacy entries."""
+    value = data.get(CONF_GATEWAY_PROFILE)
+    if value is None or value == "":
         return GATEWAY_PROFILE_WEB_ADMIN
-    return str(value)
+    if not isinstance(value, str) or value not in GATEWAY_CAPABILITIES:
+        raise ValueError(f"Unsupported ABB Welcome gateway profile: {value!r}")
+    return value
 
 
 def gateway_capabilities(data: Mapping[str, object]) -> GatewayCapabilities:
