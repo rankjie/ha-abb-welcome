@@ -53,13 +53,18 @@ async def async_setup_entry(
     device_info = gateway_device_info(entry.data)
     doors = entry.data.get("doors", [])
 
-    entities: list[ButtonEntity] = [
-        ABBWelcomeDoorButton(
+    entities: list[ButtonEntity] = []
+    for door in doors:
+        if not _door_can_unlock(door):
+            continue
+        entities.append(ABBWelcomeDoorButton(
             sip_client, door, gateway_uuid, entry.entry_id, device_info
-        )
-        for door in doors
-        if _door_can_unlock(door)
-    ]
+        ))
+        if door.get("second_lock") is True:
+            entities.append(ABBWelcomeDoorButton(
+                sip_client, door, gateway_uuid, entry.entry_id, device_info,
+                second_lock=True,
+            ))
     if coordinator is not None and coordinator.has_certs:
         entities.append(
             ABBWelcomeRefreshButton(coordinator, gateway_uuid, device_info)
@@ -74,19 +79,25 @@ class ABBWelcomeDoorButton(ButtonEntity):
     _attr_has_entity_name = True
 
     def __init__(
-        self, sip_client, door: dict, gateway_uuid: str, entry_id: str, device_info
+        self, sip_client, door: dict, gateway_uuid: str, entry_id: str, device_info,
+        *, second_lock: bool = False,
     ) -> None:
         self._sip_client = sip_client
         self._door = door
+        self._second_lock = second_lock
         self._attr_name = door["name"]
         self._attr_unique_id = f"{gateway_uuid}_{_door_station_key(door)}"
+        if second_lock:
+            self._attr_name = f"{door['name']} Second lock"
+            self._attr_unique_id += "_second_lock"
         self._attr_device_info = device_info
 
     async def async_press(self) -> None:
         """Unlock the door."""
         _LOGGER.debug("Unlocking door: %s", self._attr_name)
+        args = (self._door, "a") if self._second_lock else (self._door,)
         success = await self.hass.async_add_executor_job(
-            self._sip_client.unlock_door, self._door
+            self._sip_client.unlock_door, *args
         )
         if not success:
             raise HomeAssistantError(

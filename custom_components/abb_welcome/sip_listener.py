@@ -39,6 +39,7 @@ from .intercom_dialer import (
     generate_media_encryption_keys,
     parse_sdp,
 )
+from .message_diagnostics import MAX_MESSAGE_DIAGNOSTICS_SECONDS, redact_message_body
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -154,10 +155,9 @@ def _safe_content_type(headers: list[tuple[str, str]]) -> str | None:
 def _summarise_frame(frame: "_SipFrame") -> dict[str, Any]:
     """Return privacy-safe protocol metadata for an HA event payload.
 
-    SIP headers, URIs, dialog identifiers, bodies, and the decoded wire frame
-    contain private installation data and credentials.  They deliberately do
-    not cross the Home Assistant event-bus boundary.  Byte counts and a small
-    allow-list of fixed protocol labels retain enough detail for diagnostics.
+    Raw frames can contain private installation data and credentials. The
+    regular frame event carries byte counts and fixed protocol labels only;
+    optional sanitized MESSAGE diagnostics use a separate event.
     """
     summary: dict[str, Any] = {
         "is_response": frame.is_response,
@@ -470,6 +470,7 @@ class SipListener:
         on_state_change: Callable[[str], None] | None = None,
         on_frame: FrameCallback | None = None,
         on_message: MessageCallback | None = None,
+        on_message_diagnostic: FrameCallback | None = None,
         custom_media_crypto: bool = False,
     ) -> None:
         if transport not in ("tls", "tcp"):
@@ -484,6 +485,8 @@ class SipListener:
         self._on_state_change = on_state_change
         self._on_frame = on_frame
         self._on_message = on_message
+        self._on_message_diagnostic = on_message_diagnostic
+        self._message_diagnostics_until = 0.0
         self._custom_media_crypto = custom_media_crypto
 
         self._task: asyncio.Task[None] | None = None
@@ -502,6 +505,12 @@ class SipListener:
         self._dialog_lock = asyncio.Lock()
 
     # ----- Public lifecycle -----
+
+    def enable_message_diagnostics(self, duration: int) -> None:
+        """Publish sanitized MESSAGE bodies temporarily; zero disables it."""
+        if type(duration) is not int or not 0 <= duration <= MAX_MESSAGE_DIAGNOSTICS_SECONDS:
+            raise ValueError("MESSAGE diagnostic duration must be 0-600 seconds")
+        self._message_diagnostics_until = time.monotonic() + duration if duration else 0.0
 
     @property
     def state(self) -> str:
@@ -750,6 +759,7 @@ class SipListener:
         until the original Expires window runs out.  Best-effort — we
         absorb any failure to avoid blocking unload.
         """
+        self._message_diagnostics_until = 0.0
         self._stop_event.set()
         if self._writer is not None and self._state == "registered":
             try:
@@ -984,13 +994,19 @@ class SipListener:
             _LOGGER.debug("[abb] on_frame callback raised: %s", err)
 
     def _emit_message(self, frame: "_SipFrame") -> None:
-        """Pass an inbound MESSAGE to internal consumers outside the HA bus."""
-        if self._on_message is None:
-            return
-        try:
-            self._on_message(frame)
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("[abb] on_message callback raised: %s", err)
+        """Deliver raw MESSAGEs internally and opt-in sanitized diagnostics."""
+        if self._on_message is not None:
+            try:
+                self._on_message(frame)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("[abb] on_message callback raised: %s", err)
+        if (self._on_message_diagnostic is not None
+                and time.monotonic() < self._message_diagnostics_until):
+            self._on_message_diagnostic({
+                **redact_message_body(frame.body),
+                "body_bytes": len(frame.body),
+                "received_at": time.time(),
+            })
 
     async def _dispatch(
         self,
@@ -1007,8 +1023,8 @@ class SipListener:
             await self._respond(writer, frame, 200, "OK")
         elif method == "MESSAGE":
             # Some gateways push status MESSAGEs (e.g. door-open broadcasts).
-            # Deliver the private parsed frame only to the internal callback;
-            # the HA event receives the metadata-only summary emitted above.
+            # Raw frames remain internal. Regular frame events contain only
+            # metadata; explicitly enabled diagnostics get a sanitized body.
             self._emit_message(frame)
             _LOGGER.debug("[abb] Inbound MESSAGE (%d body bytes)", len(frame.body))
             await self._respond(writer, frame, 200, "OK")

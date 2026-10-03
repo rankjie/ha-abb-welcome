@@ -45,6 +45,10 @@ from .const import (
     topology_refresh_error,
 )
 from .coordinator import ABBWelcomeCoordinator
+from .message_diagnostics import (
+    DEFAULT_MESSAGE_DIAGNOSTICS_SECONDS,
+    MAX_MESSAGE_DIAGNOSTICS_SECONDS,
+)
 from .redaction import get_redacting_logger
 from .rtsp_proxy import RtspTcpProxy
 from .sip_client import SIPClient
@@ -182,7 +186,7 @@ _RELOAD_OPTION_KEYS = (
 )
 
 POLL_INTERVAL = timedelta(seconds=30)
-PRESERVED_DOOR_METADATA_KEYS = ("type", "can_unlock")
+PRESERVED_DOOR_METADATA_KEYS = ("type", "can_unlock", "second_lock")
 _CAMERA_COUNT_MESSAGE_RE = re.compile(r"(?:^|[\s;,])c:(\d+)(?:$|[\s;,])")
 _SIP_URI_USER_RE = re.compile(r"sip:([^@;>]+)")
 
@@ -194,6 +198,7 @@ EVENT_RING = f"{DOMAIN}_ring"
 # Useful for protocol investigation / debugging — subscribe in an
 # automation or via the Developer Tools "Events" listener.
 EVENT_SIP_FRAME = f"{DOMAIN}_sip_frame"
+EVENT_SIP_MESSAGE = f"{DOMAIN}_sip_message"
 
 # Bus event fired whenever the SIP listener transitions state
 # (stopped/connecting/registered/disconnected).
@@ -436,6 +441,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
                 sensor.record_frame(payload.get("direction", ""), is_invite)
 
+        def _on_message_diagnostic(payload: dict) -> None:
+            hass.bus.async_fire(EVENT_SIP_MESSAGE, {"entry_id": entry.entry_id, **payload})
+
         def _on_message(frame) -> None:
             """Handle private MESSAGE content without putting it on the HA bus."""
             body = frame.body.decode("utf-8", errors="replace").strip()
@@ -542,6 +550,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             on_ring=_on_ring,
             on_frame=_on_frame,
             on_message=_on_message,
+            on_message_diagnostic=_on_message_diagnostic,
             on_state_change=_on_state_change,
             custom_media_crypto=(
                 gateway_profile(entry.data) == GATEWAY_PROFILE_APP_MANAGED
@@ -593,6 +602,7 @@ SERVICE_TALK_START = "talk_start"
 SERVICE_TALK_STOP = "talk_stop"
 SERVICE_TALK_PCM16LE = "talk_pcm16le"
 SERVICE_TALK_TONE = "talk_tone"
+SERVICE_DIAGNOSE_MESSAGES = "diagnose_messages"
 EXPORT_FIELDS = (
     "gateway_ip",
     "sip_username",
@@ -673,6 +683,11 @@ def _parse_gateway_doors(raw: str, sip_domain: str) -> list[dict]:
                 "index": len(doors),
             }
         )
+        if len(parts) >= 4 and parts[3].strip():
+            second_unlock = parts[3].strip()
+            if second_unlock not in ("0", "1"):
+                raise ValueError("Invalid second-lock capability in gateway device list")
+            doors[-1]["second_lock"] = second_unlock == "1"
     return doors
 
 
@@ -698,7 +713,7 @@ def _fetch_doors_from_gateway(
 
 def _doors_equal(a: list[dict], b: list[dict]) -> bool:
     """Compare door lists ignoring persisted index metadata."""
-    keys = ("name", "address", "station_id", "body", "type", "can_unlock")
+    keys = ("name", "address", "station_id", "body", "type", "can_unlock", "second_lock")
     return [tuple(door.get(key) for key in keys) for door in a] == [
         tuple(door.get(key) for key in keys) for door in b
     ]
@@ -888,6 +903,35 @@ def _async_register_services(hass: HomeAssistant) -> None:
 
     Registration is idempotent and safe on every entry setup.
     """
+    if not hass.services.has_service(DOMAIN, SERVICE_DIAGNOSE_MESSAGES):
+
+        async def _diagnose_messages(call: ServiceCall) -> None:
+            entries = hass.data.get(DOMAIN, {})
+            target = call.data.get("entry_id")
+            if not entries:
+                raise HomeAssistantError("No ABB Welcome config entries are loaded")
+            if target and target not in entries:
+                raise HomeAssistantError("ABB Welcome config entry is not loaded")
+            selected = [entries[target]] if target else list(entries.values())
+            listeners = [data.get("sip_listener") for data in selected]
+            if any(listener is None for listener in listeners):
+                raise HomeAssistantError("Selected ABB Welcome entry has no SIP listener")
+            duration = call.data.get("duration", DEFAULT_MESSAGE_DIAGNOSTICS_SECONDS)
+            for listener in listeners:
+                listener.enable_message_diagnostics(duration)
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_DIAGNOSE_MESSAGES,
+            _diagnose_messages,
+            schema=vol.Schema({
+                vol.Optional("entry_id"): str,
+                vol.Optional("duration", default=DEFAULT_MESSAGE_DIAGNOSTICS_SECONDS): vol.All(
+                    vol.Coerce(int), vol.Range(min=0, max=MAX_MESSAGE_DIAGNOSTICS_SECONDS)
+                ),
+            }),
+        )
+
     if not hass.services.has_service(DOMAIN, SERVICE_EXPORT_CREDENTIALS):
 
         async def _export_creds(call: ServiceCall) -> None:

@@ -21,6 +21,32 @@ export_credentials:
       selector:
         text:
 
+diagnose_messages:
+  name: Diagnose SIP messages
+  description: >-
+    Temporarily publish sanitized inbound SIP MESSAGE bodies as
+    abb_welcome_sip_message events. Known commands and button parameters are
+    retained; unknown values and private fields are masked. Disabled by default
+    and cleared on reload. Use duration 0 to stop.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Optional config-entry ID. Defaults to all loaded entries.
+      required: false
+      selector:
+        text:
+    duration:
+      name: Duration
+      description: Diagnostic window in seconds. Zero stops diagnostics.
+      default: 300
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 600
+          mode: box
+          unit_of_measurement: s
+
 refresh_doors:
   name: Refresh outdoor stations
   description: >-

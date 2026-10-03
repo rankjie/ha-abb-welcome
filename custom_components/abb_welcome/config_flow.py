@@ -365,7 +365,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             return pending_result
 
         if user_input is not None:
-            self._username = user_input[CONF_ABB_USERNAME].strip()
+            self._username = user_input[CONF_ABB_USERNAME].strip().lower()
             self._password = user_input[CONF_ABB_PASSWORD]
             self._gateway_ip = user_input[CONF_GATEWAY_IP].strip()
             self._gateway_password = user_input.get(CONF_GATEWAY_PASSWORD, "")
@@ -696,6 +696,8 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 door["type"] = d["type"]
             if d.get("can_unlock") is False:
                 door["can_unlock"] = False
+            if "second_lock" in d:
+                door["second_lock"] = d["second_lock"]
             self._doors.append(door)
 
         capabilities = GATEWAY_CAPABILITIES[self._gateway_profile]

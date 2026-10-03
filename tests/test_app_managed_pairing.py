@@ -8,6 +8,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 _PKG_DIR = Path(__file__).resolve().parent.parent / "custom_components" / "abb_welcome"
 
 
@@ -145,6 +147,41 @@ class _FakeHass:
 
     async def async_add_executor_job(self, function, *args):
         return function(*args)
+
+
+@pytest.mark.parametrize("profile", ["web_admin", "app_managed"])
+@pytest.mark.parametrize(
+    ("supplied", "expected"),
+    [
+        ("synthetic.user@example.invalid", "synthetic.user@example.invalid"),
+        ("Synthetic.User@Example.Invalid", "synthetic.user@example.invalid"),
+        ("  Synthetic.User@Example.Invalid  ", "synthetic.user@example.invalid"),
+    ],
+)
+def test_certificate_request_normalizes_username_only(profile, supplied, expected):
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = profile
+    module._gateway_port_reachable = lambda *_args: True
+    module.generate_keypair_and_csr = lambda *_args: (b"synthetic-key", b"csr", None)
+    module.resolve_portal_url = lambda *_args: "https://portal.example.invalid"
+    observed = []
+
+    def request_certificate(_url, username, password, *_args):
+        observed.append((username, password))
+        raise module.PortalError("HTTP 401")
+
+    module.request_certificate = request_certificate
+    result = asyncio.run(flow.async_step_credentials({
+        module.CONF_ABB_USERNAME: supplied,
+        module.CONF_ABB_PASSWORD: "  Synthetic-Password  ",
+        module.CONF_GATEWAY_IP: "192.0.2.10",
+        module.CONF_GATEWAY_UUID_OVERRIDE: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    }))
+
+    assert observed == [(expected, "  Synthetic-Password  ")]
+    assert result["errors"]["base"] == "invalid_auth"
 
 
 def _seed_pending_pairing(module, hass):
@@ -570,6 +607,7 @@ def test_acl_parsing_builds_doors_before_confirmation() -> None:
                 "station_id": "100000001",
                 "local_id": "synthetic-local-client",
                 "type": "1",
+                "second_lock": True,
             }
         ],
     )
@@ -585,6 +623,7 @@ def test_acl_parsing_builds_doors_before_confirmation() -> None:
             "body": "1",
             "index": 0,
             "type": "1",
+            "second_lock": True,
         }
     ]
 

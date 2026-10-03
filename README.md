@@ -26,7 +26,8 @@ doorbell notifications, and two-way audio.
 
 ## Features
 
-- One Home Assistant **button entity per unlock-capable outdoor station**.
+- One Home Assistant **button entity per unlock-capable outdoor station**,
+  plus a **Second lock** button when the station reports that capability.
 - **Camera entities** for discovered door stations, backed by HA's bundled
   go2rtc/WebRTC path.
 - **LAN H.264 video + PCMA/G.711 audio** for live intercom streams.
@@ -363,6 +364,54 @@ uses that event to refresh its station list and RTSP URLs.
 - `abb_welcome.talk_tone` - send a short generated tone for testing.
 - `abb_welcome.export_credentials` - export stored SIP/gateway credentials to a
   JSON file for local debugging. This output contains secrets.
+- `abb_welcome.diagnose_messages` - temporarily publish sanitized inbound SIP
+  MESSAGE bodies for protocol investigation. Disabled by default; accepts an
+  optional `entry_id` and a `duration` of 0–600 seconds (default 300). Zero stops
+  diagnostics, and an integration reload clears the window.
+
+## SIP MESSAGE Diagnostics
+
+To investigate physical programmable buttons, open **Developer Tools → Events**
+and start listening to `abb_welcome_sip_message`. Then run this action in
+**Developer Tools → Actions**:
+
+```yaml
+action: abb_welcome.diagnose_messages
+data:
+  duration: 300
+```
+
+Press the configured physical button several times, with a few seconds between
+presses. Record the press times and the resulting events. Compare different
+unused actuator addresses and both buttons. Supplying `entry_id` restricts the
+diagnostic window to that integration entry.
+
+Each event contains `entry_id`, `received_at`, `body_bytes`, `body_format`,
+`body_redacted`, and a sanitized `body` string. Known SIP commands and supported
+button parameters, such as button ID, function and actuator address, remain
+readable. Private fields, unknown values and unknown JSON field names are
+masked; an unrecognized text body may therefore show only `<redacted>`.
+Binary bodies and bodies larger than 4096 bytes are omitted. SIP headers,
+authentication data and media keys are not published.
+
+For example, an inbound camera-count MESSAGE produces:
+
+```json
+{
+  "entry_id": "your-entry-id",
+  "received_at": 1791028800.0,
+  "body_bytes": 3,
+  "body_format": "text",
+  "body_redacted": false,
+  "body": "c:2"
+}
+```
+
+This observes messages delivered to the integration's SIP client. It does not
+guarantee that the panel sends physical button actions to that client. Confirm
+normal doorbell reception before interpreting an empty diagnostic window. The
+event is for temporary diagnosis; physical programmable-button automations are
+not yet supported.
 
 ## Realtime Ring Event
 
@@ -412,6 +461,13 @@ Options:
 | **Hybrid** *(web-admin default)* | Plain SIP `MESSAGE` for the physical default station, `INVITE`-then-`MESSAGE` for every other station. | App-managed devices require an explicit physical-default selection. Web-admin legacy entries retain their first-stored-door behavior. |
 | **Fast** | Plain SIP `MESSAGE` without first establishing a targeted call. | Allowed for app-managed devices only when one unlockable door exists. It is blocked with multiple doors because the panel may ignore the requested target. |
 | **Standard** *(app-managed default)* | TLS `INVITE` to bring the call up, then `MESSAGE`, then `BYE`. | Uses the required SIP-TLS port 5061 and avoids assuming port 5060 is available. Adds roughly 1-2 seconds per unlock. |
+
+Second-lock buttons always establish a targeted call, send the MRANGE second-lock
+command `a`, and hang up, including when Fast or Hybrid is selected. The first
+lock keeps the selected strategy. Second-lock availability comes from the
+gateway device list or the pairing ACL's `secondunlock` flag. Reload the
+integration or run `abb_welcome.refresh_doors` after changing this setting on a
+web-admin gateway; app-managed topology changes require re-pairing.
 
 If a door does not open with Hybrid, switch to **Standard**. Do not use Fast to
 test targeting on a multi-door app-managed device: the physical panel may

@@ -891,6 +891,9 @@ class SIPClient:
         )
 
     def _use_fast_route(self, door: DoorSpec) -> bool:
+        # MRANGE's second-lock command is verified only inside a targeted call.
+        if door.unlock_body == "a":
+            return False
         if self.unlock_strategy == "fast":
             return True
         if self.unlock_strategy == "standard":

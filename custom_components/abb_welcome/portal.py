@@ -604,6 +604,11 @@ def parse_acl_update(
             door["type"] = station_type
             if station_type != "1":
                 door["can_unlock"] = False
+        if config.has_option(sec, "secondunlock"):
+            second_unlock = config.get(sec, "secondunlock").strip()
+            if second_unlock not in ("0", "1"):
+                raise PortalError("Invalid second-lock capability in ACL update")
+            door["second_lock"] = second_unlock == "1"
         doors.append(door)
 
     _log(
