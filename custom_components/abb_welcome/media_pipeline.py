@@ -987,6 +987,17 @@ class StreamSession:
         return self._call is not None
 
     @property
+    def has_pending_call(self) -> bool:
+        listener = self._incoming_listener
+        station_id = str(self._door.station_id or "").strip()
+        if listener is None or not station_id:
+            return False
+        checker = getattr(listener, "pending_call_for_station", None)
+        if callable(checker):
+            return bool(checker(station_id))
+        return False
+
+    @property
     def video_codec(self) -> str:
         return self._video_codec
 
@@ -1120,15 +1131,43 @@ class StreamSession:
                 _LOGGER.info(
                     "[abb] media: dialing gateway for door=%s media_ip=%s "
                     "audio_port=%d video_port=%d camera_index=%s",
-                    self._door.name, self._media_ip,
-                    offer_audio_port, offer_video_port,
-                    self._camera_index if self._camera_index is not None else "default",
+                    self._door.name,
+                    self._media_ip,
+                    offer_audio_port,
+                    offer_video_port,
+                    self._camera_index
+                    if self._camera_index is not None
+                    else "default",
                 )
-                call = await self._dialer.dial(
-                    self._door,
-                    audio_port=offer_audio_port,
-                    video_port=offer_video_port,
-                )
+                try:
+                    call = await self._dialer.dial(
+                        self._door,
+                        audio_port=offer_audio_port,
+                        video_port=offer_video_port,
+                    )
+                except Exception as err:
+                    err_str = str(err).lower()
+                    if "486" in err_str or "busy" in err_str:
+                        _LOGGER.warning(
+                            "[abb] media: dialer busy for %s while ringing; declining incoming invite to release line",
+                            self._door.name,
+                        )
+                        if self._incoming_listener and hasattr(
+                            self._incoming_listener, "decline_pending_call"
+                        ):
+                            await self._incoming_listener.decline_pending_call(
+                                str(self._door.station_id)
+                            )
+                            await asyncio.sleep(0.4)
+                            call = await self._dialer.dial(
+                                self._door,
+                                audio_port=offer_audio_port,
+                                video_port=offer_video_port,
+                            )
+                        else:
+                            raise
+                    else:
+                        raise
             else:
                 _LOGGER.info(
                     "[abb] media: using accepted incoming gateway call for door=%s "
@@ -1677,6 +1716,59 @@ class StreamSession:
                     while sender.queue_frames > low_watermark:
                         await asyncio.sleep(min(0.005, sender.interval / 4))
             await sender.drain(timeout=max(1.0, duration_ms / 1000 + 1.0))
+        finally:
+            sender.stop_talk()
+        return sender.stats()
+
+    async def send_talkback_audio_file(
+        self,
+        file_path: str,
+    ) -> dict[str, Any]:
+        sender = self._talk_sender
+        if sender is None or not sender.active:
+            raise RuntimeError("talkback is not ready; open the camera stream first")
+
+        import wave
+
+        def _read_audio() -> bytes:
+            if not os.path.isfile(file_path):
+                raise FileNotFoundError(f"Audio file not found: {file_path}")
+            if file_path.endswith(".wav"):
+                with wave.open(file_path, "rb") as w:
+                    return w.readframes(w.getnframes())
+            with open(file_path, "rb") as f:
+                return f.read()
+
+        loop = asyncio.get_running_loop()
+        pcm_data = await loop.run_in_executor(None, _read_audio)
+
+        samples_per_frame = 160
+        frame_bytes = samples_per_frame * 2
+        total_frames = len(pcm_data) // frame_bytes
+        if total_frames == 0:
+            return sender.stats()
+
+        file_frames = [
+            pcm_data[i * frame_bytes : (i + 1) * frame_bytes]
+            for i in range(total_frames)
+        ]
+
+        sender.start_talk()
+        try:
+            high_watermark = max(1, min(sender.max_queue_frames, 10))
+            low_watermark = max(1, high_watermark // 2)
+            next_frame = 0
+            while next_frame < len(file_frames):
+                while (
+                    next_frame < len(file_frames)
+                    and sender.queue_frames < high_watermark
+                ):
+                    sender.feed_pcm16le(file_frames[next_frame])
+                    next_frame += 1
+                if next_frame < len(file_frames):
+                    while sender.queue_frames > low_watermark:
+                        await asyncio.sleep(min(0.005, sender.interval / 4))
+            await sender.drain(timeout=max(1.0, total_frames * 0.02 + 1.0))
         finally:
             sender.stop_talk()
         return sender.stats()

@@ -694,6 +694,23 @@ class SipListener:
         accepted.ack_received = dialog.ack_received
         return accepted
 
+    async def decline_pending_call(self, station_id: str) -> bool:
+        """Decline a pending inbound INVITE for a station with 486 Busy Here."""
+        async with self._dialog_lock:
+            if self._writer is None or self._writer.is_closing():
+                return False
+            frame = self._pop_pending_invite(station_id)
+            if frame is None:
+                return False
+            call_id = _header(frame.headers, "Call-ID")
+            _LOGGER.info(
+                "[abb] Declining pending incoming call station=%s call_id=%s with 486 Busy Here",
+                station_id,
+                call_id,
+            )
+            await self._respond(self._writer, frame, 486, "Busy Here", with_to_tag=True)
+            return True
+
     async def wait_accepted_call_end(self, call_id: str) -> str:
         """Wait until an accepted incoming call ends; return the end reason."""
         dialog = self._accepted_dialogs.get(call_id)
