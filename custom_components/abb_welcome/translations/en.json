@@ -92,6 +92,7 @@
         "data": {
           "unlock_strategy": "Unlock strategy",
           "default_unlock_station_id": "Physical default door for Hybrid fast path",
+          "lan_rtsp_proxy": "Serve camera streams to the LAN over RTSP (Scrypted/HomeKit)",
           "lan_rtsp_host": "Advertised Home Assistant LAN host (blank = auto)",
           "lan_rtsp_port": "Preferred LAN RTSP proxy port",
           "allow_pickup": "Allow pickup from streams"

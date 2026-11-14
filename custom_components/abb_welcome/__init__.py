@@ -24,11 +24,13 @@ from .const import (
     CONF_DEFAULT_UNLOCK_STATION_ID,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
+    CONF_LAN_RTSP_PROXY,
     CONF_UNLOCK_STRATEGY,
     DEFAULT_ALLOW_PICKUP,
     DEFAULT_LAN_RTSP_BIND_HOST,
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS,
+    DEFAULT_LAN_RTSP_PROXY,
     DOMAIN,
     EVENT_DISCOVERY_CHANGED,
     GATEWAY_PROFILE_APP_MANAGED,
@@ -187,6 +189,7 @@ _RELOAD_OPTION_KEYS = (
     CONF_DEFAULT_UNLOCK_STATION_ID,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
+    CONF_LAN_RTSP_PROXY,
     CONF_UNLOCK_STRATEGY,
 )
 
@@ -364,12 +367,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     entry_data["lan_rtsp_host"] = lan_rtsp_host
 
-    rtsp_proxy = await _async_start_rtsp_proxy(hass, entry, entry_data)
+    lan_rtsp_proxy_enabled = bool(
+        entry.options.get(CONF_LAN_RTSP_PROXY, DEFAULT_LAN_RTSP_PROXY)
+    )
+    if lan_rtsp_proxy_enabled:
+        rtsp_proxy = await _async_start_rtsp_proxy(hass, entry, entry_data)
 
-    async def _stop_rtsp_proxy(*_args) -> None:
-        await rtsp_proxy.stop()
+        async def _stop_rtsp_proxy(*_args) -> None:
+            await rtsp_proxy.stop()
 
-    entry.async_on_unload(_stop_rtsp_proxy)
+        entry.async_on_unload(_stop_rtsp_proxy)
 
     # Initial poll
     if coordinator.has_certs:
@@ -590,7 +597,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass,
         entry,
         reason=(
-            "rtsp_proxy_started"
+            "rtsp_proxy_disabled"
+            if not lan_rtsp_proxy_enabled
+            else "rtsp_proxy_started"
             if entry_data.get("lan_rtsp_proxy_running")
             else "rtsp_proxy_failed"
         ),

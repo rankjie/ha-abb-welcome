@@ -29,9 +29,11 @@ from .const import (
     CONF_GATEWAY_UUID_OVERRIDE,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
+    CONF_LAN_RTSP_PROXY,
     CONF_UNLOCK_STRATEGY,
     DEFAULT_ALLOW_PICKUP,
     DEFAULT_LAN_RTSP_PORT,
+    DEFAULT_LAN_RTSP_PROXY,
     DOMAIN,
     GATEWAY_CAPABILITIES,
     GATEWAY_PROFILE_APP_MANAGED,
@@ -996,6 +998,11 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
             )
             or DEFAULT_LAN_RTSP_PORT
         )
+        current_rtsp_proxy = bool(
+            submitted.get(CONF_LAN_RTSP_PROXY, DEFAULT_LAN_RTSP_PROXY)
+            if submitted is not None
+            else self._entry.options.get(CONF_LAN_RTSP_PROXY, DEFAULT_LAN_RTSP_PROXY)
+        )
         current_allow_pickup = bool(
             submitted.get(CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP)
             if submitted is not None
@@ -1011,6 +1018,9 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
                     mode=selector.SelectSelectorMode.DROPDOWN,
                 )
             ),
+            vol.Required(
+                CONF_LAN_RTSP_PROXY, default=current_rtsp_proxy
+            ): selector.BooleanSelector(),
             vol.Optional(
                 CONF_LAN_RTSP_HOST, default=current_rtsp_host
             ): selector.TextSelector(),

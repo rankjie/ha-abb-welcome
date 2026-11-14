@@ -834,9 +834,15 @@ class ABBWelcomeCamera(Camera):
             self._camera_index if self._camera_index is not None else "default",
             self._camera_count,
         )
+        proxy = self.hass.data[DOMAIN][self._entry_id].get("rtsp_proxy")
+        if proxy is not None:
+            proxy.allow_stream(self._stream_name)
         await self._register_with_go2rtc()
 
     async def async_will_remove_from_hass(self) -> None:
+        proxy = self.hass.data.get(DOMAIN, {}).get(self._entry_id, {}).get("rtsp_proxy")
+        if proxy is not None:
+            proxy.disallow_stream(self._stream_name)
         self._unregister_camera_service_target()
         self._coordinator.remove_state_callback(self._state_callback)
         if self._unsub_armed is not None:

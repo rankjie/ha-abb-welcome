@@ -329,7 +329,15 @@ or overwrite a newer microphone session.
 ## Scrypted RTSP Endpoint
 
 Scrypted needs a LAN-reachable RTSP URL. HA's bundled go2rtc RTSP listener is
-localhost-only, so this integration exposes it through a small LAN TCP proxy.
+localhost-only, so this integration serves its own camera streams through a
+small LAN RTSP proxy.
+
+The proxy has no authentication: any device on the LAN can play the ABB camera
+streams. It forwards playback requests for this integration's streams only, so
+other Home Assistant cameras in go2rtc are not reachable through it, and it
+rejects publishing. If you do not use Scrypted or another LAN RTSP client, turn
+it off with **Serve camera streams to the LAN over RTSP** in the integration
+options.
 
 Port selection starts at:
 
