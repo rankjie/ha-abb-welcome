@@ -106,12 +106,25 @@ _ABB_ENCRYPT_KEY_RE = re.compile(
 _SDP_CRYPTO_INLINE_RE = re.compile(
     r"(a=crypto:\d+\s+\S+\s+inline:)[^\s\r\n]+", re.IGNORECASE
 )
+# Credentials sent as URL query or form parameters, e.g. the gateway admin
+# login ``checklogin.cgi?name=admin&pwd=...``.
+_CREDENTIAL_PARAM_RE = re.compile(
+    r"(?<![A-Za-z0-9_])((?:pwd|passwd|password|pass)=)[^&\s\"'#;]*",
+    re.IGNORECASE,
+)
+# Third-party loggers that print request URLs verbatim at DEBUG level.
+_DEPENDENCY_LOGGERS = ("urllib3.connectionpool",)
 
 
 def redact_abb_encrypt_keys(value: str) -> str:
     """Remove ABB SDP media keys while retaining useful SDP structure."""
     value = _ABB_ENCRYPT_KEY_RE.sub(r"\1" + REDACTED, value)
     return _SDP_CRYPTO_INLINE_RE.sub(r"\1" + REDACTED, value)
+
+
+def redact_url_credentials(value: str) -> str:
+    """Mask password values in URL query strings and form bodies."""
+    return _CREDENTIAL_PARAM_RE.sub(r"\1" + REDACTED, value)
 
 
 def redact_log_value(value: Any, key: str | None = None) -> Any:
@@ -128,6 +141,7 @@ def redact_log_value(value: Any, key: str | None = None) -> Any:
         return redact_log_value(str(value))
     if isinstance(value, str):
         value = redact_abb_encrypt_keys(value)
+        value = redact_url_credentials(value)
         value = _PEM_RE.sub(REDACTED, value)
         value = _UUID_RE.sub(REDACTED, value)
         value = _IPV4_RE.sub(REDACTED, value)
@@ -184,8 +198,40 @@ class ABBWelcomeRedactionFilter(logging.Filter):
         return redact_log_value(value)
 
 
+class CredentialRedactionFilter(logging.Filter):
+    """Mask passwords in records of dependency loggers this integration uses.
+
+    urllib3 logs every request line, including the query string, at DEBUG.
+    The gateway admin login is a GET with ``pwd=`` in the query, so with
+    ``urllib3`` at DEBUG (e.g. ``logger: default: debug``) the password
+    would be written to the Home Assistant log in clear text. Only password
+    parameters are touched; everything else in the record stays as is.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = redact_url_credentials(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                redact_url_credentials(arg) if isinstance(arg, str) else arg
+                for arg in record.args
+            )
+        return True
+
+
+def install_dependency_redaction() -> None:
+    """Install the credential filter on dependency loggers once."""
+    for name in _DEPENDENCY_LOGGERS:
+        logger = logging.getLogger(name)
+        if not any(
+            isinstance(item, CredentialRedactionFilter) for item in logger.filters
+        ):
+            logger.addFilter(CredentialRedactionFilter())
+
+
 def get_redacting_logger(name: str) -> logging.Logger:
     """Return a module logger with one ABB redaction filter installed."""
+    install_dependency_redaction()
     logger = logging.getLogger(name)
     if not any(isinstance(item, ABBWelcomeRedactionFilter) for item in logger.filters):
         logger.addFilter(ABBWelcomeRedactionFilter())

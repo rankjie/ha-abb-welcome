@@ -49,7 +49,7 @@ from .message_diagnostics import (
     DEFAULT_MESSAGE_DIAGNOSTICS_SECONDS,
     MAX_MESSAGE_DIAGNOSTICS_SECONDS,
 )
-from .redaction import get_redacting_logger
+from .redaction import get_redacting_logger, redact_url_credentials
 from .rtsp_proxy import RtspTcpProxy
 from .sip_client import SIPClient
 from .sip_listener import IncomingCall, SipListener
@@ -626,7 +626,9 @@ _GATEWAY_LOGIN_OK_RESPONSES = {"1", "2"}
 def _fetch_gateway_device_list(gateway_ip: str, admin_password: str) -> str:
     """Read the gateway admin device-list CGI response."""
     errors: list[str] = []
-    for scheme in ("http", "https"):
+    # HTTPS first: the legacy login sends the password in the query string,
+    # so plain HTTP is only a fallback for gateways without TLS.
+    for scheme in ("https", "http"):
         base = f"{scheme}://{gateway_ip}"
         try:
             with requests.Session() as session:
@@ -658,7 +660,8 @@ def _fetch_gateway_device_list(gateway_ip: str, admin_password: str) -> str:
                     continue
                 return decode_gateway_text(response.content).strip()
         except requests.RequestException as err:
-            errors.append(f"{scheme}: {err}")
+            # requests puts the full URL (including ``pwd=``) in the message.
+            errors.append(f"{scheme}: {redact_url_credentials(str(err))}")
 
     raise RuntimeError("; ".join(errors) or "gateway returned no device list")
 

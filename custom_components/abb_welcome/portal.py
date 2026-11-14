@@ -96,7 +96,9 @@ _REDACT_JSON_RE = re.compile(
     r'("[^"]*"|\[[^\]]*\])',
     re.IGNORECASE,
 )
-_REDACT_FORM_RE = re.compile(r'(password=)[^&\s]*')
+_REDACT_FORM_RE = re.compile(
+    r'(?<![A-Za-z0-9_])((?:pwd|passwd|password|pass)=)[^&\s]*', re.IGNORECASE
+)
 _UUID_RE = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
     re.IGNORECASE,
