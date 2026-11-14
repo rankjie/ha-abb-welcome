@@ -646,6 +646,51 @@ class StationStreamCoordinator:
         self._notify_state()
         return stats
 
+    @property
+    def has_pending_call(self) -> bool:
+        session = getattr(self, "session", None)
+        return bool(getattr(session, "has_pending_call", False))
+
+    async def send_talkback_audio_file(
+        self,
+        file_path: str,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        session_id = str(session_id or "").strip()
+        if session_id and self._talkback_owner and session_id != self._talkback_owner:
+            stats = self.talkback_stats()
+            stats["ignored"] = True
+            stats["ignore_reason"] = "talkback_session_owner_mismatch"
+            return stats
+        if session_id and not self._talkback_owner:
+            self._talkback_owner = session_id
+
+        opened_by_us = False
+        if not self.session.active:
+            _LOGGER.info(
+                "[abb] send_talkback_audio_file: opening session for %s",
+                self.door.name,
+            )
+            await self.session.open()
+            opened_by_us = True
+            await asyncio.sleep(0.3)
+
+        try:
+            stats = await self.session.send_talkback_audio_file(file_path)
+            stats["owner"] = self._talkback_owner
+            return stats
+        finally:
+            if opened_by_us:
+                _LOGGER.info(
+                    "[abb] send_talkback_audio_file: closing session for %s",
+                    self.door.name,
+                )
+                try:
+                    await self.session.close()
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug("[abb] close after audio_file failed: %s", err)
+            self._notify_state()
+
 
 class ABBWelcomeCamera(Camera):
     """Camera entity backed by per-entity RTSP server + lazy SIP dial."""
@@ -1163,6 +1208,22 @@ class ABBWelcomeCamera(Camera):
             duration_ms=duration_ms,
             frequency_hz=frequency_hz,
             amplitude=amplitude,
+            session_id=talkback_session_id,
+        )
+        self.async_write_ha_state()
+        return stats
+
+    @property
+    def has_pending_call(self) -> bool:
+        return self._coordinator.has_pending_call
+
+    async def async_talkback_audio_file(
+        self,
+        file_path: str,
+        talkback_session_id: str = "",
+    ) -> dict[str, Any]:
+        stats = await self._coordinator.send_talkback_audio_file(
+            file_path=file_path,
             session_id=talkback_session_id,
         )
         self.async_write_ha_state()
