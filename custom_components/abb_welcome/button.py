@@ -83,6 +83,7 @@ class ABBWelcomeDoorButton(ButtonEntity):
         *, second_lock: bool = False,
     ) -> None:
         self._sip_client = sip_client
+        self._entry_id = entry_id
         self._door = door
         self._second_lock = second_lock
         self._attr_name = door["name"]
@@ -95,14 +96,34 @@ class ABBWelcomeDoorButton(ButtonEntity):
     async def async_press(self) -> None:
         """Unlock the door."""
         _LOGGER.debug("Unlocking door: %s", self._attr_name)
-        args = (self._door, "a") if self._second_lock else (self._door,)
-        success = await self.hass.async_add_executor_job(
-            self._sip_client.unlock_door, *args
-        )
+        success = None if self._second_lock else await self._unlock_in_active_call()
+        if success is None:
+            args = (self._door, "a") if self._second_lock else (self._door,)
+            success = await self.hass.async_add_executor_job(
+                self._sip_client.unlock_door, *args
+            )
         if not success:
             raise HomeAssistantError(
                 f"Failed to unlock door: {self._attr_name}"
             )
+
+    async def _unlock_in_active_call(self) -> bool | None:
+        """Unlock over the dialer's call with this station, or None if it has none.
+
+        A door on the INVITE route cannot place its own INVITE while that call
+        holds the gateway's only call slot.
+        """
+        dialer = self.hass.data[DOMAIN][self._entry_id].get("intercom_dialer")
+        message = self._sip_client.invite_route_message(self._door)
+        if (
+            dialer is None
+            or message is None
+            or not dialer.in_call_with(message.station_id)
+        ):
+            return None
+        return await dialer.send_unlock_message(
+            message.station_id, message.target_uri, message.body
+        )
 
 
 class ABBWelcomeRefreshButton(ButtonEntity):

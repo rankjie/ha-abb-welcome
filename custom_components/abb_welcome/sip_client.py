@@ -43,6 +43,15 @@ class DoorSpec:
 
 
 @dataclass(frozen=True)
+class UnlockMessage:
+    """Out-of-dialog MESSAGE that opens one station's door."""
+
+    station_id: str
+    target_uri: str
+    body: str
+
+
+@dataclass(frozen=True)
 class GatewayConfig:
     """Socket transport config."""
 
@@ -336,6 +345,10 @@ def _build_gateway_config(domain: str, host: str, transport: str) -> GatewayConf
     )
 
 
+def _invite_target_uri(transport: str, address: str) -> str:
+    return f"{address};transport=tls" if transport == "tls" else address
+
+
 def _register_client(
     stream: SipStream,
     local_ip: str,
@@ -569,7 +582,7 @@ def _start_invite_call(
     transport = gw.transport.upper()
     transport_param = f";transport={gw.transport}" if gw.transport == "tls" else ""
     request_uri = door.address
-    target_uri = request_uri + transport_param if gw.transport == "tls" else request_uri
+    target_uri = _invite_target_uri(gw.transport, request_uri)
     local_contact = f"<sip:{sip_user}@{local_ip}:{local_port};transport={gw.transport}>"
     from_header = f"<sip:{sip_user}@{gw.sip_domain}{transport_param}>"
     to_header = f"<{door.address}>"
@@ -1031,6 +1044,23 @@ class SIPClient:
                         _LOGGER.warning("Call teardown issue for %s: %s", door.name, err)
                 session.close_media()
             sock.close()
+
+    def invite_route_message(self, door: Mapping[str, object]) -> UnlockMessage | None:
+        """Return the MESSAGE the INVITE route sends for ``door``.
+
+        None means ``unlock_door`` would not use the INVITE route.
+        """
+        try:
+            spec = self._normalize_door(door, None)
+        except ValueError:
+            return None
+        if self._use_fast_route(spec):
+            return None
+        return UnlockMessage(
+            station_id=spec.station_id,
+            target_uri=_invite_target_uri(self.invite_transport, spec.address),
+            body=spec.unlock_body,
+        )
 
     def unlock_door(
         self,
