@@ -153,27 +153,10 @@ def _candidate_lan_rtsp_ports(configured_port: int | None) -> list[int]:
     return ports
 
 
-for _name in (
-    "custom_components.abb_welcome",
-    "custom_components.abb_welcome.portal",
-    "custom_components.abb_welcome.config_flow",
-    "custom_components.abb_welcome.coordinator",
-    "custom_components.abb_welcome.sip_client",
-    "custom_components.abb_welcome.sip_listener",
-    "custom_components.abb_welcome.button",
-    "custom_components.abb_welcome.binary_sensor",
-    "custom_components.abb_welcome.camera",
-    "custom_components.abb_welcome.intercom_dialer",
-    "custom_components.abb_welcome.media_pipeline",
-    "custom_components.abb_welcome.rtsp_proxy",
-    "custom_components.abb_welcome.rtsp_server",
-    "custom_components.abb_welcome.streaming_state",
-    "custom_components.abb_welcome.switch",
-    "custom_components.abb_welcome.image",
-    "custom_components.abb_welcome.event",
-    "custom_components.abb_welcome.sensor",
-):
-    logging.getLogger(_name).setLevel(logging.INFO)
+# Only the package logger is pinned: the module loggers inherit from it, so
+# Home Assistant's "Enable debug logging" (which raises this logger) reaches
+# every module.
+logging.getLogger("custom_components.abb_welcome").setLevel(logging.INFO)
 
 PLATFORMS = [
     Platform.BINARY_SENSOR,
