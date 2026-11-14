@@ -7,7 +7,6 @@ import logging
 import re
 import socket
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import requests
@@ -17,6 +16,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.start import async_at_start
 
 from .const import (
@@ -48,6 +48,11 @@ from .coordinator import ABBWelcomeCoordinator
 from .message_diagnostics import (
     DEFAULT_MESSAGE_DIAGNOSTICS_SECONDS,
     MAX_MESSAGE_DIAGNOSTICS_SECONDS,
+)
+from .credential_export import (
+    ExportPathError,
+    resolve_export_path,
+    write_private_file,
 )
 from .redaction import get_redacting_logger, redact_url_credentials
 from .rtsp_proxy import RtspTcpProxy
@@ -942,7 +947,12 @@ def _async_register_services(hass: HomeAssistant) -> None:
 
         async def _export_creds(call: ServiceCall) -> None:
             target_entry_id = call.data.get("entry_id")
-            path = call.data.get("path") or "/config/abb_welcome_creds.json"
+            try:
+                target = await hass.async_add_executor_job(
+                    resolve_export_path, hass.config.path(), call.data.get("path")
+                )
+            except ExportPathError as err:
+                raise HomeAssistantError(str(err)) from err
 
             entries = hass.data.get(DOMAIN, {})
             if not entries:
@@ -970,9 +980,8 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     }
                 )
 
-            target = Path(path)
             await hass.async_add_executor_job(
-                target.write_text, json.dumps(payload, indent=2)
+                write_private_file, target, json.dumps(payload, indent=2)
             )
             _LOGGER.warning(
                 "[abb] Credentials exported to %s — file contains the SIP password, "
@@ -980,7 +989,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 target,
             )
 
-        hass.services.async_register(
+        # Admin only: the file contains every secret this integration holds.
+        async_register_admin_service(
+            hass,
             DOMAIN,
             SERVICE_EXPORT_CREDENTIALS,
             _export_creds,

@@ -4,7 +4,8 @@ export_credentials:
     Write the integration's stored SIP credentials, gateway admin password,
     portal certificate, and private key to a JSON file. Intended for local
     prototyping (e.g. an off-HA SIP/RTP test client). The output contains
-    secrets — handle accordingly and delete the file when done.
+    secrets — handle accordingly and delete the file when done. Admin users
+    only.
   fields:
     entry_id:
       name: Entry ID
@@ -15,7 +16,11 @@ export_credentials:
         text:
     path:
       name: Output path
-      description: Where to write the JSON file. Default /config/abb_welcome_creds.json.
+      description: >-
+        Where to write the JSON file, inside the config directory (relative
+        paths are relative to it). Not allowed inside www/, which is served
+        without authentication. Default abb_welcome_creds.json. The file is
+        written with owner-only permissions (0600).
       example: "/config/abb_welcome_creds.json"
       required: false
       selector:

@@ -367,7 +367,9 @@ uses that event to refresh its station list and RTSP URLs.
 - `abb_welcome.talk_pcm16le` - queue base64 PCM16LE microphone audio.
 - `abb_welcome.talk_tone` - send a short generated tone for testing.
 - `abb_welcome.export_credentials` - export stored SIP/gateway credentials to a
-  JSON file for local debugging. This output contains secrets.
+  JSON file for local debugging. This output contains secrets. Admin users
+  only; the file must be inside the config directory but not in `www/`, and
+  is written with owner-only (0600) permissions.
 - `abb_welcome.diagnose_messages` - temporarily publish sanitized inbound SIP
   MESSAGE bodies for protocol investigation. Disabled by default; accepts an
   optional `entry_id` and a `duration` of 0–600 seconds (default 300). Zero stops
