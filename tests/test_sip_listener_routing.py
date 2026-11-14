@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -66,8 +67,13 @@ def _respond(frame, code: int, reason: str) -> str:
     return writer.data.decode("utf-8")
 
 
-def test_invite_200_copies_all_record_routes_in_wire_order() -> None:
-    response = _respond(_request(), 200, "OK")
+@pytest.mark.parametrize(
+    ("code", "reason"), ((200, "OK"), (183, "Session Progress"))
+)
+def test_dialog_forming_invite_response_copies_record_routes_in_wire_order(
+    code: int, reason: str
+) -> None:
+    response = _respond(_request(), code, reason)
 
     first = "Record-Route: <sip:first.invalid;lr>"
     second = "Record-Route: <sip:second.invalid;lr>"
@@ -83,10 +89,56 @@ def test_invite_200_copies_all_record_routes_in_wire_order() -> None:
         (_request("OPTIONS"), 200, "OK"),
     ),
 )
-def test_record_routes_are_not_copied_outside_invite_2xx(
+def test_record_routes_are_not_copied_outside_invite_dialog_responses(
     frame, code: int, reason: str
 ) -> None:
     assert "Record-Route:" not in _respond(frame, code, reason)
+
+
+def test_answering_sends_early_media_then_200_in_one_dialog() -> None:
+    sdp = (
+        "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\n"
+        "t=0 0\r\nm=audio 50690 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n"
+        "m=video 50668 RTP/AVP 102\r\na=rtpmap:102 H264/90000\r\n"
+    )
+    frame = _request()
+    frame.body = sdp.encode()
+    frame._received_at = time.time()
+
+    async def answer() -> str:
+        listener = sip_listener.SipListener(
+            "gateway.invalid", "ha", "secret", "example.invalid"
+        )
+        writer = _Writer()
+        writer.is_closing = lambda: False
+        listener._writer = writer
+        listener._open_invites["dialog-routing-test"] = frame
+        task = asyncio.ensure_future(
+            listener.accept_pending_call(
+                station_id="",
+                media_ip="192.0.2.2",
+                audio_port=40000,
+                video_port=40002,
+            )
+        )
+        await asyncio.sleep(0)
+        listener._accepted_dialogs["dialog-routing-test"].ack_event.set()
+        assert await task is not None
+        return writer.data.decode("utf-8")
+
+    wire = asyncio.run(answer())
+    progress, ok = wire.split("SIP/2.0 200 OK")
+    assert progress.startswith("SIP/2.0 183 Session Progress")
+    to_tags = [
+        line.split(";tag=")[1]
+        for line in wire.splitlines()
+        if line.startswith("To:")
+    ]
+    assert len(to_tags) == 2 and to_tags[0] == to_tags[1]
+    for response in (progress, ok):
+        assert "m=audio 40000 RTP/AVP 8" in response
+        assert "m=video 40002 RTP/AVP 102" in response
+        assert response.count("Record-Route:") == 2
 
 
 def test_register_wait_dispatches_requests_and_matches_exact_response() -> None:

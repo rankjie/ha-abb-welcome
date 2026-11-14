@@ -651,21 +651,34 @@ class SipListener:
             dialog = _AcceptedDialog(call=accepted)
             self._ended_dialog_reasons.pop(call_id, None)
             self._accepted_dialogs[call_id] = dialog
+            answer_headers = [
+                f"Contact: {local_contact}",
+                (
+                    "Allow: INVITE, ACK, CANCEL, OPTIONS, MESSAGE, INFO, REFER, "
+                    "BYE, NOTIFY, PRACK, UPDATE, SUBSCRIBE"
+                ),
+                "Supported: replaces, outbound",
+                "Content-Type: application/sdp",
+            ]
+            # The vendor app is in early media (183 with SDP) before it sends
+            # the 200 OK. A gateway that got only the 200 OK acknowledged it
+            # but bridged no audio and left the indoor station ringing (#40).
+            await self._respond(
+                self._writer,
+                frame,
+                183,
+                "Session Progress",
+                to_tag=local_tag,
+                extra_headers=answer_headers,
+                body=answer,
+            )
             await self._respond(
                 self._writer,
                 frame,
                 200,
                 "OK",
                 to_tag=local_tag,
-                extra_headers=[
-                    f"Contact: {local_contact}",
-                    (
-                        "Allow: INVITE, ACK, CANCEL, OPTIONS, MESSAGE, INFO, REFER, "
-                        "BYE, NOTIFY, PRACK, UPDATE, SUBSCRIBE"
-                    ),
-                    "Supported: replaces, outbound",
-                    "Content-Type: application/sdp",
-                ],
+                extra_headers=answer_headers,
                 body=answer,
             )
             _LOGGER.info(
@@ -1131,10 +1144,11 @@ class SipListener:
         for via in _all_headers(frame.headers, "Via"):
             lines.append(f"Via: {via}")
             out_headers.append(("Via", via))
-        # A 2xx response to an INVITE establishes the dialog's route set.
-        # Echo every Record-Route value in wire order so the caller's ACK and
-        # subsequent in-dialog requests return over the registered SIP route.
-        if frame.method == "INVITE" and 200 <= code < 300:
+        # A 2xx or dialog-forming provisional response to an INVITE establishes
+        # the dialog's route set. Echo every Record-Route value in wire order so
+        # the caller's ACK and subsequent in-dialog requests return over the
+        # registered SIP route. 100 Trying forms no dialog.
+        if frame.method == "INVITE" and 100 < code < 300:
             for route in _all_headers(frame.headers, "Record-Route"):
                 lines.append(f"Record-Route: {route}")
                 out_headers.append(("Record-Route", route))
