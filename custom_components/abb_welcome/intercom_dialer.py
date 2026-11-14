@@ -516,6 +516,15 @@ class IntercomDialer:
         """Return the current established surveillance call, if any."""
         return self._call
 
+    def in_call_with(self, station_id: str) -> bool:
+        """Return whether the established call is with ``station_id``."""
+        call = self._call
+        return (
+            call is not None
+            and bool(station_id)
+            and call.door.station_id == station_id
+        )
+
     @property
     def camera_count_target(self) -> CallState | CallTarget | None:
         """Return the call target that should receive a camera-count notice.
@@ -1283,3 +1292,105 @@ class IntercomDialer:
             if frame.status_code is not None and frame.status_code >= 300:
                 raise RuntimeError(f"MESSAGE rejected: {frame.start_line}")
             return frame
+
+    async def send_unlock_message(
+        self, station_id: str, target_uri: str, body: str, *, timeout: float = 5.0
+    ) -> bool | None:
+        """Send an out-of-dialog unlock MESSAGE while our call is with the station.
+
+        The gateway has one call slot, so unlocking over a second INVITE is
+        refused with 486 while this call is up.  The MESSAGE is the one the
+        INVITE route sends after its call is established, sent on the connection
+        that holds the call.  Returns True only on a 200 final response, and
+        None when nothing was sent because the call with the station is gone.
+        """
+        async with self._lock:
+            if not self.in_call_with(station_id):
+                _LOGGER.debug(
+                    "[abb] dialer: cannot send unlock MESSAGE, no active call "
+                    "with this station"
+                )
+                return None
+            if self._writer is None or self._writer.is_closing():
+                _LOGGER.debug(
+                    "[abb] dialer: cannot send unlock MESSAGE, SIP writer closed"
+                )
+                return None
+
+            call_id = f"{uuid.uuid4().hex[:16]}@{self.domain}"
+            from_tag = uuid.uuid4().hex[:8]
+
+            def _headers(cseq: int, authorization: str = "") -> list[str]:
+                return [
+                    f"Via: SIP/2.0/TLS {self._local_ip}:{self._local_port};branch=z9hG4bK-{uuid.uuid4().hex[:12]};rport",
+                    "Max-Forwards: 70",
+                    f"From: <sip:{self.username}@{self.domain};transport=tls>;tag={from_tag}",
+                    f"To: <{target_uri}>",
+                    f"Call-ID: {call_id}",
+                    f"CSeq: {cseq} MESSAGE",
+                    "Content-Type: text/plain",
+                    f"User-Agent: {USER_AGENT}",
+                    *([authorization] if authorization else []),
+                ]
+
+            async def _final_response(cseq: int) -> SipFrame:
+                while True:
+                    frame = await self._await_response(
+                        lambda f: f.is_response
+                        and f.header("Call-ID") == call_id
+                        and f.header("CSeq").split() == [str(cseq), "MESSAGE"],
+                        timeout=timeout,
+                    )
+                    if (frame.status_code or 0) >= 200:
+                        return frame
+
+            try:
+                await self._send_request("MESSAGE", target_uri, _headers(1), body)
+                frame = await _final_response(1)
+                if frame.status_code in (401, 407):
+                    proxy = frame.status_code == 407
+                    challenge = _parse_challenge(
+                        frame.header(
+                            "Proxy-Authenticate" if proxy else "WWW-Authenticate"
+                        )
+                    )
+                    if not challenge:
+                        _LOGGER.error(
+                            "[abb] dialer: unlock MESSAGE auth challenge "
+                            "missing: %s",
+                            frame.start_line,
+                        )
+                        return False
+                    auth = _digest(
+                        self.username, self.password, "MESSAGE", target_uri, challenge
+                    )
+                    auth_header = "Proxy-Authorization" if proxy else "Authorization"
+                    await self._send_request(
+                        "MESSAGE",
+                        target_uri,
+                        _headers(2, f"{auth_header}: {auth}"),
+                        body,
+                    )
+                    frame = await _final_response(2)
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "[abb] dialer: no unlock MESSAGE response within %.1fs "
+                    "call_id=%s",
+                    timeout, call_id,
+                )
+                return False
+            except OSError as err:
+                _LOGGER.error("[abb] dialer: unlock MESSAGE network error: %s", err)
+                return False
+
+            if frame.status_code != 200:
+                _LOGGER.error(
+                    "[abb] dialer: unlock MESSAGE rejected: %s call_id=%s",
+                    frame.start_line, call_id,
+                )
+                return False
+            _LOGGER.info(
+                "[abb] dialer: unlock MESSAGE accepted: %s call_id=%s",
+                frame.start_line, call_id,
+            )
+            return True
