@@ -654,6 +654,10 @@ class GatewayAdminError(Exception):
     """Raised when a call to the gateway's local admin CGI fails."""
 
 
+class GatewayWebAdminMissingError(GatewayAdminError):
+    """The device answers HTTPS but has no 83342-style web admin login."""
+
+
 # Body-encoding variants tried by ``_gw_post`` in order.  The first one is
 # what rankjie's gateway accepts (verified live) and what we observe in
 # Chrome dev-tools captures: ``application/x-www-form-urlencoded`` Content-Type
@@ -785,6 +789,11 @@ def _gateway_login(
     _http_trace(resp, "checklogin")
     body = decode_gateway_text(resp.content).strip()
     _log(logging.DEBUG, "Gateway login response: HTTP %d (body redacted)", resp.status_code)
+    if resp.status_code == 404:
+        session.close()
+        raise GatewayWebAdminMissingError(
+            "Gateway web admin login endpoint not found (HTTP 404)"
+        )
     if resp.status_code != 200 or body not in ("1", "2"):
         session.close()
         raise GatewayAdminError(

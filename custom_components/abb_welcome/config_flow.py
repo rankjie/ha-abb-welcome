@@ -49,6 +49,7 @@ from .const import (
 )
 from .portal import (
     GatewayAdminError,
+    GatewayWebAdminMissingError,
     PortalError,
     compute_integrity_code,
     default_client_name,
@@ -648,6 +649,8 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         except GatewayAdminError as err:
             msg = str(err).lower()
             self._log_stage_failure(err)
+            if isinstance(err, GatewayWebAdminMissingError):
+                return self._pairing_failed("gateway_web_admin_missing")
             if "login failed" in msg:
                 return self._pairing_failed("gateway_admin_auth_failed")
             if "missing uuid" in msg or "op=6" in msg:
@@ -684,6 +687,9 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             await self.hass.async_add_executor_job(self._do_gateway_authorize)
         except GatewayAdminError as err:
             self._log_stage_failure(err)
+            if isinstance(err, GatewayWebAdminMissingError):
+                # No web admin at all — manual approval there is impossible.
+                return self._pairing_failed("gateway_web_admin_missing")
             if "login failed" in str(err).lower():
                 # Wrong admin password — manual flow can't recover.
                 return self._pairing_failed("gateway_admin_auth_failed")

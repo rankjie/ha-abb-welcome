@@ -66,6 +66,7 @@
       "invalid_auth": "Invalid portal credentials.",
       "gateway_not_found": "No IP gateway is visible to this portal account.",
       "gateway_admin_auth_failed": "Gateway admin password is wrong (login at https://gateway-ip/ as `admin` failed).",
+      "gateway_web_admin_missing": "This device has no IP gateway web admin (its login page returned 404), so the web-admin device type cannot pair with it. That device type supports the 83342 IP gateway only.",
       "no_pending_app": "The gateway did not see our pairing request. Try again or check that the portal account is linked to this gateway.",
       "integrity_code_rejected": "The gateway rejected the integrity code we computed. Open an issue with your gateway firmware version.",
       "gateway_admin_failed": "Talking to the gateway admin CGI failed. See the debug report below.",

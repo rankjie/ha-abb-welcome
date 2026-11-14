@@ -737,6 +737,66 @@ def test_web_admin_retry_after_connect_reuses_issued_certificate() -> None:
     assert calls["connect"][-1] == (b"cert-2", uuid)
 
 
+@pytest.mark.parametrize("stage", ["gateway_uuid", "approve"])
+def test_device_without_web_admin_is_not_reported_as_a_wrong_password(stage) -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[0]
+    _stub_web_admin_pairing(module, {"certificate": [], "connect": []})
+
+    def _missing(*args):
+        raise module.GatewayWebAdminMissingError(
+            "Gateway web admin login endpoint not found (HTTP 404)"
+        )
+
+    uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    if stage == "gateway_uuid":
+        module.gateway_local_info = _missing
+    else:
+        module.gateway_local_info = lambda *args: {"uuid": uuid}
+        module.gateway_authorize = _missing
+
+    failed = _run(flow.async_step_credentials(_web_admin_credentials(module)))
+    assert failed["errors"]["base"] == "gateway_web_admin_missing"
+
+
+@pytest.mark.parametrize(
+    "status, body, expected",
+    [
+        (404, "<html>404 Not Found</html>", "GatewayWebAdminMissingError"),
+        (200, "0", "GatewayAdminError"),
+        (500, "", "GatewayAdminError"),
+    ],
+)
+def test_gateway_login_tells_a_missing_web_admin_from_a_rejected_login(
+    monkeypatch, status, body, expected
+) -> None:
+    _load_config_flow()
+    portal = sys.modules["abb_pairing_test.portal"]
+
+    class _Session:
+        cookies: dict = {}
+
+        def post(self, *args, **kwargs):
+            return types.SimpleNamespace(
+                status_code=status,
+                content=body.encode(),
+                headers={},
+                request=types.SimpleNamespace(
+                    method="POST", url="https://192.0.2.1/", headers={}, body=b""
+                ),
+            )
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(portal.requests, "Session", _Session)
+    with pytest.raises(portal.GatewayAdminError) as err:
+        portal._gateway_login("192.0.2.1", "admin", "synthetic-password")
+    assert type(err.value).__name__ == expected
+
+
 def test_failed_certificate_request_keeps_issued_key_pair() -> None:
     module = _load_config_flow()
     flow = module.ABBWelcomeConfigFlow()
