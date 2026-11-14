@@ -48,6 +48,7 @@ BACK = {
     "body": "1",
     "index": 1,
 }
+FRONT_TARGET = "sip:100000001@example.invalid;transport=tls"
 BACK_TARGET = "sip:100000002@example.invalid;transport=tls"
 OK = [("200 OK", {})]
 CHALLENGE = 'Digest realm="gateway", nonce="abc123", qop="auth"'
@@ -506,9 +507,35 @@ def test_other_presses_keep_the_old_unlock_path(
     assert requests == []
 
 
-def test_second_lock_press_keeps_the_old_unlock_path(button_module):
+@pytest.mark.parametrize(
+    "door, station, target, strategy",
+    [
+        (BACK, "100000002", BACK_TARGET, "hybrid"),
+        # The second lock never takes the fast route, default door included.
+        (FRONT, "100000001", FRONT_TARGET, "hybrid"),
+        (FRONT, "100000001", FRONT_TARGET, "fast"),
+    ],
+)
+def test_second_lock_unlocks_inside_the_active_call(
+    button_module, door, station, target, strategy
+):
     client_calls, requests, error = _press(
-        button_module, BACK, station="100000002", second_lock=True
+        button_module, door, station=station, second_lock=True, strategy=strategy
+    )
+    assert error is None
+    assert client_calls == []
+    assert len(requests) == 1
+    request_line, _, body = _parse_request(requests[0])
+    assert request_line == f"MESSAGE {target} SIP/2.0"
+    assert body == "a"
+
+
+@pytest.mark.parametrize("station", [None, "100000001"])
+def test_second_lock_press_without_a_call_to_its_station_keeps_the_invite_route(
+    button_module, station
+):
+    client_calls, requests, error = _press(
+        button_module, BACK, station=station, second_lock=True
     )
     assert error is None
     assert client_calls == [(BACK, "a")]

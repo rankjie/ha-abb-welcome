@@ -1045,15 +1045,18 @@ class SIPClient:
                 session.close_media()
             sock.close()
 
-    def invite_route_message(self, door: Mapping[str, object]) -> UnlockMessage | None:
+    def invite_route_message(
+        self, door: Mapping[str, object], body: str | None = None
+    ) -> UnlockMessage | None:
         """Return the MESSAGE the INVITE route sends for ``door``.
 
+        ``body`` overrides the door's unlock body as it does in ``unlock_door``.
         It is addressed for TLS because the dialer, the only connection that
         sends it, is always TLS. None means ``unlock_door`` would not use the
         INVITE route.
         """
         try:
-            spec = self._normalize_door(door, None)
+            spec = self._normalize_door(door, body)
         except ValueError:
             return None
         if self._use_fast_route(spec):

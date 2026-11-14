@@ -348,7 +348,8 @@ def test_second_button_sends_a_and_surfaces_failure(monkeypatch, success):
     module = _button_module(monkeypatch)
     calls = []
     client = types.SimpleNamespace(
-        unlock_door=lambda *args: calls.append(args) or success
+        unlock_door=lambda *args: calls.append(args) or success,
+        invite_route_message=lambda door, body: None,
     )
     door = {"name": "Front", "station_id": "100000001", "second_lock": True}
     entity = module.ABBWelcomeDoorButton(
@@ -358,7 +359,10 @@ def test_second_button_sends_a_and_surfaces_failure(monkeypatch, success):
     async def executor(function, *args):
         return function(*args)
 
-    entity.hass = types.SimpleNamespace(async_add_executor_job=executor)
+    entity.hass = types.SimpleNamespace(
+        data={module.DOMAIN: {"synthetic-entry": {}}},
+        async_add_executor_job=executor,
+    )
     if success:
         asyncio.run(entity.async_press())
     else:
