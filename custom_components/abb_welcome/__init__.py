@@ -640,6 +640,12 @@ _GATEWAY_LOGIN_OK_RESPONSES = {"1", "2"}
 def _fetch_gateway_device_list(gateway_ip: str, admin_password: str) -> str:
     """Read the gateway admin device-list CGI response."""
     errors: list[str] = []
+    # The gateway answers "-8" unless the Referer is http://<its IP>/..., so
+    # it can't follow the scheme in use or a hostname.
+    try:
+        referer_host = socket.gethostbyname(gateway_ip)
+    except OSError:
+        referer_host = gateway_ip
     # HTTPS first: the legacy login sends the password in the query string,
     # so plain HTTP is only a fallback for gateways without TLS.
     for scheme in ("https", "http"):
@@ -663,7 +669,7 @@ def _fetch_gateway_device_list(gateway_ip: str, admin_password: str) -> str:
                 response = session.get(
                     f"{base}/cgi-bin/adduser.cgi",
                     params={"type": "getdevicelist"},
-                    headers={"Referer": f"{base}/config.html"},
+                    headers={"Referer": f"http://{referer_host}/config.html"},
                     timeout=_GATEWAY_ADMIN_TIMEOUT,
                     verify=False,
                 )
