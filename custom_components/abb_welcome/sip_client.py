@@ -1048,7 +1048,9 @@ class SIPClient:
     def invite_route_message(self, door: Mapping[str, object]) -> UnlockMessage | None:
         """Return the MESSAGE the INVITE route sends for ``door``.
 
-        None means ``unlock_door`` would not use the INVITE route.
+        It is addressed for TLS because the dialer, the only connection that
+        sends it, is always TLS. None means ``unlock_door`` would not use the
+        INVITE route.
         """
         try:
             spec = self._normalize_door(door, None)
@@ -1058,7 +1060,7 @@ class SIPClient:
             return None
         return UnlockMessage(
             station_id=spec.station_id,
-            target_uri=_invite_target_uri(self.invite_transport, spec.address),
+            target_uri=_invite_target_uri("tls", spec.address),
             body=spec.unlock_body,
         )
 

@@ -556,3 +556,15 @@ def test_press_during_the_dialer_hangup_falls_back_to_the_invite_route(button_mo
         assert [r.split(" ", 1)[0] for r in gateway.requests] == ["BYE"]
 
     asyncio.run(scenario())
+
+
+def test_invite_route_message_is_addressed_for_tls_whatever_the_invite_transport():
+    client = sip_client.SIPClient(
+        host="192.0.2.10",
+        username="synthetic-user",
+        password="synthetic-password",
+        domain="example.invalid",
+        doors=[FRONT, BACK],
+        invite_transport="tcp",
+    )
+    assert client.invite_route_message(BACK).target_uri.endswith(";transport=tls")
