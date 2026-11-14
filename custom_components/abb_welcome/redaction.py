@@ -122,6 +122,27 @@ def redact_abb_encrypt_keys(value: str) -> str:
     return _SDP_CRYPTO_INLINE_RE.sub(r"\1" + REDACTED, value)
 
 
+def sdp_for_log(body: bytes | str) -> str:
+    """Render an SDP body for a diagnostic log record, one SDP line per line.
+
+    The origin line carries the SIP username, so it is dropped. A 0.0.0.0
+    connection address means the media is on hold; it is labelled before the
+    logging filter masks every address, because that distinction is the reason
+    to log the SDP at all. Media keys and addresses are left to the filter.
+    """
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+    lines = []
+    for line in text.splitlines():
+        if not line:
+            continue
+        if line.startswith("o="):
+            line = f"o={REDACTED}"
+        elif line.startswith("c=") and line.split()[-1] == "0.0.0.0":
+            line = "c=<hold>"
+        lines.append(line)
+    return "\n" + "\n".join(lines)
+
+
 def redact_url_credentials(value: str) -> str:
     """Mask password values in URL query strings and form bodies."""
     return _CREDENTIAL_PARAM_RE.sub(r"\1" + REDACTED, value)

@@ -43,7 +43,7 @@ from .message_diagnostics import MAX_MESSAGE_DIAGNOSTICS_SECONDS, redact_message
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
-from .redaction import get_redacting_logger
+from .redaction import get_redacting_logger, sdp_for_log
 
 _LOGGER = get_redacting_logger(__name__)
 
@@ -617,6 +617,8 @@ class SipListener:
                 video_port=video_port,
                 local_send_keys=local_send_keys,
             )
+            _LOGGER.debug("[abb] listener: SDP offer: %s", sdp_for_log(frame.body))
+            _LOGGER.debug("[abb] listener: SDP answer: %s", sdp_for_log(answer))
             local_tag = uuid.uuid4().hex[:8]
             local_contact = (
                 f"<sip:{self.username}@{self._local_ip}:{self._local_port};"

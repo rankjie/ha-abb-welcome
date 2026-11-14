@@ -120,3 +120,48 @@ def test_connection_error_message_is_redacted():
 )
 def test_redact_url_credentials(raw: str, expected: str):
     assert redaction.redact_url_credentials(raw) == expected
+
+
+def test_sdp_log_record_keeps_structure_and_drops_private_values() -> None:
+    offer = (
+        "v=0\r\n"
+        "o=sipuser-4711 1 1 IN IP4 192.0.2.10\r\n"
+        "s=Talk\r\n"
+        "c=IN IP4 192.0.2.10\r\n"
+        "m=audio 7078 RTP/AVP 8 0\r\n"
+        "c=IN IP4 0.0.0.0\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
+        "a=recvonly\r\n"
+        "a=abb_encrypt:1\r\n"
+        "a=abb_encrypt_key:0123456789abcdef\r\n"
+        "m=video 9078 RTP/AVP 102\r\n"
+        "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:c2VjcmV0c2VjcmV0c2VjcmV0\r\n"
+    ).encode()
+    logger = redaction.get_redacting_logger("abb_sdp_log_test")
+    logger.setLevel(logging.DEBUG)
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    logger.addHandler(handler)
+    try:
+        logger.debug("[abb] listener: SDP offer: %s", redaction.sdp_for_log(offer))
+    finally:
+        logger.removeHandler(handler)
+    logged = stream.getvalue()
+
+    for kept in (
+        "m=audio 7078 RTP/AVP 8 0",
+        "c=<hold>",
+        "a=rtpmap:8 PCMA/8000",
+        "a=recvonly",
+        "a=abb_encrypt:1",
+        "m=video 9078 RTP/AVP 102",
+        "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:<redacted>",
+    ):
+        assert kept in logged
+    for private in (
+        "sipuser-4711",
+        "192.0.2.10",
+        "0123456789abcdef",
+        "c2VjcmV0c2VjcmV0c2VjcmV0",
+    ):
+        assert private not in logged
