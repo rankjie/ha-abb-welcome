@@ -24,6 +24,7 @@ EVENT_TYPES = [
     "call-answered",
     "call-terminated",
     "call-missed",
+    "call-surveillance",
     "light",
     "screenshot",
 ]

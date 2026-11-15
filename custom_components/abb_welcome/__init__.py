@@ -18,6 +18,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.start import async_at_start
+from homeassistant.helpers.storage import Store
 
 from .const import (
     CONF_ALLOW_PICKUP,
@@ -46,7 +47,11 @@ from .const import (
     topology_refresh_action,
     topology_refresh_error,
 )
-from .coordinator import ABBWelcomeCoordinator
+from .coordinator import (
+    STATION_SCREENSHOT_STORAGE_VERSION,
+    ABBWelcomeCoordinator,
+    station_screenshot_storage_key,
+)
 from .message_diagnostics import (
     DEFAULT_MESSAGE_DIAGNOSTICS_SECONDS,
     MAX_MESSAGE_DIAGNOSTICS_SECONDS,
@@ -326,6 +331,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _async_refresh_doors_for_entry(hass, entry, reload_on_change=False)
 
     coordinator = ABBWelcomeCoordinator(hass, entry)
+    await coordinator.async_restore_station_screenshots()
 
     entry_data: dict = {
         "sip_client": _build_client(entry),
@@ -1275,3 +1281,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id, None)
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete per-entry storage when the ABB Welcome entry is removed."""
+    await Store(
+        hass,
+        STATION_SCREENSHOT_STORAGE_VERSION,
+        station_screenshot_storage_key(entry.entry_id),
+        private=True,
+    ).async_remove()

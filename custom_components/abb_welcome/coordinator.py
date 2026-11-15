@@ -18,6 +18,7 @@ import requests
 import urllib3
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DEFAULT_PORTAL_URL, DOMAIN
@@ -29,6 +30,9 @@ _LOG = "[abb] "
 
 HISTORY_TYPES = ",".join(
     [
+        # Root of HA/app-initiated live views; its payload names the station
+        # and the view's screenshot links to it through belongsTo.
+        "com.abb.ispf.event.welcome.call-surveillance",
         "com.abb.ispf.event.welcome.ring",
         "com.abb.ispf.event.welcome.call-answered",
         "com.abb.ispf.event.welcome.call-terminated",
@@ -44,6 +48,13 @@ HISTORY_PAGE_SIZE = 20
 HISTORY_EVENT_CAP = 200
 SCREENSHOT_HISTORY_TYPE = "com.abb.ispf.event.welcome.screenshot"
 RING_EVENT_POLL_DELAYS = (2.0, 5.0, 10.0, 20.0)
+STATION_SCREENSHOT_STORAGE_VERSION = 1
+STATION_SCREENSHOT_SAVE_DELAY_SECONDS = 1.0
+
+
+def station_screenshot_storage_key(entry_id: str) -> str:
+    """Return the storage key holding one entry's per-station screenshots."""
+    return f"{DOMAIN}.{entry_id}.station_screenshots"
 
 
 @dataclass
@@ -98,6 +109,12 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
             entry.data.get("portal_url", DEFAULT_PORTAL_URL) or DEFAULT_PORTAL_URL
         ).rstrip("/")
         self._data = ABBWelcomeData()
+        self._screenshot_store: Store[dict[str, Any]] = Store(
+            hass,
+            STATION_SCREENSHOT_STORAGE_VERSION,
+            station_screenshot_storage_key(entry.entry_id),
+            private=True,
+        )
         self._has_certs = bool(self._cert_pem and self._key_pem)
         self._station_names = {
             str(door.get("station_id", "")).strip(): str(
@@ -520,9 +537,23 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
                 self._data.latest_screenshot_event_id = newest_screenshot_id
 
             # Portal events are newest-first; older frames must not replace newer ones.
+            by_station = self._data.latest_screenshots_by_station
             for ie in reversed(polled_events):
-                if ie.image_data and ie.station_id:
-                    self._data.latest_screenshots_by_station[ie.station_id] = ie
+                if not (ie.image_data and ie.station_id):
+                    continue
+                current = by_station.get(ie.station_id)
+                current_ts = (
+                    self._timestamp_seconds(current.timestamp) if current else None
+                )
+                new_ts = self._timestamp_seconds(ie.timestamp)
+                # A restored frame may be newer than anything on the first page.
+                if (
+                    current_ts is not None
+                    and new_ts is not None
+                    and current_ts > new_ts
+                ):
+                    continue
+                by_station[ie.station_id] = ie
 
             # Latest non-screenshot event for the sensor
             for ie in polled_events:
@@ -549,5 +580,72 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
             session.close()
             self._cleanup(tmps)
 
+    def _station_screenshot_ids(self) -> dict[str, str]:
+        return {
+            station_id: event.event_id
+            for station_id, event in self._data.latest_screenshots_by_station.items()
+        }
+
+    def _station_screenshots_payload(self) -> dict[str, Any]:
+        by_station = self._data.latest_screenshots_by_station
+        return {
+            "stations": {
+                station_id: {
+                    "event_id": event.event_id,
+                    "timestamp": event.timestamp,
+                    "local_name": event.local_name,
+                    "image": base64.b64encode(event.image_data or b"").decode(),
+                }
+                for station_id, event in by_station.items()
+                if event.image_data
+            }
+        }
+
+    async def async_restore_station_screenshots(self) -> None:
+        """Load per-station screenshots kept across Home Assistant restarts.
+
+        The portal's first page only covers the most recent events, so a
+        station that has been quiet would otherwise lose its picture.
+        """
+        stored = await self._screenshot_store.async_load()
+        if stored is None:
+            return
+        stations = stored.get("stations") if isinstance(stored, dict) else None
+        if not isinstance(stations, dict):
+            _LOGGER.warning(_LOG + "Ignoring malformed station screenshot cache")
+            return
+        restored = 0
+        for station_id, raw in stations.items():
+            try:
+                event = IntercomEvent(
+                    event_id=str(raw["event_id"]),
+                    event_type="screenshot",
+                    timestamp=str(raw["timestamp"]),
+                    sender="",
+                    image_data=base64.b64decode(raw["image"], validate=True),
+                    station_id=str(station_id),
+                    local_name=str(raw.get("local_name") or ""),
+                )
+            except (KeyError, TypeError, ValueError):
+                _LOGGER.warning(_LOG + "Ignoring malformed cached station screenshot")
+                continue
+            if event.image_data[:2] != b"\xff\xd8":
+                _LOGGER.warning(
+                    _LOG + "Ignoring cached station screenshot without JPEG data"
+                )
+                continue
+            self._data.latest_screenshots_by_station.setdefault(event.station_id, event)
+            restored += 1
+        _LOGGER.info(_LOG + "Restored %d cached station screenshot(s)", restored)
+
     async def _async_update_data(self) -> ABBWelcomeData:
-        return await self.hass.async_add_executor_job(self.poll_events)
+        before = self._station_screenshot_ids()
+        data = await self.hass.async_add_executor_job(self.poll_events)
+        if self._station_screenshot_ids() != before:
+            # Snapshot now: the next poll mutates the dict in an executor thread.
+            payload = self._station_screenshots_payload()
+            self._screenshot_store.async_delay_save(
+                lambda: payload,
+                STATION_SCREENSHOT_SAVE_DELAY_SECONDS,
+            )
+        return data

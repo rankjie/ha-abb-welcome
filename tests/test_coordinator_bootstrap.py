@@ -53,12 +53,34 @@ class _DataUpdateCoordinator:
 
 
 update_coordinator.DataUpdateCoordinator = _DataUpdateCoordinator
+storage = types.ModuleType("homeassistant.helpers.storage")
+
+
+class _Store:
+    """In-memory stand-in for Home Assistant's JSON store."""
+
+    def __init__(self, *_args: Any, data: Any = None, **_kwargs: Any) -> None:
+        self.data = data
+        self.saved: Any = None
+
+    def __class_getitem__(cls, _item):
+        return cls
+
+    async def async_load(self) -> Any:
+        return self.data
+
+    def async_delay_save(self, data_func, _delay: float) -> None:
+        self.saved = data_func()
+
+
+storage.Store = _Store
 homeassistant.config_entries = config_entries
 homeassistant.core = core
 helpers.update_coordinator = update_coordinator
 sys.modules["homeassistant.config_entries"] = config_entries
 sys.modules["homeassistant.core"] = core
 sys.modules["homeassistant.helpers.update_coordinator"] = update_coordinator
+sys.modules["homeassistant.helpers.storage"] = storage
 
 package = types.ModuleType(_PACKAGE)
 package.__path__ = [str(_PKG_DIR)]
@@ -138,6 +160,7 @@ def _coordinator(session: _Session):
     instance._data = coordinator_module.ABBWelcomeData()
     instance._ring_poll_task = None
     instance._station_names = {}
+    instance._screenshot_store = _Store()
     instance._make_session = lambda: (session, [])
     instance._cleanup = lambda _paths: None
     return instance
@@ -513,3 +536,180 @@ def test_incremental_overlap_is_deduplicated_and_history_cap_is_retained() -> No
     assert len(data.events) == coordinator_module.HISTORY_EVENT_CAP
     assert data.events[0].event_id == "newest"
     assert sum(event.event_id == "retained-199" for event in data.events) == 1
+
+
+def _jpeg_screenshot(event_id: str, timestamp: str) -> dict[str, Any]:
+    event = _screenshot(event_id, timestamp)
+    event["payload"] = base64.b64encode(b"\xff\xd8" + event_id.encode()).decode()
+    return event
+
+
+def _surveillance(event_id: str, station_id: str, name: str, timestamp: str):
+    return _event(
+        event_id,
+        event_type="call-surveillance",
+        timestamp=timestamp,
+        payload=base64.b64encode(
+            json.dumps(
+                {
+                    "local_id": f"sip:{station_id}@example.invalid",
+                    "local_name": name,
+                }
+            ).encode()
+        ).decode(),
+    )
+
+
+def _linked(event: dict[str, Any], root_id: str) -> dict[str, Any]:
+    event["belongsTo"] = root_id
+    return event
+
+
+def test_live_view_screenshots_follow_their_surveillance_call_station() -> None:
+    # Live views opened from HA produce no ring: the screenshot and the
+    # station-less call-terminated link to a call-surveillance root instead.
+    page = [
+        _linked(
+            _event(
+                "garage-end",
+                event_type="call-terminated",
+                timestamp="2026-11-15T13:16:51+01:00",
+            ),
+            "garage-view",
+        ),
+        _linked(
+            _jpeg_screenshot("garage-shot", "2026-11-15T13:16:27+01:00"),
+            "garage-view",
+        ),
+        _surveillance(
+            "garage-view", "100000003", "Parking Garage", "2026-11-15T13:16:21+01:00"
+        ),
+        _linked(
+            _jpeg_screenshot("inner-shot", "2026-11-15T13:16:01+01:00"),
+            "inner-view",
+        ),
+        _surveillance("inner-view", "100000002", "Inner", "2026-11-15T13:15:58+01:00"),
+    ]
+    session = _Session([page])
+    instance = _coordinator(session)
+
+    by_station = instance.poll_events().latest_screenshots_by_station
+
+    assert "com.abb.ispf.event.welcome.call-surveillance" in (
+        session.calls[0][1]["type"].split(",")
+    )
+    assert by_station["100000002"].event_id == "inner-shot"
+    assert by_station["100000003"].event_id == "garage-shot"
+    assert by_station["100000003"].local_name == "Parking Garage"
+
+
+def test_station_screenshots_survive_restart_until_a_newer_frame_arrives() -> None:
+    async def _run() -> None:
+        before_restart = _coordinator(_Session([[]]))
+        before_restart.hass = types.SimpleNamespace(
+            async_add_executor_job=lambda func: asyncio.sleep(0, func()),
+        )
+        before_restart._data.latest_screenshots_by_station["100000001"] = (
+            coordinator_module.IntercomEvent(
+                event_id="outdoor-shot",
+                event_type="screenshot",
+                timestamp="2026-11-13T12:07:15+01:00",
+                sender="",
+                image_data=b"\xff\xd8outdoor",
+                station_id="100000001",
+                local_name="Outdoor 1",
+            )
+        )
+        before_restart._data.latest_screenshots_by_station["100000002"] = (
+            coordinator_module.IntercomEvent(
+                event_id="inner-old",
+                event_type="screenshot",
+                timestamp="2026-11-14T12:26:02+01:00",
+                sender="",
+                image_data=b"\xff\xd8inner-old",
+                station_id="100000002",
+            )
+        )
+        stored = before_restart._station_screenshots_payload()
+
+        # After a restart the first page no longer reaches Outdoor 1's frame,
+        # while Inner has a newer one.
+        page = [
+            _linked(
+                _jpeg_screenshot("inner-new", "2026-11-15T13:11:23+01:00"),
+                "inner-view",
+            ),
+            _surveillance(
+                "inner-view", "100000002", "Inner", "2026-11-15T13:11:18+01:00"
+            ),
+        ]
+        after_restart = _coordinator(_Session([page]))
+        after_restart._screenshot_store = _Store(data=stored)
+        after_restart.hass = before_restart.hass
+        await after_restart.async_restore_station_screenshots()
+        data = await after_restart._async_update_data()
+
+        outdoor = data.latest_screenshots_by_station["100000001"]
+        assert outdoor.event_id == "outdoor-shot"
+        assert outdoor.image_data == b"\xff\xd8outdoor"
+        assert outdoor.local_name == "Outdoor 1"
+        assert data.latest_screenshots_by_station["100000002"].event_id == "inner-new"
+        assert set(after_restart._screenshot_store.saved["stations"]) == {
+            "100000001",
+            "100000002",
+        }
+
+    asyncio.run(_run())
+
+
+def test_older_page_frame_does_not_replace_a_newer_restored_frame() -> None:
+    async def _run() -> None:
+        restored = {
+            "stations": {
+                "100000002": {
+                    "event_id": "inner-new",
+                    "timestamp": "2026-11-15T13:11:23+01:00",
+                    "local_name": "",
+                    "image": base64.b64encode(b"\xff\xd8new").decode(),
+                }
+            }
+        }
+        page = [
+            _linked(
+                _jpeg_screenshot("inner-older", "2026-11-15T13:00:00+01:00"),
+                "inner-view",
+            ),
+            _surveillance(
+                "inner-view", "100000002", "Inner", "2026-11-15T12:59:58+01:00"
+            ),
+        ]
+        instance = _coordinator(_Session([page]))
+        instance._screenshot_store = _Store(data=restored)
+        await instance.async_restore_station_screenshots()
+
+        data = instance.poll_events()
+
+        assert data.latest_screenshots_by_station["100000002"].event_id == "inner-new"
+
+    asyncio.run(_run())
+
+
+def test_malformed_screenshot_cache_is_ignored(caplog) -> None:
+    async def _run() -> None:
+        instance = _coordinator(_Session([]))
+        instance._screenshot_store = _Store(
+            data={
+                "stations": {
+                    "100000002": {
+                        "event_id": "x",
+                        "timestamp": "t",
+                        "image": "not base64!",
+                    }
+                }
+            }
+        )
+        await instance.async_restore_station_screenshots()
+        assert instance._data.latest_screenshots_by_station == {}
+
+    asyncio.run(_run())
+    assert "Ignoring malformed cached station screenshot" in caplog.text
