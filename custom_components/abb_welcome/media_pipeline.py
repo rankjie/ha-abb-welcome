@@ -22,6 +22,7 @@ import socket
 import struct
 import threading
 import time
+import wave
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -987,6 +988,17 @@ class StreamSession:
         return self._call is not None
 
     @property
+    def has_pending_call(self) -> bool:
+        listener = self._incoming_listener
+        station_id = str(self._door.station_id or "").strip()
+        if listener is None or not station_id:
+            return False
+        pending_call_for_station = getattr(listener, "pending_call_for_station", None)
+        return bool(
+            callable(pending_call_for_station) and pending_call_for_station(station_id)
+        )
+
+    @property
     def video_codec(self) -> str:
         return self._video_codec
 
@@ -1661,25 +1673,78 @@ class StreamSession:
                 )
             tone_frames.append(bytes(frame))
 
+        return await self._stream_talkback_frames(
+            sender, tone_frames, duration_s=duration_ms / 1000
+        )
+
+    async def _stream_talkback_frames(
+        self,
+        sender: _PCMATalkSender,
+        frames: list[bytes],
+        *,
+        duration_s: float,
+    ) -> dict[str, Any]:
         sender.start_talk()
         try:
             high_watermark = max(1, min(sender.max_queue_frames, 10))
             low_watermark = max(1, high_watermark // 2)
             next_frame = 0
-            while next_frame < len(tone_frames):
+            while next_frame < len(frames):
                 while (
-                    next_frame < len(tone_frames)
+                    next_frame < len(frames)
                     and sender.queue_frames < high_watermark
                 ):
-                    sender.feed_pcm16le(tone_frames[next_frame])
+                    sender.feed_pcm16le(frames[next_frame])
                     next_frame += 1
-                if next_frame < len(tone_frames):
+                if next_frame < len(frames):
                     while sender.queue_frames > low_watermark:
                         await asyncio.sleep(min(0.005, sender.interval / 4))
-            await sender.drain(timeout=max(1.0, duration_ms / 1000 + 1.0))
+            await sender.drain(timeout=max(1.0, duration_s + 1.0))
         finally:
             sender.stop_talk()
         return sender.stats()
+
+    async def send_talkback_audio_file(self, file_path: str) -> dict[str, Any]:
+        sender = self._talk_sender
+        if sender is None or not sender.active:
+            raise RuntimeError("talkback is not ready; open the camera stream first")
+        if not file_path.lower().endswith(".wav"):
+            raise ValueError(
+                f"Talkback audio file must be a .wav file (got {file_path!r})"
+            )
+
+        def _load_wav_pcm() -> bytes:
+            with wave.open(file_path, "rb") as wf:
+                comptype = wf.getcomptype()
+                channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                framerate = wf.getframerate()
+                if (
+                    comptype != "NONE"
+                    or channels != 1
+                    or sampwidth != 2
+                    or framerate != 8000
+                ):
+                    raise ValueError(
+                        "Talkback WAV file must be uncompressed 8 kHz mono 16-bit PCM "
+                        f"(got comptype={comptype}, channels={channels}, "
+                        f"sampwidth={sampwidth * 8}-bit, rate={framerate} Hz)"
+                    )
+                return wf.readframes(wf.getnframes())
+
+        pcm = await asyncio.to_thread(_load_wav_pcm)
+        if not pcm:
+            raise ValueError("Talkback WAV file contains no audio frames")
+
+        frame_bytes = 320  # 160 samples * 2 bytes (20 ms at 8 kHz)
+        audio_frames = [
+            pcm[i : i + frame_bytes].ljust(frame_bytes, b"\x00")
+            for i in range(0, len(pcm), frame_bytes)
+        ]
+        duration_s = len(audio_frames) * 0.02
+        return await self._stream_talkback_frames(
+            sender, audio_frames, duration_s=duration_s
+        )
 
     async def _punch(
         self,

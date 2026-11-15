@@ -567,6 +567,10 @@ class StationStreamCoordinator:
             self._schedule_close()
             self._notify_state()
 
+    @property
+    def has_pending_call(self) -> bool:
+        return self.session.has_pending_call
+
     def start_talkback(self, session_id: str = "") -> dict[str, Any]:
         session_id = str(session_id or "").strip()
         if self._talkback_owner and session_id and self._talkback_owner != session_id:
@@ -642,6 +646,25 @@ class StationStreamCoordinator:
             frequency_hz=frequency_hz,
             amplitude=amplitude,
         )
+        stats["owner"] = self._talkback_owner
+        self._notify_state()
+        return stats
+
+    async def send_talkback_audio_file(
+        self,
+        *,
+        file_path: str,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        session_id = str(session_id or "").strip()
+        if session_id and self._talkback_owner and session_id != self._talkback_owner:
+            stats = self.talkback_stats()
+            stats["ignored"] = True
+            stats["ignore_reason"] = "talkback_session_owner_mismatch"
+            return stats
+        if session_id and not self._talkback_owner:
+            self._talkback_owner = session_id
+        stats = await self.session.send_talkback_audio_file(file_path)
         stats["owner"] = self._talkback_owner
         self._notify_state()
         return stats
@@ -1120,9 +1143,14 @@ class ABBWelcomeCamera(Camera):
     def talkback_stats(self) -> dict[str, Any]:
         return self._coordinator.talkback_stats()
 
-    def talkback_target_score(self) -> tuple[int, int, int]:
-        """Sort active/current talkback targets ahead of idle sub-cameras."""
+    @property
+    def has_pending_call(self) -> bool:
+        return self._coordinator.has_pending_call
+
+    def talkback_target_score(self) -> tuple[int, int, int, int]:
+        """Sort ringing, active, and current talkback targets ahead of idle sub-cameras."""
         return (
+            0 if self.has_pending_call else 1,
             0 if self._coordinator.talkback_ready else 1,
             0 if self._coordinator.active else 1,
             0 if self._camera_index is None else 1,
@@ -1169,6 +1197,19 @@ class ABBWelcomeCamera(Camera):
             duration_ms=duration_ms,
             frequency_hz=frequency_hz,
             amplitude=amplitude,
+            session_id=talkback_session_id,
+        )
+        self.async_write_ha_state()
+        return stats
+
+    async def async_talkback_audio_file(
+        self,
+        *,
+        file_path: str,
+        talkback_session_id: str = "",
+    ) -> dict[str, Any]:
+        stats = await self._coordinator.send_talkback_audio_file(
+            file_path=file_path,
             session_id=talkback_session_id,
         )
         self.async_write_ha_state()
