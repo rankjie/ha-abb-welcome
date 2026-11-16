@@ -517,9 +517,12 @@ class SipListener:
         """Return the current high-level listener state."""
         return self._state
 
-    def pending_call_for_station(self, station_id: str) -> bool:
-        """Return whether an unanswered INVITE is pending for this station."""
+    def _has_matching_pending_invite(
+        self, station_id: str, *, allow_single_fallback: bool
+    ) -> bool:
         station_id = str(station_id or "").strip()
+        if not station_id and not allow_single_fallback:
+            return False
         now = time.time()
         pending = 0
         for call_id, frame in list(self._open_invites.items()):
@@ -527,9 +530,21 @@ class SipListener:
                 self._open_invites.pop(call_id, None)
                 continue
             pending += 1
-            if self._frame_station_id(frame) == station_id:
+            if station_id and self._frame_station_id(frame) == station_id:
                 return True
-        return pending == 1
+        return allow_single_fallback and pending == 1
+
+    def pending_call_for_station(self, station_id: str) -> bool:
+        """Return whether an unanswered INVITE is pending for this station."""
+        return self._has_matching_pending_invite(
+            station_id, allow_single_fallback=True
+        )
+
+    def has_pending_call_for_station(self, station_id: str) -> bool:
+        """Return whether an unanswered INVITE explicitly matches this station."""
+        return self._has_matching_pending_invite(
+            station_id, allow_single_fallback=False
+        )
 
     async def accept_pending_call(
         self,

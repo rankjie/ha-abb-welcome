@@ -662,12 +662,35 @@ class StationStreamCoordinator:
             stats["ignored"] = True
             stats["ignore_reason"] = "talkback_session_owner_mismatch"
             return stats
-        if session_id and not self._talkback_owner:
-            self._talkback_owner = session_id
-        stats = await self.session.send_talkback_audio_file(file_path)
-        stats["owner"] = self._talkback_owner
-        self._notify_state()
-        return stats
+
+        audio_frames, duration_s = await asyncio.to_thread(
+            self.session.load_talkback_wav_frames, file_path
+        )
+
+        opened_for_talkback = False
+        if not self.session.active:
+            async with self._stream_lock:
+                if not self.session.active:
+                    self._cancel_close_task()
+                    await self.session.open()
+                    opened_for_talkback = True
+
+        try:
+            if session_id and not self._talkback_owner:
+                self._talkback_owner = session_id
+            stats = await self.session.send_talkback_audio_frames(
+                audio_frames, duration_s=duration_s
+            )
+            stats["owner"] = self._talkback_owner
+            return stats
+        finally:
+            if opened_for_talkback and not self._rtsp_play_sessions:
+                async with self._stream_lock:
+                    if not self._rtsp_play_sessions and self.session.active:
+                        await self.session.close()
+                if not self._rtsp_play_sessions:
+                    self._talkback_owner = ""
+            self._notify_state()
 
 
 class ABBWelcomeCamera(Camera):
@@ -1148,11 +1171,11 @@ class ABBWelcomeCamera(Camera):
         return self._coordinator.has_pending_call
 
     def talkback_target_score(self) -> tuple[int, int, int, int]:
-        """Sort ringing, active, and current talkback targets ahead of idle sub-cameras."""
+        """Sort active, ringing, and primary talkback targets ahead of idle sub-cameras."""
         return (
-            0 if self.has_pending_call else 1,
             0 if self._coordinator.talkback_ready else 1,
             0 if self._coordinator.active else 1,
+            0 if self.has_pending_call else 1,
             0 if self._camera_index is None else 1,
         )
 

@@ -265,9 +265,11 @@ talk_tone:
 talk_audio_file:
   name: Send Talkback Audio File
   description: >
-    Stream a pre-recorded 8 kHz mono 16-bit PCM WAV file into the active talkback
-    session (useful for automated prerecorded responses). The file path must be
-    allowlisted in Home Assistant (for example via allowlist_external_dirs).
+    Stream a pre-recorded 8 kHz mono 16-bit PCM WAV file to the outdoor station.
+    If no stream is currently open, the service temporarily opens (or answers)
+    the session, plays the file, and closes the call afterward. The file path
+    must be allowlisted in Home Assistant (for example via
+    allowlist_external_dirs).
   fields:
     entity_id:
       name: Camera Entity

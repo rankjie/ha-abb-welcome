@@ -993,10 +993,8 @@ class StreamSession:
         station_id = str(self._door.station_id or "").strip()
         if listener is None or not station_id:
             return False
-        pending_call_for_station = getattr(listener, "pending_call_for_station", None)
-        return bool(
-            callable(pending_call_for_station) and pending_call_for_station(station_id)
-        )
+        exact_check = getattr(listener, "has_pending_call_for_station", None)
+        return bool(callable(exact_check) and exact_check(station_id))
 
     @property
     def video_codec(self) -> str:
@@ -1704,16 +1702,15 @@ class StreamSession:
             sender.stop_talk()
         return sender.stats()
 
-    async def send_talkback_audio_file(self, file_path: str) -> dict[str, Any]:
-        sender = self._talk_sender
-        if sender is None or not sender.active:
-            raise RuntimeError("talkback is not ready; open the camera stream first")
+    @staticmethod
+    def load_talkback_wav_frames(file_path: str) -> tuple[list[bytes], float]:
+        """Validate an 8 kHz mono 16-bit PCM WAV file and split it into 20 ms frames."""
         if not file_path.lower().endswith(".wav"):
             raise ValueError(
                 f"Talkback audio file must be a .wav file (got {file_path!r})"
             )
 
-        def _load_wav_pcm() -> bytes:
+        try:
             with wave.open(file_path, "rb") as wf:
                 comptype = wf.getcomptype()
                 channels = wf.getnchannels()
@@ -1730,9 +1727,12 @@ class StreamSession:
                         f"(got comptype={comptype}, channels={channels}, "
                         f"sampwidth={sampwidth * 8}-bit, rate={framerate} Hz)"
                     )
-                return wf.readframes(wf.getnframes())
+                pcm = wf.readframes(wf.getnframes())
+        except (wave.Error, EOFError) as err:
+            raise ValueError(
+                f"Talkback audio file is not a valid PCM WAV ({file_path!r}): {err}"
+            ) from err
 
-        pcm = await asyncio.to_thread(_load_wav_pcm)
         if not pcm:
             raise ValueError("Talkback WAV file contains no audio frames")
 
@@ -1741,7 +1741,28 @@ class StreamSession:
             pcm[i : i + frame_bytes].ljust(frame_bytes, b"\x00")
             for i in range(0, len(pcm), frame_bytes)
         ]
-        duration_s = len(audio_frames) * 0.02
+        return audio_frames, len(audio_frames) * 0.02
+
+    async def send_talkback_audio_frames(
+        self,
+        audio_frames: list[bytes],
+        *,
+        duration_s: float,
+    ) -> dict[str, Any]:
+        sender = self._talk_sender
+        if sender is None or not sender.active:
+            raise RuntimeError("talkback is not ready; open the camera stream first")
+        return await self._stream_talkback_frames(
+            sender, audio_frames, duration_s=duration_s
+        )
+
+    async def send_talkback_audio_file(self, file_path: str) -> dict[str, Any]:
+        sender = self._talk_sender
+        if sender is None or not sender.active:
+            raise RuntimeError("talkback is not ready; open the camera stream first")
+        audio_frames, duration_s = await asyncio.to_thread(
+            self.load_talkback_wav_frames, file_path
+        )
         return await self._stream_talkback_frames(
             sender, audio_frames, duration_s=duration_s
         )

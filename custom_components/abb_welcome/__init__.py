@@ -839,15 +839,15 @@ def _camera_sort_key(camera: object) -> tuple[int, int, int, int]:
     scorer = getattr(camera, "talkback_target_score", None)
     if callable(scorer):
         return scorer()
-    pending = bool(getattr(camera, "has_pending_call", False))
     ready = bool(getattr(camera, "talkback_ready", False))
     session = getattr(camera, "_session", None)
     active = bool(getattr(session, "active", False))
+    pending = bool(getattr(camera, "has_pending_call", False))
     camera_index = getattr(camera, "_camera_index", None)
     return (
-        0 if pending else 1,
         0 if ready else 1,
         0 if active else 1,
+        0 if pending else 1,
         0 if camera_index is None else 1,
     )
 
@@ -1264,6 +1264,8 @@ def _async_register_services(hass: HomeAssistant) -> None:
             ),
         )
 
+    if not hass.services.has_service(DOMAIN, SERVICE_TALK_AUDIO_FILE):
+
         async def _talk_audio_file(call: ServiceCall) -> None:
             file_path = str(call.data["file_path"]).strip()
             if not hass.config.is_allowed_path(file_path):
@@ -1299,7 +1301,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
             schema=vol.Schema(
                 {
                     **talk_target_schema,
-                    vol.Required("file_path"): cv.string,
+                    vol.Required("file_path"): str,
                 }
             ),
         )
