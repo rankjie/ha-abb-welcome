@@ -372,6 +372,7 @@ class StationStreamCoordinator:
         self.camera_index = camera_index
         self._stream_lock = asyncio.Lock()
         self._rtsp_play_sessions: list[RtspSession] = []
+        self._active_file_playbacks = 0
         self._close_task: asyncio.Task | None = None
         self._talkback_owner = ""
         self._state_callbacks: list[Callable[[], None]] = []
@@ -392,6 +393,10 @@ class StationStreamCoordinator:
     @property
     def client_count(self) -> int:
         return len(self._rtsp_play_sessions)
+
+    @property
+    def _has_active_consumers(self) -> bool:
+        return bool(self._rtsp_play_sessions) or self._active_file_playbacks > 0
 
     @property
     def video_codec(self) -> str:
@@ -486,6 +491,7 @@ class StationStreamCoordinator:
         )
         if not self._rtsp_play_sessions:
             self.session.set_packet_handlers(on_video=None, on_audio=None)
+        if not self._has_active_consumers:
             self._schedule_close()
         self._notify_state()
 
@@ -529,10 +535,10 @@ class StationStreamCoordinator:
             await asyncio.sleep(_TEARDOWN_GRACE_SECONDS)
         except asyncio.CancelledError:
             return
-        if self._rtsp_play_sessions:
+        if self._has_active_consumers:
             return
         async with self._stream_lock:
-            if self._rtsp_play_sessions:
+            if self._has_active_consumers:
                 return
             if self.session.active:
                 await self.session.close()
@@ -555,7 +561,8 @@ class StationStreamCoordinator:
                 self._discard_rtsp_play_session(client)
         if not self._rtsp_play_sessions:
             self.session.set_packet_handlers(on_video=None, on_audio=None)
-            self._schedule_close()
+            if not self._has_active_consumers:
+                self._schedule_close()
             self._notify_state()
 
     def _forward_audio(self, packet: bytes) -> None:
@@ -564,7 +571,8 @@ class StationStreamCoordinator:
                 self._discard_rtsp_play_session(client)
         if not self._rtsp_play_sessions:
             self.session.set_packet_handlers(on_video=None, on_audio=None)
-            self._schedule_close()
+            if not self._has_active_consumers:
+                self._schedule_close()
             self._notify_state()
 
     @property
@@ -667,15 +675,16 @@ class StationStreamCoordinator:
             self.session.load_talkback_wav_frames, file_path
         )
 
+        self._active_file_playbacks += 1
+        self._cancel_close_task()
         opened_for_talkback = False
-        if not self.session.active:
+        try:
             async with self._stream_lock:
                 if not self.session.active:
                     self._cancel_close_task()
                     await self.session.open()
                     opened_for_talkback = True
 
-        try:
             if session_id and not self._talkback_owner:
                 self._talkback_owner = session_id
             stats = await self.session.send_talkback_audio_frames(
@@ -684,12 +693,15 @@ class StationStreamCoordinator:
             stats["owner"] = self._talkback_owner
             return stats
         finally:
-            if opened_for_talkback and not self._rtsp_play_sessions:
-                async with self._stream_lock:
-                    if not self._rtsp_play_sessions and self.session.active:
-                        await self.session.close()
-                if not self._rtsp_play_sessions:
+            self._active_file_playbacks = max(0, self._active_file_playbacks - 1)
+            if not self._has_active_consumers:
+                if opened_for_talkback:
+                    async with self._stream_lock:
+                        if not self._has_active_consumers and self.session.active:
+                            await self.session.close()
                     self._talkback_owner = ""
+                elif self.session.active:
+                    self._schedule_close()
             self._notify_state()
 
 
@@ -1231,6 +1243,12 @@ class ABBWelcomeCamera(Camera):
         file_path: str,
         talkback_session_id: str = "",
     ) -> dict[str, Any]:
+        if not self._stream_allowed():
+            raise RuntimeError(
+                "ABB Welcome streaming is disarmed. "
+                "Toggle the streaming switch on for this station, "
+                "or wait for an inbound ring."
+            )
         stats = await self._coordinator.send_talkback_audio_file(
             file_path=file_path,
             session_id=talkback_session_id,

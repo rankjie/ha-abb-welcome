@@ -210,6 +210,7 @@ def _write_mulaw_wav(path: Path, payload: bytes = b"\x7f" * 160) -> Path:
 class _FakeTalkSender:
     def __init__(self, *, active: bool = True, max_queue_frames: int = 10) -> None:
         self.active = active
+        self.talking = False
         self.max_queue_frames = max_queue_frames
         self.interval = 0.02
         self.queue_frames = 0
@@ -220,6 +221,7 @@ class _FakeTalkSender:
 
     def start_talk(self) -> None:
         self.started += 1
+        self.talking = True
 
     def feed_pcm16le(self, pcm: bytes) -> None:
         self.frames.append(pcm)
@@ -229,6 +231,7 @@ class _FakeTalkSender:
 
     def stop_talk(self) -> None:
         self.stopped += 1
+        self.talking = False
 
     def stats(self) -> dict[str, object]:
         return {"frames_sent": len(self.frames)}
@@ -416,9 +419,24 @@ class TestSendTalkbackAudioFile(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await inactive_session.send_talkback_audio_file("/media/abb_welcome/msg.wav")
 
+    async def test_interrupted_playback_raises_runtime_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wav_path = _write_wav(Path(tmpdir) / "msg.wav", frames=b"\x01\x02" * 320)
+            sender = _FakeTalkSender(active=True)
+
+            async def _interrupt_on_drain(timeout: float = 1.0) -> None:
+                sender.active = False
+                sender.stop_talk()
+
+            sender.drain = _interrupt_on_drain  # type: ignore[method-assign]
+            session = self._make_session(sender)
+
+            with self.assertRaises(RuntimeError):
+                await session.send_talkback_audio_file(str(wav_path))
+
 
 class TestCoordinatorTalkbackAudioFile(unittest.IsolatedAsyncioTestCase):
-    """Verify unattended auto-open/close behavior in StationStreamCoordinator."""
+    """Verify unattended auto-open/close and lifecycle safety in StationStreamCoordinator."""
 
     def _make_coordinator(self, *, initially_active: bool):
         import asyncio
@@ -432,16 +450,28 @@ class TestCoordinatorTalkbackAudioFile(unittest.IsolatedAsyncioTestCase):
         )
         coord._stream_lock = asyncio.Lock()
         coord._rtsp_play_sessions = []
+        coord._active_file_playbacks = 0
         coord._close_task = None
         coord._talkback_owner = ""
         coord._state_callbacks = []
+        coord.door = types.SimpleNamespace(station_id="0001", address="0001")
+
+        scheduled_closes: list[asyncio.Task] = []
+
+        def _create_bg_task(coro, *, name: str = ""):
+            task = asyncio.create_task(coro)
+            scheduled_closes.append(task)
+            return task
+
+        coord.hass = types.SimpleNamespace(async_create_background_task=_create_bg_task)
 
         calls: list[str] = []
         sender = _FakeTalkSender(active=initially_active)
         session = types.SimpleNamespace(
             active=initially_active,
             load_talkback_wav_frames=mp.StreamSession.load_talkback_wav_frames,
-            talkback_stats=lambda: {"active": session.active, "talking": False},
+            talkback_stats=lambda: {"active": session.active, "talking": sender.talking},
+            set_packet_handlers=lambda **kw: None,
         )
 
         async def _open() -> None:
@@ -453,22 +483,24 @@ class TestCoordinatorTalkbackAudioFile(unittest.IsolatedAsyncioTestCase):
             calls.append("close")
             session.active = False
             sender.active = False
+            sender.stop_talk()
 
         async def _send_frames(frames: list[bytes], *, duration_s: float):
             calls.append("send")
-            sender.frames.extend(frames)
-            return {"frames_sent": len(frames), "duration_s": duration_s}
+            return await mp.StreamSession._stream_talkback_frames(
+                session, sender, frames, duration_s=duration_s
+            )
 
         session.open = _open
         session.close = _close
         session.send_talkback_audio_frames = _send_frames
         coord.session = session
-        return coord, calls, sender
+        return coord, calls, sender, scheduled_closes
 
     async def test_unattended_call_opens_streams_and_closes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             wav_path = _write_wav(Path(tmpdir) / "away.wav", frames=b"\x01\x02" * 160)
-            coord, calls, sender = self._make_coordinator(initially_active=False)
+            coord, calls, sender, scheduled = self._make_coordinator(initially_active=False)
 
             stats = await coord.send_talkback_audio_file(
                 file_path=str(wav_path), session_id="auto-1"
@@ -479,12 +511,13 @@ class TestCoordinatorTalkbackAudioFile(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(sender.frames), 1)
             self.assertFalse(coord.session.active)
             self.assertEqual(coord._talkback_owner, "")
+            self.assertEqual(scheduled, [])
 
     async def test_invalid_wav_does_not_open_unattended_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bad_path = Path(tmpdir) / "bad.wav"
             bad_path.write_text("not a wav", encoding="utf-8")
-            coord, calls, _ = self._make_coordinator(initially_active=False)
+            coord, calls, _, _ = self._make_coordinator(initially_active=False)
 
             with self.assertRaises(ValueError):
                 await coord.send_talkback_audio_file(file_path=str(bad_path))
@@ -492,10 +525,11 @@ class TestCoordinatorTalkbackAudioFile(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls, [])
             self.assertFalse(coord.session.active)
 
-    async def test_active_stream_is_not_closed_after_playback(self) -> None:
+    async def test_active_stream_with_viewer_is_not_closed_after_playback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             wav_path = _write_wav(Path(tmpdir) / "msg.wav", frames=b"\x01\x02" * 160)
-            coord, calls, _ = self._make_coordinator(initially_active=True)
+            coord, calls, _, scheduled = self._make_coordinator(initially_active=True)
+            coord._rtsp_play_sessions.append(types.SimpleNamespace(session_id="rtsp-1"))
 
             stats = await coord.send_talkback_audio_file(
                 file_path=str(wav_path), session_id="viewer-1"
@@ -504,6 +538,89 @@ class TestCoordinatorTalkbackAudioFile(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls, ["send"])
             self.assertEqual(stats["frames_sent"], 1)
             self.assertTrue(coord.session.active)
+            self.assertEqual(scheduled, [])
+
+    async def test_pending_close_timer_cancelled_during_playback_and_rescheduled_after(self) -> None:
+        import asyncio
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wav_path = _write_wav(Path(tmpdir) / "msg.wav", frames=b"\x01\x02" * 160)
+            coord, calls, _, scheduled = self._make_coordinator(initially_active=True)
+            pending_close = asyncio.create_task(asyncio.sleep(10))
+            coord._close_task = pending_close
+
+            stats = await coord.send_talkback_audio_file(file_path=str(wav_path))
+            await asyncio.sleep(0)
+
+            self.assertTrue(pending_close.cancelled())
+            self.assertEqual(calls, ["send"])
+            self.assertEqual(stats["frames_sent"], 1)
+            self.assertEqual(len(scheduled), 1)
+            scheduled[0].cancel()
+
+    async def test_last_rtsp_viewer_detaching_during_playback_defers_close(self) -> None:
+        import asyncio
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wav_path = _write_wav(Path(tmpdir) / "msg.wav", frames=b"\x01\x02" * 160)
+            coord, calls, sender, scheduled = self._make_coordinator(initially_active=True)
+            rtsp_sess = types.SimpleNamespace(session_id="rtsp-1")
+            coord._rtsp_play_sessions.append(rtsp_sess)
+
+            async def _drain_and_detach(timeout: float = 1.0) -> None:
+                coord.detach_rtsp_session(rtsp_sess)
+                self.assertEqual(scheduled, [])
+                self.assertTrue(coord.session.active)
+                sender.drained += 1
+
+            sender.drain = _drain_and_detach  # type: ignore[method-assign]
+
+            stats = await coord.send_talkback_audio_file(file_path=str(wav_path))
+            self.assertEqual(stats["frames_sent"], 1)
+            self.assertEqual(calls, ["send"])
+            self.assertEqual(len(scheduled), 1)
+            scheduled[0].cancel()
+
+    async def test_force_close_interrupts_playback_with_runtime_error(self) -> None:
+        import asyncio
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wav_path = _write_wav(Path(tmpdir) / "msg.wav", frames=b"\x01\x02" * 160)
+            coord, calls, sender, _ = self._make_coordinator(initially_active=False)
+
+            async def _force_close_mid_drain(timeout: float = 1.0) -> None:
+                await coord.force_close()
+
+            sender.drain = _force_close_mid_drain  # type: ignore[method-assign]
+
+            with self.assertRaises(RuntimeError):
+                await coord.send_talkback_audio_file(file_path=str(wav_path))
+
+            self.assertIn("open", calls)
+            self.assertIn("close", calls)
+            self.assertFalse(coord.session.active)
+            self.assertEqual(coord._active_file_playbacks, 0)
+
+    async def test_camera_refuses_talkback_audio_file_when_disarmed(self) -> None:
+        _load_submodule("intercom_dialer")
+        _load_submodule("media_pipeline")
+        camera_mod = _load_submodule("camera")
+
+        cam = camera_mod.ABBWelcomeCamera.__new__(camera_mod.ABBWelcomeCamera)
+        called = 0
+
+        async def _send_file(**kwargs):
+            nonlocal called
+            called += 1
+            return {}
+
+        cam._stream_allowed = lambda: False
+        cam._coordinator = types.SimpleNamespace(send_talkback_audio_file=_send_file)
+        cam.async_write_ha_state = lambda: None
+
+        with self.assertRaises(RuntimeError):
+            await cam.async_talkback_audio_file(file_path="/media/abb_welcome/msg.wav")
+        self.assertEqual(called, 0)
 
 
 class TestTalkAudioFileAllowlistAndRegistration(unittest.IsolatedAsyncioTestCase):

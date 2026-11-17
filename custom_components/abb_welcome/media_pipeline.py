@@ -1688,16 +1688,24 @@ class StreamSession:
             low_watermark = max(1, high_watermark // 2)
             next_frame = 0
             while next_frame < len(frames):
+                if not sender.active or not getattr(sender, "talking", True):
+                    raise RuntimeError("talkback playback interrupted")
                 while (
                     next_frame < len(frames)
                     and sender.queue_frames < high_watermark
                 ):
+                    if not sender.active or not getattr(sender, "talking", True):
+                        raise RuntimeError("talkback playback interrupted")
                     sender.feed_pcm16le(frames[next_frame])
                     next_frame += 1
                 if next_frame < len(frames):
                     while sender.queue_frames > low_watermark:
+                        if not sender.active or not getattr(sender, "talking", True):
+                            raise RuntimeError("talkback playback interrupted")
                         await asyncio.sleep(min(0.005, sender.interval / 4))
             await sender.drain(timeout=max(1.0, duration_s + 1.0))
+            if not sender.active or not getattr(sender, "talking", True):
+                raise RuntimeError("talkback playback interrupted")
         finally:
             sender.stop_talk()
         return sender.stats()
