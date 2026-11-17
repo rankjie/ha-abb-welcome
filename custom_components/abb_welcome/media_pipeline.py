@@ -22,6 +22,7 @@ import socket
 import struct
 import threading
 import time
+import wave
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -987,6 +988,15 @@ class StreamSession:
         return self._call is not None
 
     @property
+    def has_pending_call(self) -> bool:
+        listener = self._incoming_listener
+        station_id = str(self._door.station_id or "").strip()
+        if listener is None or not station_id:
+            return False
+        exact_check = getattr(listener, "has_pending_call_for_station", None)
+        return bool(callable(exact_check) and exact_check(station_id))
+
+    @property
     def video_codec(self) -> str:
         return self._video_codec
 
@@ -1661,25 +1671,109 @@ class StreamSession:
                 )
             tone_frames.append(bytes(frame))
 
+        return await self._stream_talkback_frames(
+            sender, tone_frames, duration_s=duration_ms / 1000
+        )
+
+    async def _stream_talkback_frames(
+        self,
+        sender: _PCMATalkSender,
+        frames: list[bytes],
+        *,
+        duration_s: float,
+    ) -> dict[str, Any]:
         sender.start_talk()
         try:
             high_watermark = max(1, min(sender.max_queue_frames, 10))
             low_watermark = max(1, high_watermark // 2)
             next_frame = 0
-            while next_frame < len(tone_frames):
+            while next_frame < len(frames):
+                if not sender.active or not getattr(sender, "talking", True):
+                    raise RuntimeError("talkback playback interrupted")
                 while (
-                    next_frame < len(tone_frames)
+                    next_frame < len(frames)
                     and sender.queue_frames < high_watermark
                 ):
-                    sender.feed_pcm16le(tone_frames[next_frame])
+                    if not sender.active or not getattr(sender, "talking", True):
+                        raise RuntimeError("talkback playback interrupted")
+                    sender.feed_pcm16le(frames[next_frame])
                     next_frame += 1
-                if next_frame < len(tone_frames):
+                if next_frame < len(frames):
                     while sender.queue_frames > low_watermark:
+                        if not sender.active or not getattr(sender, "talking", True):
+                            raise RuntimeError("talkback playback interrupted")
                         await asyncio.sleep(min(0.005, sender.interval / 4))
-            await sender.drain(timeout=max(1.0, duration_ms / 1000 + 1.0))
+            await sender.drain(timeout=max(1.0, duration_s + 1.0))
+            if not sender.active or not getattr(sender, "talking", True):
+                raise RuntimeError("talkback playback interrupted")
         finally:
             sender.stop_talk()
         return sender.stats()
+
+    @staticmethod
+    def load_talkback_wav_frames(file_path: str) -> tuple[list[bytes], float]:
+        """Validate an 8 kHz mono 16-bit PCM WAV file and split it into 20 ms frames."""
+        if not file_path.lower().endswith(".wav"):
+            raise ValueError(
+                f"Talkback audio file must be a .wav file (got {file_path!r})"
+            )
+
+        try:
+            with wave.open(file_path, "rb") as wf:
+                comptype = wf.getcomptype()
+                channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                framerate = wf.getframerate()
+                if (
+                    comptype != "NONE"
+                    or channels != 1
+                    or sampwidth != 2
+                    or framerate != 8000
+                ):
+                    raise ValueError(
+                        "Talkback WAV file must be uncompressed 8 kHz mono 16-bit PCM "
+                        f"(got comptype={comptype}, channels={channels}, "
+                        f"sampwidth={sampwidth * 8}-bit, rate={framerate} Hz)"
+                    )
+                pcm = wf.readframes(wf.getnframes())
+        except (wave.Error, EOFError) as err:
+            raise ValueError(
+                f"Talkback audio file is not a valid PCM WAV ({file_path!r}): {err}"
+            ) from err
+
+        if not pcm:
+            raise ValueError("Talkback WAV file contains no audio frames")
+
+        frame_bytes = 320  # 160 samples * 2 bytes (20 ms at 8 kHz)
+        audio_frames = [
+            pcm[i : i + frame_bytes].ljust(frame_bytes, b"\x00")
+            for i in range(0, len(pcm), frame_bytes)
+        ]
+        return audio_frames, len(audio_frames) * 0.02
+
+    async def send_talkback_audio_frames(
+        self,
+        audio_frames: list[bytes],
+        *,
+        duration_s: float,
+    ) -> dict[str, Any]:
+        sender = self._talk_sender
+        if sender is None or not sender.active:
+            raise RuntimeError("talkback is not ready; open the camera stream first")
+        return await self._stream_talkback_frames(
+            sender, audio_frames, duration_s=duration_s
+        )
+
+    async def send_talkback_audio_file(self, file_path: str) -> dict[str, Any]:
+        sender = self._talk_sender
+        if sender is None or not sender.active:
+            raise RuntimeError("talkback is not ready; open the camera stream first")
+        audio_frames, duration_s = await asyncio.to_thread(
+            self.load_talkback_wav_frames, file_path
+        )
+        return await self._stream_talkback_frames(
+            sender, audio_frames, duration_s=duration_s
+        )
 
     async def _punch(
         self,

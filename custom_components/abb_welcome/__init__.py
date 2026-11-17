@@ -608,6 +608,7 @@ SERVICE_TALK_START = "talk_start"
 SERVICE_TALK_STOP = "talk_stop"
 SERVICE_TALK_PCM16LE = "talk_pcm16le"
 SERVICE_TALK_TONE = "talk_tone"
+SERVICE_TALK_AUDIO_FILE = "talk_audio_file"
 SERVICE_DIAGNOSE_MESSAGES = "diagnose_messages"
 EXPORT_FIELDS = (
     "gateway_ip",
@@ -834,15 +835,21 @@ def _normalise_entity_ids(raw: object) -> list[str]:
     return [str(raw)]
 
 
-def _camera_sort_key(camera: object) -> tuple[int, int, int]:
+def _camera_sort_key(camera: object) -> tuple[int, int, int, int]:
     scorer = getattr(camera, "talkback_target_score", None)
     if callable(scorer):
         return scorer()
     ready = bool(getattr(camera, "talkback_ready", False))
     session = getattr(camera, "_session", None)
     active = bool(getattr(session, "active", False))
+    pending = bool(getattr(camera, "has_pending_call", False))
     camera_index = getattr(camera, "_camera_index", None)
-    return (0 if ready else 1, 0 if active else 1, 0 if camera_index is None else 1)
+    return (
+        0 if ready else 1,
+        0 if active else 1,
+        0 if pending else 1,
+        0 if camera_index is None else 1,
+    )
 
 
 def _cameras_for_talk_service(hass: HomeAssistant, call: ServiceCall) -> list[object]:
@@ -1253,6 +1260,48 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     vol.Optional("amplitude", default=0.35): vol.All(
                         vol.Coerce(float), vol.Range(min=0.0, max=1.0)
                     ),
+                }
+            ),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_TALK_AUDIO_FILE):
+
+        async def _talk_audio_file(call: ServiceCall) -> None:
+            file_path = str(call.data["file_path"]).strip()
+            if not hass.config.is_allowed_path(file_path):
+                raise HomeAssistantError(f"Path is not allowed: {file_path}")
+            talkback_session_id = str(
+                call.data.get("talkback_session_id")
+                or call.data.get("session_id")
+                or ""
+            ).strip()
+            for camera in _cameras_for_talk_service(hass, call):
+                talk_file = getattr(camera, "async_talkback_audio_file", None)
+                if not callable(talk_file):
+                    raise HomeAssistantError(
+                        "Selected camera does not support talkback"
+                    )
+                try:
+                    stats = await talk_file(
+                        file_path=file_path,
+                        talkback_session_id=talkback_session_id,
+                    )
+                except (OSError, RuntimeError, ValueError) as err:
+                    raise HomeAssistantError(str(err)) from err
+                _LOGGER.info(
+                    "[abb] talk_audio_file target=%s stats=%s",
+                    getattr(camera, "entity_id", "unknown"),
+                    stats,
+                )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_TALK_AUDIO_FILE,
+            _talk_audio_file,
+            schema=vol.Schema(
+                {
+                    **talk_target_schema,
+                    vol.Required("file_path"): str,
                 }
             ),
         )

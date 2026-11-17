@@ -261,3 +261,40 @@ talk_tone:
           max: 1
           step: 0.05
           mode: slider
+
+talk_audio_file:
+  name: Send Talkback Audio File
+  description: >
+    Stream a pre-recorded 8 kHz mono 16-bit PCM WAV file to the outdoor station.
+    If no stream is currently open, the service temporarily opens (or answers)
+    the session, plays the file, and closes the call afterward. The file path
+    must be allowlisted in Home Assistant (for example via
+    allowlist_external_dirs).
+  fields:
+    entity_id:
+      name: Camera Entity
+      description: Optional ABB Welcome camera entity ID(s) to target.
+      required: false
+      selector:
+        entity:
+          domain: camera
+          integration: abb_welcome
+    entry_id:
+      name: Config Entry ID
+      description: Optional config entry ID when targeting all cameras in one entry.
+      required: false
+      selector:
+        text:
+    file_path:
+      name: WAV File Path
+      description: Path to an uncompressed 8 kHz, mono, 16-bit PCM .wav file.
+      required: true
+      example: "/media/abb_welcome/intercom_mensaje.wav"
+      selector:
+        text:
+    talkback_session_id:
+      name: Talkback Session ID
+      description: Optional client session ID used to keep single-speaker ownership.
+      required: false
+      selector:
+        text:
