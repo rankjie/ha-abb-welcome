@@ -565,7 +565,7 @@ sections:
                     perform_action: abb_welcome.talk_audio_file
                     data:
                       entity_id: camera.<gateway>_<door_name>
-                      file_path: "/config/abb_welcome/intercom_mensaje.wav"
+                      file_path: "/media/abb_welcome/intercom_mensaje.wav"
                 - type: button
                   name: Stop
                   icon: mdi:video-off
@@ -604,7 +604,17 @@ sections:
 
 ### Automation: Doorbell Answering Machine (Absence Message)
 
-Broadcast an audio file to the outdoor station when someone rings the doorbell and nobody is home (requires `abb_welcome.talk_audio_file`, which automatically opens/answers the station when no stream is active and closes afterward):
+Broadcast a pre-recorded 8 kHz mono 16-bit PCM WAV file to the outdoor station when someone rings the doorbell and nobody is home.
+
+**Prerequisites:**
+- Requires `abb_welcome.talk_audio_file` ([#43](https://github.com/rankjie/ha-abb-welcome/pull/43)).
+- **Allow pickup** (`switch.<gateway>_allow_pickup`) must be enabled so Home Assistant can answer the pending incoming call (and arm streaming for the ringing station).
+- The WAV file path must be allowlisted in Home Assistant. `/media/...` (Home Assistant's configured media directory) and `/config/www/...` are allowlisted by default; if you store files in another folder such as `/config/abb_welcome`, add it to `configuration.yaml`:
+  ```yaml
+  homeassistant:
+    allowlist_external_dirs:
+      - /config/abb_welcome
+  ```
 
 ```yaml
 alias: "ABB Welcome: Absence Message on Doorbell Ring"
@@ -621,12 +631,13 @@ action:
   - delay: "00:00:03"  # Brief pause after first ring tone
   - action: abb_welcome.talk_audio_file
     data:
-      file_path: "/config/abb_welcome/intercom_mensaje.wav"
+      entity_id: camera.<gateway>_<door_name>  # target the intended/ringing camera
+      file_path: "/media/abb_welcome/intercom_mensaje.wav"
 ```
 
 ### Automation: Actionable Mobile Notification
 
-Send an instant mobile notification with the visitor screenshot and handle the `OPEN_GATE` and `SEND_MESSAGE` button taps:
+Send an instant mobile notification with the visitor screenshot and handle the `OPEN_GATE` and `SEND_MESSAGE` button taps (for multi-door setups, bind `entity_id` to the intended/ringing camera):
 
 ```yaml
 alias: "ABB Welcome: Doorbell Ring Notification & Actions"
@@ -676,7 +687,8 @@ action:
         sequence:
           - action: abb_welcome.talk_audio_file
             data:
-              file_path: "/config/abb_welcome/intercom_mensaje.wav"
+              entity_id: camera.<gateway>_<door_name>
+              file_path: "/media/abb_welcome/intercom_mensaje.wav"
 ```
 
 ## Troubleshooting
