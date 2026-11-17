@@ -9,9 +9,10 @@ Flow:
   3. Compute SHA-1 fingerprint, GRUU (first 5 chars lowercase),
      SIP username (= portal_username + "_" + GRUU), and own_portal_uuid
      (extracted from the cert SAN).
-  4. GET /event?type=...discovery using mutual TLS with the new cert,
-     decode the base64 JSON payload, find the entry with
-     type == com.abb.ispf.client.welcome.gateway.
+  4. App-managed devices only: GET /event?type=...discovery using mutual
+     TLS with the new cert and decode the base64 JSON payload, a map of
+     portal UUID -> {type, name}.  The device to pair is one of the
+     PAIRABLE_CLIENT_TYPES entries.
   5. POST /event with type=...welcome.connect, destination=[gateway_uuid],
      source=own_uuid, plus client-side id+timestamp.  Payload content does
      not affect the integrity code — the gateway re-derives it from the
@@ -25,8 +26,10 @@ Flow:
   7. User opens gateway web admin -> App Management -> Handle pending
      -> sets permissions -> types the integrity code.
   8. Gateway pushes a com.abb.ispf.event.welcome.acl-update event addressed
-     to our UUID.  Poll /event?type=...acl-update (no portal_client filter,
-     it does not mean what you think it does).
+     to our UUID.  Poll /event?type=...acl-update without a portal_client
+     filter.  For app-managed devices, alternate with the official app's
+     Wi-Fi panel query, portal_client=<device uuid>&newer_than=<timestamp>,
+     which filters on the event sender.
   9. Decode the event payload (base64): line 0 is base64 of an
      RSA-PKCS1v15-encrypted SIP password, lines 1+ are an INI config
      describing network domain, outdoor stations, and SIP users.
@@ -62,8 +65,8 @@ from .const import (
     EVENT_TYPE_ACL_UPDATE,
     EVENT_TYPE_CONNECT,
     EVENT_TYPE_DISCOVERY,
-    GATEWAY_CLIENT_TYPE,
     GEO_URL,
+    PAIRABLE_CLIENT_TYPES,
 )
 from .redaction import get_redacting_logger
 from .text import decode_gateway_text, repair_utf8_mojibake
@@ -383,54 +386,81 @@ def _cleanup(paths: list[str]) -> None:
             pass
 
 
-def discover_gateway(
-    portal_url: str, cert_pem: bytes, key_pem: bytes
-) -> tuple[str, str]:
-    """Return (gateway_uuid, gateway_name) from the latest discovery event.
+def list_pairable_devices(
+    portal_url: str,
+    cert_pem: bytes,
+    key_pem: bytes,
+    attempts: int = 5,
+    interval: float = 2.0,
+) -> dict[str, tuple[str, str]]:
+    """Return ``{portal_uuid: (client_type, name)}`` of pairable devices.
 
-    Raises PortalError when no gateway entry is present.
+    Reads the latest discovery event with the new client identity.  A brand
+    new identity can see an empty event list for a few seconds, so an empty
+    list is retried; an empty result after ``attempts`` tries is returned.
     """
     session, temps = _mtls_session(cert_pem, key_pem)
     try:
-        resp = session.get(
-            f"{portal_url}/event",
-            params={
-                "type": EVENT_TYPE_DISCOVERY,
-                "pagination_limit": 1,
-                "pagination_page": 1,
-                "order": "desc",
-            },
-            timeout=DEFAULT_TIMEOUT,
-        )
-        _http_trace(resp, "discovery")
-        resp.raise_for_status()
-        events = (resp.json() or {}).get("events") or []
-        if not events:
-            raise PortalError(
-                "No discovery events visible — the portal account may not be "
-                "linked to any IP gateway yet."
-            )
-        payload_b64 = events[0].get("payload", "")
-        pad = "=" * (-len(payload_b64) % 4)
-        entries: dict[str, dict[str, Any]] = {}
-        try:
-            import json
-            entries = json.loads(base64.b64decode(payload_b64 + pad))
-        except (ValueError, UnicodeDecodeError) as err:
-            raise PortalError(f"Could not decode discovery payload: {err}") from err
-
-        for uid, info in entries.items():
-            if info.get("type") == GATEWAY_CLIENT_TYPE:
-                return uid, repair_utf8_mojibake(
-                    str(info.get("name") or "ABB Welcome Gateway")
+        for n in range(1, attempts + 1):
+            try:
+                resp = session.get(
+                    f"{portal_url}/event",
+                    params={
+                        "type": EVENT_TYPE_DISCOVERY,
+                        "pagination_limit": 1,
+                        "pagination_page": 1,
+                        "order": "desc",
+                    },
+                    timeout=DEFAULT_TIMEOUT,
                 )
-        raise PortalError(
-            "Discovery event has no gateway entry "
-            f"(type={GATEWAY_CLIENT_TYPE} not found)"
-        )
+            except requests.RequestException as err:
+                raise PortalError(f"Discovery request failed: {err}") from err
+            _http_trace(resp, f"discovery[{n}]")
+            if resp.status_code != 200:
+                raise PortalError(f"Discovery request failed: HTTP {resp.status_code}")
+            try:
+                events = (resp.json() or {}).get("events") or []
+            except ValueError as err:
+                raise PortalError("Discovery response is not JSON") from err
+            if events:
+                return _pairable_entries(events[0].get("payload", ""))
+            _log(logging.DEBUG, "Discovery attempt %d: no discovery yet", n)
+            if n < attempts:
+                time.sleep(interval)
+        return {}
     finally:
         session.close()
         _cleanup(temps)
+
+
+def _pairable_entries(payload_b64: str) -> dict[str, tuple[str, str]]:
+    """Decode a discovery payload and keep the entries the app can pair."""
+    pad = "=" * (-len(payload_b64) % 4)
+    try:
+        entries = _json.loads(base64.b64decode(payload_b64 + pad))
+    except (ValueError, UnicodeDecodeError) as err:
+        raise PortalError(f"Could not decode discovery payload: {err}") from err
+    if not isinstance(entries, dict):
+        raise PortalError("Discovery payload is not a JSON object")
+
+    pairable_types = {t.lower() for t in PAIRABLE_CLIENT_TYPES}
+    devices: dict[str, tuple[str, str]] = {}
+    for uid, info in entries.items():
+        if not isinstance(info, dict):
+            continue
+        client_type = str(info.get("type") or "").lower()
+        name = repair_utf8_mojibake(str(info.get("name") or ""))
+        # The official app hides entries whose name starts with "_no_app".
+        if client_type in pairable_types and not name.startswith("_no_app"):
+            devices[str(uid).lower()] = (client_type, name)
+    _log(
+        logging.INFO,
+        "Discovery lists %d entries, %d pairable: %s",
+        len(entries),
+        len(devices),
+        ", ".join(sorted(t for t, _ in devices.values())) or "none",
+    )
+    return devices
 
 
 def send_connect_event(
@@ -440,8 +470,10 @@ def send_connect_event(
     gateway_uuid: str,
     own_uuid: str,
     integrity_code: str,
-) -> None:
+) -> int:
     """POST a welcome.connect event so the gateway shows a pending request.
+
+    Returns the accepted HTTP status (200 or 201).
 
     The integrity code is included for traceability/debug, but the gateway
     derives the expected code from our cert independently.
@@ -463,9 +495,12 @@ def send_connect_event(
     _log(logging.DEBUG, "Connect event metadata redacted")
     session, temps = _mtls_session(cert_pem, key_pem)
     try:
-        resp = session.post(
-            f"{portal_url}/event", json=body, timeout=DEFAULT_TIMEOUT
-        )
+        try:
+            resp = session.post(
+                f"{portal_url}/event", json=body, timeout=DEFAULT_TIMEOUT
+            )
+        except requests.RequestException as err:
+            raise PortalError(f"Connect event failed: {type(err).__name__}") from err
         _http_trace(resp, "connect")
         _log(logging.INFO, "Connect event response: HTTP %d", resp.status_code)
         if resp.status_code not in (200, 201):
@@ -473,9 +508,36 @@ def send_connect_event(
             raise PortalError(
                 f"Connect event rejected: HTTP {resp.status_code}"
             )
+        return resp.status_code
     finally:
         session.close()
         _cleanup(temps)
+
+
+class AclRevokedError(PortalError):
+    """The device answered our pairing with an empty (revoking) ACL update."""
+
+
+class ClientRejectedError(PortalError):
+    """The portal refuses this client identity (removed or revoked)."""
+
+
+# HTTP statuses that mean the portal will never accept this client identity.
+_POLL_FATAL_STATUSES = frozenset({401, 403, 404})
+
+
+def portal_timestamp(moment: datetime) -> str:
+    """Format a ``newer_than`` value like the official app (UTC, +0000)."""
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+0000")
+
+
+def _event_ids(*values: Any) -> list[str]:
+    """Normalize event address fields (string or list) to lowercase IDs."""
+    ids: list[str] = []
+    for value in values:
+        items = value if isinstance(value, list) else [value]
+        ids.extend(str(item).strip().lower() for item in items if item)
+    return ids
 
 
 def poll_acl_update(
@@ -486,54 +548,145 @@ def poll_acl_update(
     attempts: int = 30,
     interval: float = 3.0,
     on_attempt: Callable[[int], None] | None = None,
+    target_uuid: str = "",
+    newer_than: str = "",
 ) -> str | None:
     """Poll until an ACL-update addressed to ``own_uuid`` arrives.
 
     ``on_attempt`` receives each 1-based attempt number before it runs.
+    With ``target_uuid`` and ``newer_than`` (app-managed devices), every
+    second attempt uses the official app's Wi-Fi panel query, which filters
+    on the sending device and on time; there, an event from ``target_uuid``
+    without any destination is accepted, as the official app does.
     Returns the base64-decoded payload as text, or None on timeout.
+    Raises ClientRejectedError when the portal rejects this client,
+    AclRevokedError when the device answers with an empty ACL update, and
+    PortalError for a response that is not an event list.
     """
+    own = own_uuid.lower()
+    target = target_uuid.lower()
+    queries: list[tuple[str, dict[str, Any] | str]] = [
+        (
+            "inbox",
+            {
+                "type": EVENT_TYPE_ACL_UPDATE,
+                "order": "desc",
+                "pagination_limit": 5,
+                "pagination_page": 1,
+            },
+        )
+    ]
+    if target and newer_than:
+        # Passed as a raw string so "+0000" goes out unencoded, byte for
+        # byte what the official app sends.
+        queries.append(
+            (
+                "device",
+                f"type={EVENT_TYPE_ACL_UPDATE}&portal_client={target}"
+                f"&newer_than={newer_than}",
+            )
+        )
     _log(
         logging.INFO,
         "[step 8/8] Polling /event?type=%s (client id redacted; max %d "
-        "attempts, %.1fs interval)",
+        "attempts, %.1fs interval, %d query variant(s))",
         EVENT_TYPE_ACL_UPDATE,
         attempts,
         interval,
+        len(queries),
     )
+    traced: set[str] = set()
     session, temps = _mtls_session(cert_pem, key_pem)
     try:
         for n in range(1, attempts + 1):
             if on_attempt is not None:
                 on_attempt(n)
+            variant, params = queries[(n - 1) % len(queries)]
             try:
                 resp = session.get(
-                    f"{portal_url}/event",
-                    params={
-                        "type": EVENT_TYPE_ACL_UPDATE,
-                        "order": "desc",
-                        "pagination_limit": 5,
-                        "pagination_page": 1,
-                    },
-                    timeout=DEFAULT_TIMEOUT,
+                    f"{portal_url}/event", params=params, timeout=DEFAULT_TIMEOUT
                 )
+            except requests.RequestException as err:
+                _log(logging.DEBUG, "Poll attempt %d (%s): transport error %s",
+                     n, variant, type(err).__name__)
+                time.sleep(interval)
+                continue
+            if variant not in traced:
+                traced.add(variant)
                 _http_trace(resp, f"acl-poll[{n}]")
-                resp.raise_for_status()
-                events = (resp.json() or {}).get("events") or []
-            except (requests.RequestException, ValueError) as err:
-                _log(logging.DEBUG, "Poll attempt %d transport error: %s", n, err)
+            if resp.status_code in _POLL_FATAL_STATUSES:
+                raise ClientRejectedError(
+                    f"ACL poll rejected by the portal: HTTP {resp.status_code}"
+                )
+            if resp.status_code != 200:
+                _log(logging.DEBUG, "Poll attempt %d (%s): HTTP %d, retrying",
+                     n, variant, resp.status_code)
+                time.sleep(interval)
+                continue
+            try:
+                body = resp.json()
+            except ValueError as err:
+                raise PortalError("ACL poll response is not JSON") from err
+            events = body.get("events") if isinstance(body, dict) else None
+            if events is None:
                 events = []
-            _log(logging.DEBUG, "Poll attempt %d: %d events visible", n, len(events))
-            for evt in events:
-                dest = evt.get("destination") or []
-                if own_uuid in dest:
-                    payload_b64 = evt.get("payload", "")
-                    pad = "=" * (-len(payload_b64) % 4)
-                    raw = base64.b64decode(payload_b64 + pad)
-                    _log(logging.INFO,
-                        "ACL-update arrived (event id=%s, %d-byte payload) on attempt %d",
-                        evt.get("id"), len(raw), n,
-                    )
-                    return decode_gateway_text(raw)
+            if not isinstance(events, list):
+                raise PortalError("ACL poll response has no event list")
+            _log(
+                logging.DEBUG,
+                "Poll attempt %d (%s): HTTP 200, %d bytes, keys=%s, %d events",
+                n,
+                variant,
+                len(resp.content),
+                ",".join(sorted(body)) if isinstance(body, dict) else "-",
+                len(events),
+            )
+            # The official app reads the device query's newest event from
+            # the end of the list; the inbox query is ordered newest first.
+            if variant == "device":
+                events = list(reversed(events))
+            for index, evt in enumerate(events):
+                if not isinstance(evt, dict):
+                    continue
+                destinations = _event_ids(
+                    evt.get("destination"), evt.get("destinations")
+                )
+                senders = _event_ids(evt.get("sender"), evt.get("source"))
+                for_us = own in destinations
+                from_target = bool(target) and target in senders
+                has_content = bool(evt.get("payload"))
+                _log(
+                    logging.DEBUG,
+                    "Poll attempt %d item %d: for us=%s, from target=%s, "
+                    "other recipients=%s, has content=%s",
+                    n,
+                    index,
+                    for_us,
+                    from_target,
+                    bool(destinations) and not for_us,
+                    has_content,
+                )
+                # Only the time-filtered device query may accept an event by
+                # sender alone; the inbox query also returns older events.
+                if not (
+                    for_us
+                    or (variant == "device" and from_target and not destinations)
+                ):
+                    continue
+                if not has_content:
+                    if for_us:
+                        raise AclRevokedError(
+                            "The device answered with an empty ACL update"
+                        )
+                    continue
+                payload_b64 = str(evt["payload"])
+                pad = "=" * (-len(payload_b64) % 4)
+                raw = base64.b64decode(payload_b64 + pad)
+                _log(logging.INFO,
+                    "ACL-update arrived (%d-byte payload) on attempt %d (%s)",
+                    len(raw), n, variant,
+                )
+                return decode_gateway_text(raw)
             time.sleep(interval)
         _log(logging.WARNING, "ACL-update polling timed out after %d attempts", attempts)
         return None
@@ -571,7 +724,9 @@ def parse_acl_update(
         raise PortalError(f"SIP password decryption failed: {err}") from err
     _log(logging.INFO, "SIP password decrypted (%d chars; value redacted)", len(sip_password))
 
-    config = configparser.ConfigParser()
+    # ACL values are literal text; a "%" in a door name must not be treated
+    # as interpolation syntax.
+    config = configparser.ConfigParser(interpolation=None)
     try:
         config.read_string(rest)
     except configparser.Error as err:

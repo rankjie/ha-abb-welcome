@@ -59,7 +59,8 @@ doorbell notifications, and two-way audio.
   gateway.
 - For web-admin gateways only, the gateway admin password used at
   `https://<gateway-ip>/`.
-- For app-managed devices, the private MyBuildings **system ID / Portal UUID**.
+- For app-managed devices with more than one device on the MyBuildings
+  account, the device's **Portal UUID**; otherwise setup finds it.
 - For Apple Home: a working Scrypted installation and the
   [ABB HA Doorbell Scrypted plugin][scrypted-bridge].
 
@@ -98,7 +99,7 @@ Then fill in:
 - MyBuildings portal **password**
 - Gateway local **IP address**
 - Gateway **web admin password** (web-admin profile only)
-- Gateway **Portal UUID / MyBuildings system ID** (required for app-managed)
+- Gateway **Portal UUID** (optional)
 
 Optional: if automatic setup cannot read the gateway UUID from the local
 `portalclient.cgi` endpoint, fill in **Gateway Portal UUID** from the gateway web
@@ -111,7 +112,7 @@ Both profiles:
    MyBuildings portal. Each certificate appears as an `ha-*` client, so a retry
    in the same setup dialog with the same portal account reuses it.
 3. Compute the gateway integrity code from the certificate fingerprint.
-4. Send one `welcome.connect` event so the device sees a pending pairing.
+4. Send a `welcome.connect` event so the device sees a pending pairing.
 5. Poll for the gateway ACL update, decrypt the SIP password, read the door
    list, and create HA entities.
 
@@ -119,20 +120,24 @@ The setup dialog shows which stage is running and counts the ACL checks.
 
 For a web-admin gateway, setup reads the gateway UUID from its CGI (unless an
 override was supplied), then logs into the CGI to approve the pending client.
-For an app-managed device, setup uses the required Portal UUID directly and
-immediately polls for the ACL produced by MyBuildings app pairing. It never calls
-the local CGI or waits for a panel approval action.
+For an app-managed device, setup reads the MyBuildings discovery list with the
+new certificate and sends the pairing request to the gateway or Wi-Fi indoor
+station listed there, the same way the official app picks its target. An entered
+Portal UUID is used when it is in that list. If it is not, and the account has
+exactly one device, that device is used instead. With several devices, setup
+lists them and asks for one. Setup never calls the local CGI.
 
 A successful web-admin pairing typically completes in under 15 seconds.
 
-For an app-managed device, the integration creates one `ha-*` client and shows
-its client name and integrity code, persists the identity, then immediately polls
-for its ACL update. M2240x/ASI22 additional apps normally pair automatically when
-they use the same MyBuildings account. The M22403-W does not expose an approval
-screen on the panel; ABB's generic pairing email also describes other product
-families that do. If polling times out, wait and submit again. If the official
-Welcome app shows the station as unpaired and offers **Resend pairing request**,
-use that option; do not unpair an `ha-*` client already shown as paired.
+For an app-managed device, the integration creates one `ha-*` client, persists
+the identity, and waits about 90 seconds for the ACL update. It alternates the
+plain ACL query with the query the official app uses for Wi-Fi indoor stations.
+M2240x/ASI22 additional apps normally pair automatically when they use the same
+MyBuildings account; the M22403-W has no approval screen on the panel. If no
+ACL arrives, the dialog shows the client name and integrity code, and **Submit**
+sends the pairing request again with the same identity before checking for
+another round. An `ha-*` client shown as active in MyBuildings only has a
+certificate; it is paired once the device has sent its ACL.
 
 The pending private identity is stored in Home Assistant's private storage. A
 later config flow can resume the same certificate, client identity, and
@@ -499,13 +504,12 @@ falls back to Standard; another door is never selected silently.
   and that Home Assistant can route to it.
 - **Cannot reach SIP-TLS port 5061**: for an app-managed device, check its local
   IP, Wi-Fi connection, and routing from Home Assistant.
-- **No ACL update after app pairing**: wait briefly and submit again. M2240x/ASI22
-  pairing is normally automatic for clients on the same MyBuildings account; the
-  M22403-W has no panel approval screen. If the official Welcome app offers
-  **Resend pairing request** for an unpaired station, use it. If the config-flow
-  page disappears, start ABB Welcome setup again and choose the app-managed
-  profile; Home Assistant offers to resume the saved request without sending
-  another `welcome.connect`.
+- **No ACL update after app pairing**: submit again to resend the pairing
+  request. If the indoor station lists a pending app under System Settings ->
+  APP Settings, approve it there. If the config-flow page disappears, start
+  ABB Welcome setup again and choose the app-managed profile; Home Assistant
+  offers to resume the saved identity, which resends the pairing request
+  without creating another MyBuildings client.
 - **Any setup failure**: the error page ends with a **Debug report** box holding
   the setup's DEBUG log with passwords, IPs, UUIDs and certificates redacted.
   Copy the whole box into a GitHub issue.

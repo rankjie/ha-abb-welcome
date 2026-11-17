@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import socket
+from datetime import datetime, timedelta, timezone
 
 import voluptuous as vol
 from homeassistant.config_entries import (
@@ -48,6 +49,8 @@ from .const import (
     unlockable_station_ids,
 )
 from .portal import (
+    AclRevokedError,
+    ClientRejectedError,
     GatewayAdminError,
     GatewayWebAdminMissingError,
     PortalError,
@@ -57,8 +60,10 @@ from .portal import (
     gateway_authorize,
     gateway_local_info,
     generate_keypair_and_csr,
+    list_pairable_devices,
     parse_acl_update,
     poll_acl_update,
+    portal_timestamp,
     request_certificate,
     resolve_portal_url,
     send_connect_event,
@@ -81,7 +86,18 @@ def _log_error(msg: str, *args: object) -> None:
 POLL_ATTEMPTS = 60
 # Roughly five minutes for the user to complete the gateway UI flow.
 POLL_ATTEMPTS_MANUAL = 100
+# App-managed rounds stay short (the official app waits 90 s per round) and
+# end on a form, so the dialog never depends on one late progress event.
+APP_MANAGED_POLL_ATTEMPTS = 30
 POLL_INTERVAL = 3.0
+# The official app's Wi-Fi panel query looks back this far from the request.
+ACL_LOOKBACK = timedelta(minutes=5)
+
+DEVICE_KINDS = {
+    "com.abb.ispf.client.welcome.gateway": "IP gateway",
+    "com.abb.ispf.client.globalip.gateway": "IP gateway",
+    "com.abb.ispf.client.welcome.panel": "Wi-Fi indoor station",
+}
 
 PENDING_PAIRING_STORAGE_VERSION = 1
 PENDING_PAIRING_SCHEMA_VERSION = 1
@@ -129,7 +145,7 @@ STEP_APP_MANAGED_DATA_SCHEMA = vol.Schema(
             selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
         ),
         vol.Required(CONF_GATEWAY_IP): str,
-        vol.Required(CONF_GATEWAY_UUID_OVERRIDE): str,
+        vol.Optional(CONF_GATEWAY_UUID_OVERRIDE, default=""): str,
     }
 )
 
@@ -149,6 +165,26 @@ STEP_PENDING_PAIRING_DATA_SCHEMA = vol.Schema(
         )
     }
 )
+
+
+class _DeviceChoiceRequired(Exception):
+    """Discovery cannot tell which device to pair; the user must choose."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__(error)
+        self.error = error
+
+
+def _valid_optional_timestamp(value: object) -> bool:
+    """Return whether ``value`` is "" or an aware ISO-8601 timestamp."""
+    if not isinstance(value, str):
+        return False
+    if not value:
+        return True
+    try:
+        return datetime.fromisoformat(value).tzinfo is not None
+    except ValueError:
+        return False
 
 
 def _gateway_port_reachable(host: str, port: int, timeout: float = 5) -> bool:
@@ -194,7 +230,12 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._doors: list[dict] = []
         self._manual_authorize = False
         self._gateway_profile = GATEWAY_PROFILE_WEB_ADMIN
-        self._acl_timed_out = False
+        self._app_authorize_error = ""
+        self._connect_count = 0
+        self._connect_sent_at: datetime | None = None
+        self._resend_connect = False
+        self._discovery_status = ""
+        self._discovered_devices: dict[str, tuple[str, str]] = {}
         self._pending_pairing_checked = False
         self._pending_pairing: dict[str, object] | None = None
         self._pending_pairing_phase = PENDING_PAIRING_PHASE_AWAITING_ACL
@@ -248,6 +289,10 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 PENDING_PAIRING_PHASE_AWAITING_ACL,
                 PENDING_PAIRING_PHASE_ACL_RECEIVED,
             }
+            # Pairing metadata added after the first app-managed release.
+            and isinstance(data.get("connect_count", 1), int)
+            and _valid_optional_timestamp(data.get("connect_sent_at", ""))
+            and isinstance(data.get("discovery_status", ""), str)
             and (
                 data.get("phase") != PENDING_PAIRING_PHASE_ACL_RECEIVED
                 or (
@@ -277,6 +322,11 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             "gateway_name": self._gateway_name,
             "integrity_eight": self._integrity_eight,
             "integrity_display": self._integrity_display,
+            "connect_count": self._connect_count,
+            "connect_sent_at": (
+                self._connect_sent_at.isoformat() if self._connect_sent_at else ""
+            ),
+            "discovery_status": self._discovery_status,
         }
         if self._pending_pairing_phase == PENDING_PAIRING_PHASE_ACL_RECEIVED:
             data.update(
@@ -304,11 +354,16 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._integrity_eight = str(data["integrity_eight"])
         self._integrity_display = str(data["integrity_display"])
         self._pending_pairing_phase = str(data["phase"])
+        # State saved before these fields existed was stored after exactly one
+        # accepted pairing request, at an unrecorded time, without discovery.
+        self._connect_count = int(data.get("connect_count", 1))
+        sent_at = str(data.get("connect_sent_at", ""))
+        self._connect_sent_at = datetime.fromisoformat(sent_at) if sent_at else None
+        self._discovery_status = str(data.get("discovery_status", ""))
         if self._pending_pairing_phase == PENDING_PAIRING_PHASE_ACL_RECEIVED:
             self._sip_password = str(data["sip_password"])
             self._sip_domain = str(data["sip_domain"])
             self._doors = list(data["doors"])
-        self._manual_authorize = True
 
     async def _async_find_pending_pairing(self) -> ConfigFlowResult | None:
         """Offer recovery before accepting credentials for a new identity."""
@@ -342,8 +397,9 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._pending_pairing = None
 
     async def _check_unique(self, gateway_uuid: str) -> ConfigFlowResult | None:
-        await self.async_set_unique_id(gateway_uuid)
-        self._abort_if_unique_id_configured()
+        if gateway_uuid:
+            await self.async_set_unique_id(gateway_uuid)
+            self._abort_if_unique_id_configured()
         for entry in self._async_current_entries():
             if entry.data.get(CONF_GATEWAY_IP) == self._gateway_ip:
                 return self.async_abort(reason="already_configured")
@@ -388,9 +444,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             self._gateway_ip = user_input[CONF_GATEWAY_IP].strip()
             self._gateway_password = user_input.get(CONF_GATEWAY_PASSWORD, "")
             uuid_raw = user_input.get(CONF_GATEWAY_UUID_OVERRIDE, "").strip().lower()
-            if not capabilities.admin_available and not uuid_raw:
-                errors[CONF_GATEWAY_UUID_OVERRIDE] = "uuid_required"
-            elif uuid_raw and not _UUID_RE.fullmatch(uuid_raw):
+            if uuid_raw and not _UUID_RE.fullmatch(uuid_raw):
                 errors[CONF_GATEWAY_UUID_OVERRIDE] = "invalid_uuid"
             self._gateway_uuid_override = uuid_raw
 
@@ -433,9 +487,23 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
             description_placeholders={
                 "profile": self._gateway_profile,
+                "discovered_devices": (
+                    self._device_list()
+                    if errors.get("base") == "device_choice_required"
+                    else ""
+                ),
                 "debug_report": debug_report,
             },
         )
+
+    def _device_list(self) -> str:
+        """Render the pairable devices discovery listed, for the user to pick."""
+        lines = [
+            f"- {name or 'Unnamed'} ({DEVICE_KINDS.get(client_type, client_type)}): "
+            f"`{uuid}`"
+            for uuid, (client_type, name) in sorted(self._discovered_devices.items())
+        ]
+        return "\n\n**Devices on this account:**\n\n" + "\n".join(lines)
 
     async def async_step_pending_pairing(
         self, user_input: dict | None = None
@@ -454,6 +522,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                     return abort
                 if self._pending_pairing_phase == PENDING_PAIRING_PHASE_ACL_RECEIVED:
                     return await self.async_step_confirm()
+                self._resend_connect = True
                 return await self.async_step_poll_acl()
 
         pending = self._pending_pairing or {}
@@ -517,7 +586,12 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         """Abort and keep the collected debug report visible."""
         return self.async_abort(
             reason=reason,
-            description_placeholders={"debug_report": self._debug_report()},
+            description_placeholders={
+                "discovered_devices": (
+                    self._device_list() if self._discovered_devices else ""
+                ),
+                "debug_report": self._debug_report(),
+            },
         )
 
     def _log_stage_failure(self, err: Exception) -> None:
@@ -547,6 +621,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         # before the certificate request because every certificate registers
         # another client on the portal.
         if not capabilities.admin_available:
+            # May be empty; discovery then picks the device.
             self._gateway_uuid = self._gateway_uuid_override
             self._gateway_name = "M2240x / ASI22"
         elif self._gateway_uuid_override:
@@ -583,18 +658,83 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._fingerprint = identity["fingerprint_sha1"]
         self._own_uuid = identity["own_portal_uuid"]
 
+    def _match_discovered_device(self) -> None:
+        """Pick the app-managed device from the account's discovery list.
+
+        The portal accepts a connect for any UUID, so a value that is not a
+        device of this account would leave the pairing waiting forever.
+        """
+        devices = list_pairable_devices(
+            self._portal_url, self._cert_pem, self._private_key_pem
+        )
+        self._discovered_devices = devices
+        entered = self._gateway_uuid
+        if entered in devices:
+            chosen = entered
+        elif len(devices) == 1:
+            chosen = next(iter(devices))
+            if entered:
+                _LOGGER.warning(
+                    _LOG_PREFIX
+                    + "The entered portal UUID is not a pairable device of this "
+                    "account; using the only listed device instead"
+                )
+        elif devices:
+            raise _DeviceChoiceRequired("device_choice_required")
+        elif entered:
+            _LOGGER.warning(
+                _LOG_PREFIX
+                + "Discovery lists no pairable device; using the entered portal "
+                "UUID unverified"
+            )
+            self._discovery_status = "unverified"
+            return
+        else:
+            raise _DeviceChoiceRequired("device_not_found")
+
+        client_type, name = devices[chosen]
+        self._gateway_uuid = chosen
+        self._discovery_status = client_type
+        if name:
+            self._gateway_name = name
+        _log_info("Pairing with the discovered %s", client_type)
+
+    async def _claim_discovered_device(self) -> bool:
+        """Adopt the discovered UUID; return False if it is already set up.
+
+        Runs before any pairing request goes to a device that discovery
+        picked, so a configured device never gets a second client.
+        """
+        await self.async_set_unique_id(self._gateway_uuid)
+        return not any(
+            entry.unique_id == self._gateway_uuid
+            or entry.data.get(CONF_GATEWAY_IP) == self._gateway_ip
+            for entry in self._async_current_entries()
+        )
+
     def _send_connect_request(self) -> None:
         """Ask the gateway, through the portal, to list our pairing request."""
         self._integrity_eight, self._integrity_display = compute_integrity_code(
             self._fingerprint
         )
-        send_connect_event(
+        self._post_connect()
+
+    def _post_connect(self) -> None:
+        """Send the pairing request for this flow's identity and record it."""
+        status = send_connect_event(
             self._portal_url,
             self._cert_pem,
             self._private_key_pem,
             self._gateway_uuid,
             self._own_uuid,
             self._integrity_eight,
+        )
+        self._connect_count += 1
+        self._connect_sent_at = datetime.now(timezone.utc)
+        _log_info(
+            "Pairing request %d accepted by the portal (HTTP %s)",
+            self._connect_count,
+            status,
         )
 
     def _do_gateway_authorize(self) -> None:
@@ -644,8 +784,17 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             await self.hass.async_add_executor_job(self._resolve_gateway_uuid)
             self._set_pairing_stage("certificate")
             await self.hass.async_add_executor_job(self._ensure_portal_identity)
+            if capabilities.approval_method == "automatic_acl":
+                self._set_pairing_stage("discovery")
+                await self.hass.async_add_executor_job(self._match_discovered_device)
+                if not await self._claim_discovered_device():
+                    self._abort_reason = "already_configured"
+                    return "pairing_failed"
             self._set_pairing_stage("connect")
             await self.hass.async_add_executor_job(self._send_connect_request)
+        except _DeviceChoiceRequired as err:
+            self._log_stage_failure(err)
+            return self._pairing_failed(err.error)
         except GatewayAdminError as err:
             msg = str(err).lower()
             self._log_stage_failure(err)
@@ -663,8 +812,6 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             self._log_stage_failure(err)
             if "401" in msg or "auth" in msg:
                 return self._pairing_failed("invalid_auth")
-            if "no discovery" in msg or "gateway entry" in msg:
-                return self._pairing_failed("gateway_not_found")
             return self._pairing_failed("unknown")
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Unexpected portal setup error")
@@ -733,25 +880,29 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_app_authorize(
         self, user_input: dict | None = None
     ) -> ConfigFlowResult:
-        """Offer another ACL poll after automatic app pairing timed out."""
+        """Resend the pairing request and poll again after a round failed."""
         if user_input is not None:
-            self._acl_timed_out = False
+            self._app_authorize_error = ""
+            self._resend_connect = True
             return await self.async_step_poll_acl()
 
+        error = self._app_authorize_error
         return self.async_show_form(
             step_id="app_authorize",
             data_schema=vol.Schema({}),
-            errors={"base": "acl_timeout_retry"} if self._acl_timed_out else {},
+            errors={"base": error} if error else {},
             description_placeholders={
                 "client_name": self._client_name,
                 "integrity_code": self._integrity_display,
-                "debug_report": (
-                    self._debug_report() if self._acl_timed_out else ""
-                ),
+                "debug_report": self._debug_report() if error else "",
             },
         )
 
     def _poll_attempts(self) -> int:
+        if GATEWAY_CAPABILITIES[self._gateway_profile].approval_method == (
+            "automatic_acl"
+        ):
+            return APP_MANAGED_POLL_ATTEMPTS
         return POLL_ATTEMPTS_MANUAL if self._manual_authorize else POLL_ATTEMPTS
 
     async def async_step_poll_acl(
@@ -793,17 +944,89 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             return await self._async_poll_acl_stages()
 
     async def _async_poll_acl_stages(self) -> str:
+        app_managed = (
+            GATEWAY_CAPABILITIES[self._gateway_profile].approval_method
+            == "automatic_acl"
+        )
+        poll_args: list[object] = [
+            self._portal_url,
+            self._cert_pem,
+            self._private_key_pem,
+            self._own_uuid,
+            self._poll_attempts(),
+            POLL_INTERVAL,
+            self._poll_attempt_started,
+        ]
+        if app_managed:
+            if self._resend_connect:
+                self._resend_connect = False
+                # Identities saved before discovery existed, or whose
+                # discovery was still empty, target an unchecked UUID.
+                if self._discovery_status in ("", "unverified"):
+                    previous_uuid = self._gateway_uuid
+                    try:
+                        await self.hass.async_add_executor_job(
+                            self._match_discovered_device
+                        )
+                    except _DeviceChoiceRequired:
+                        _log_error("The saved target device is not listed in discovery")
+                        self._abort_reason = "saved_device_not_listed"
+                        return "pairing_failed"
+                    except PortalError as err:
+                        _LOGGER.warning(
+                            _LOG_PREFIX + "Discovery before resending failed: %s", err
+                        )
+                        self._app_authorize_error = "resend_failed"
+                        return "app_authorize"
+                    if (
+                        self._gateway_uuid != previous_uuid
+                        and not await self._claim_discovered_device()
+                    ):
+                        self._abort_reason = "already_configured"
+                        return "pairing_failed"
+                try:
+                    await self.hass.async_add_executor_job(self._post_connect)
+                except PortalError as err:
+                    _LOGGER.warning(
+                        _LOG_PREFIX + "Resending the pairing request failed: %s",
+                        err,
+                    )
+                    self._app_authorize_error = "resend_failed"
+                    return "app_authorize"
+                try:
+                    await self._async_save_pending_pairing()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception("Could not persist pending pairing state")
+                    self._abort_reason = "pending_storage_failed"
+                    return "pairing_failed"
+            sent_at = self._connect_sent_at
+            _log_info(
+                "Pairing requests sent: %d, last %s s ago; discovery check: %s",
+                self._connect_count,
+                (
+                    int((datetime.now(timezone.utc) - sent_at).total_seconds())
+                    if sent_at
+                    else "unknown"
+                ),
+                self._discovery_status or "not run",
+            )
+            if sent_at:
+                poll_args += [
+                    self._gateway_uuid,
+                    portal_timestamp(sent_at - ACL_LOOKBACK),
+                ]
         try:
             payload = await self.hass.async_add_executor_job(
-                poll_acl_update,
-                self._portal_url,
-                self._cert_pem,
-                self._private_key_pem,
-                self._own_uuid,
-                self._poll_attempts(),
-                POLL_INTERVAL,
-                self._poll_attempt_started,
+                poll_acl_update, *poll_args
             )
+        except AclRevokedError:
+            _log_error("The device revoked this client instead of pairing it")
+            self._abort_reason = "acl_revoked"
+            return "pairing_failed"
+        except ClientRejectedError as err:
+            _LOGGER.warning(_LOG_PREFIX + "ACL polling stopped: %s", err)
+            self._abort_reason = "client_rejected"
+            return "pairing_failed"
         except Exception:  # noqa: BLE001
             _LOGGER.exception("ACL polling error")
             self._abort_reason = "unknown"
@@ -814,9 +1037,8 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOG_PREFIX + "No ACL update arrived after %d checks",
                 self._poll_attempts(),
             )
-            capabilities = GATEWAY_CAPABILITIES[self._gateway_profile]
-            if capabilities.approval_method == "automatic_acl":
-                self._acl_timed_out = True
+            if app_managed:
+                self._app_authorize_error = "acl_timeout_retry"
                 return "app_authorize"
             self._abort_reason = "acl_timeout"
             return "pairing_failed"
@@ -856,8 +1078,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 door["second_lock"] = d["second_lock"]
             self._doors.append(door)
 
-        capabilities = GATEWAY_CAPABILITIES[self._gateway_profile]
-        if capabilities.approval_method == "automatic_acl":
+        if app_managed:
             self._pending_pairing_phase = PENDING_PAIRING_PHASE_ACL_RECEIVED
             try:
                 await self._async_save_pending_pairing()

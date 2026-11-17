@@ -247,13 +247,15 @@ def _seed_pending_pairing(module, hass):
     flow._gateway_name = "M2240x / ASI22"
     flow._integrity_eight = "1234ABCD"
     flow._integrity_display = "1234 ABCD"
+    flow._discovery_status = "com.abb.ispf.client.welcome.panel"
     flow._password = "portal-password-must-not-be-stored"
     flow._gateway_password = "admin-password-must-not-be-stored"
     _run(flow._async_save_pending_pairing())
     return flow
 
 
-def test_pending_pairing_survives_new_flow_without_new_connect() -> None:
+@pytest.mark.parametrize("legacy_state", [False, True])
+def test_resumed_pairing_resends_connect_with_saved_identity(legacy_state) -> None:
     module = _load_config_flow()
     backing_store = {}
     _seed_pending_pairing(module, _FakeHass(backing_store))
@@ -261,15 +263,26 @@ def test_pending_pairing_survives_new_flow_without_new_connect() -> None:
     stored = backing_store[module.PENDING_PAIRING_STORAGE_KEY]
     assert "portal-password-must-not-be-stored" not in repr(stored)
     assert "admin-password-must-not-be-stored" not in repr(stored)
+    if legacy_state:
+        # dev12 saved its state after exactly one accepted connect and
+        # without the pairing metadata fields.
+        for key in ("connect_count", "connect_sent_at", "discovery_status"):
+            del stored[key]
+        expected_count = 2
+    else:
+        expected_count = 1
 
-    calls = {"connect": 0, "certificate": 0, "poll": 0}
-    module.send_connect_event = lambda *args: calls.__setitem__("connect", 1)
+    calls = {"connect": [], "certificate": 0, "poll": [], "discovery": 0}
+
+    def _discover(*args):
+        calls["discovery"] += 1
+        return dict([_PANEL])
+
+    module.list_pairable_devices = _discover
+    module.send_connect_event = lambda *args: calls["connect"].append(args) or 201
     module.request_certificate = lambda *args: calls.__setitem__("certificate", 1)
+    module.poll_acl_update = lambda *args: calls["poll"].append(args)
 
-    def _poll(*args):
-        calls["poll"] += 1
-
-    module.poll_acl_update = _poll
     resumed = module.ABBWelcomeConfigFlow()
     resumed.hass = _FakeHass(backing_store)
     resumed._gateway_profile = module.GATEWAY_PROFILES[1]
@@ -283,7 +296,22 @@ def test_pending_pairing_survives_new_flow_without_new_connect() -> None:
     )
     assert waiting["step_id"] == "app_authorize"
     assert resumed._client_name == "ha-test"
-    assert calls == {"connect": 0, "certificate": 0, "poll": 1}
+    assert calls["certificate"] == 0
+    gateway_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    assert [args[1:5] for args in calls["connect"]] == [
+        (b"certificate", b"private-key", gateway_uuid,
+         "11111111-1111-4111-8111-111111111111")
+    ]
+    [poll_args] = calls["poll"]
+    assert poll_args[4] == module.APP_MANAGED_POLL_ATTEMPTS
+    assert poll_args[7] == gateway_uuid
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+0000", poll_args[8])
+    saved = backing_store[module.PENDING_PAIRING_STORAGE_KEY]
+    assert saved["connect_count"] == expected_count
+    assert saved["connect_sent_at"]
+    # Only state saved without a discovery check looks the device up again.
+    assert calls["discovery"] == (1 if legacy_state else 0)
+    assert saved["discovery_status"] == "com.abb.ispf.client.welcome.panel"
 
 
 def test_pending_pairing_acl_state_survives_reload_and_clears_on_success() -> None:
@@ -367,26 +395,50 @@ def test_invalid_pending_pairing_must_be_explicitly_reset() -> None:
     assert module.PENDING_PAIRING_STORAGE_KEY not in backing_store
 
 
-def test_app_managed_setup_skips_cgi_and_sends_connect_once_across_retry() -> None:
-    module = _load_config_flow()
-    flow = module.ABBWelcomeConfigFlow()
-    flow.hass = _FakeHass()
-    flow._gateway_profile = module.GATEWAY_PROFILES[1]
-
-    calls = {"connect": 0, "local_info": 0, "authorize": 0, "poll": 0}
+def _stub_app_managed_pairing(module, calls, devices):
     module.default_client_name = lambda: "ha-test"
     module.generate_keypair_and_csr = lambda username: (b"key", b"csr", object())
     module.resolve_portal_url = lambda username: "https://portal.invalid"
-    module.request_certificate = lambda *args: b"cert"
+    module.request_certificate = lambda *args: calls["certificate"].append(1) or b"cert"
     module.derive_identity = lambda *args: {
         "sip_username": "sip-user",
         "fingerprint_sha1": "A" * 40,
         "own_portal_uuid": "11111111-1111-1111-1111-111111111111",
     }
     module.compute_integrity_code = lambda fingerprint: ("1234ABCD", "1234 ABCD")
+    module.list_pairable_devices = lambda *args: dict(devices)
+    module.send_connect_event = (
+        lambda _url, _cert, _key, gateway_uuid, *_args: calls["connect"].append(
+            gateway_uuid
+        )
+        or 201
+    )
+    module._gateway_port_reachable = lambda host, port: port == 5061
 
-    def _connect(*args):
-        calls["connect"] += 1
+
+def _app_managed_credentials(module, uuid=""):
+    return {
+        module.CONF_ABB_USERNAME: "portal-user",
+        module.CONF_ABB_PASSWORD: "portal-password",
+        module.CONF_GATEWAY_IP: "192.0.2.10",
+        module.CONF_GATEWAY_UUID_OVERRIDE: uuid,
+    }
+
+
+_PANEL_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+_OTHER_UUID = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+_PANEL = (_PANEL_UUID, ("com.abb.ispf.client.welcome.panel", "Hallway panel"))
+_GATEWAY = (_OTHER_UUID, ("com.abb.ispf.client.welcome.gateway", "Garage gateway"))
+
+
+def test_app_managed_setup_skips_cgi_and_resends_connect_on_retry() -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[1]
+
+    calls = {"certificate": [], "connect": [], "local_info": 0, "authorize": 0}
+    _stub_app_managed_pairing(module, calls, [_PANEL])
 
     def _local_info(*args):
         calls["local_info"] += 1
@@ -396,15 +448,9 @@ def test_app_managed_setup_skips_cgi_and_sends_connect_once_across_retry() -> No
         calls["authorize"] += 1
 
     poll_results = iter((None, "encrypted-acl"))
-    module.send_connect_event = _connect
     module.gateway_local_info = _local_info
     module.gateway_authorize = _authorize
-    module._gateway_port_reachable = lambda host, port: port == 5061
-    def _poll(*args):
-        calls["poll"] += 1
-        return next(poll_results)
-
-    module.poll_acl_update = _poll
+    module.poll_acl_update = lambda *args: next(poll_results)
     module.parse_acl_update = lambda *args: (
         "sip-password",
         "sip.example.invalid",
@@ -417,35 +463,95 @@ def test_app_managed_setup_skips_cgi_and_sends_connect_once_across_retry() -> No
         ],
     )
 
-    credentials = {
-        module.CONF_ABB_USERNAME: "portal-user",
-        module.CONF_ABB_PASSWORD: "portal-password",
-        module.CONF_GATEWAY_IP: "192.0.2.10",
-        module.CONF_GATEWAY_UUID_OVERRIDE: (
-            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-        ),
-    }
-    waiting = _run(flow.async_step_credentials(credentials))
+    waiting = _run(
+        flow.async_step_credentials(_app_managed_credentials(module, _PANEL_UUID))
+    )
     assert waiting["step_id"] == "app_authorize"
     assert waiting["errors"]["base"] == "acl_timeout_retry"
-    assert calls == {"connect": 1, "local_info": 0, "authorize": 0, "poll": 1}
-    assert flow._gateway_name == "M2240x / ASI22"
+    assert calls["connect"] == [_PANEL_UUID]
+    assert flow._gateway_name == "Hallway panel"
 
-    resumed = module.ABBWelcomeConfigFlow()
-    resumed.hass = _FakeHass(flow.hass.storage)
-    resumed._gateway_profile = module.GATEWAY_PROFILES[1]
-    recovery = _run(resumed.async_step_credentials())
-    assert recovery["step_id"] == "pending_pairing"
-    confirmed = _run(
-        resumed.async_step_pending_pairing(
-            {module.PENDING_PAIRING_ACTION: module.PENDING_PAIRING_ACTION_RESUME}
-        )
-    )
+    confirmed = _run(flow.async_step_app_authorize({}))
     assert confirmed["step_id"] == "confirm"
-    assert calls == {"connect": 1, "local_info": 0, "authorize": 0, "poll": 2}
-    assert resumed._sip_password == "sip-password"
-    created = _run(resumed.async_step_confirm({}))
-    assert created["data"]["portal_url"] == "https://portal.invalid"
+    assert calls["connect"] == [_PANEL_UUID, _PANEL_UUID]
+    assert calls["certificate"] == [1]
+    assert (calls["local_info"], calls["authorize"]) == (0, 0)
+    stored = flow.hass.storage[module.PENDING_PAIRING_STORAGE_KEY]
+    assert stored["phase"] == module.PENDING_PAIRING_PHASE_ACL_RECEIVED
+    assert stored["connect_count"] == 2
+    assert stored["discovery_status"] == "com.abb.ispf.client.welcome.panel"
+    created = _run(flow.async_step_confirm({}))
+    assert created["title"] == "ABB Welcome (Hallway panel)"
+    assert created["data"]["gateway_uuid"] == _PANEL_UUID
+
+
+@pytest.mark.parametrize(
+    ("entered", "devices", "expected_uuid", "expected_status"),
+    [
+        (_PANEL_UUID, [_GATEWAY, _PANEL], _PANEL_UUID, "com.abb.ispf.client.welcome.panel"),
+        (_OTHER_UUID, [_PANEL], _PANEL_UUID, "com.abb.ispf.client.welcome.panel"),
+        ("", [_PANEL], _PANEL_UUID, "com.abb.ispf.client.welcome.panel"),
+        (_PANEL_UUID, [], _PANEL_UUID, "unverified"),
+    ],
+    ids=["entered-listed", "entered-unlisted-single", "blank-single", "nothing-listed"],
+)
+def test_app_managed_connect_targets_discovered_device(
+    entered, devices, expected_uuid, expected_status
+) -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[1]
+    calls = {"certificate": [], "connect": []}
+    _stub_app_managed_pairing(module, calls, devices)
+    module.poll_acl_update = lambda *args: None
+
+    waiting = _run(flow.async_step_credentials(_app_managed_credentials(module, entered)))
+
+    assert waiting["step_id"] == "app_authorize"
+    assert calls["connect"] == [expected_uuid]
+    stored = flow.hass.storage[module.PENDING_PAIRING_STORAGE_KEY]
+    assert stored["gateway_uuid"] == expected_uuid
+    assert stored["discovery_status"] == expected_status
+
+
+@pytest.mark.parametrize(
+    ("entered", "devices", "error"),
+    [
+        (_PANEL_UUID.replace("a", "c"), [_GATEWAY, _PANEL], "device_choice_required"),
+        ("", [_GATEWAY, _PANEL], "device_choice_required"),
+        ("", [], "device_not_found"),
+    ],
+    ids=["entered-unlisted-several", "blank-several", "blank-nothing-listed"],
+)
+def test_app_managed_asks_for_device_when_discovery_is_ambiguous(
+    entered, devices, error
+) -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[1]
+    calls = {"certificate": [], "connect": []}
+    _stub_app_managed_pairing(module, calls, devices)
+    module.poll_acl_update = lambda *args: None
+
+    form = _run(flow.async_step_credentials(_app_managed_credentials(module, entered)))
+
+    assert form["step_id"] == "credentials"
+    assert form["errors"]["base"] == error
+    assert calls["connect"] == []
+    assert module.PENDING_PAIRING_STORAGE_KEY not in flow.hass.storage
+    listed = form["description_placeholders"]["discovered_devices"]
+    for uuid, (_type, name) in devices:
+        assert f"{name} " in listed and f"`{uuid}`" in listed
+
+    # Choosing a listed device reuses the certificate already issued.
+    chosen = _run(
+        flow.async_step_credentials(_app_managed_credentials(module, _PANEL_UUID))
+    )
+    assert chosen["step_id"] == "app_authorize"
+    assert calls["connect"] == [_PANEL_UUID]
+    assert calls["certificate"] == [1]
 
 
 def test_app_managed_entry_omits_admin_and_portal_passwords() -> None:
@@ -480,23 +586,13 @@ def test_app_managed_entry_omits_admin_and_portal_passwords() -> None:
     assert "portal-password-must-not-be-stored" not in repr(data)
 
 
-def test_app_managed_requires_valid_uuid() -> None:
+def test_app_managed_rejects_malformed_uuid() -> None:
     module = _load_config_flow()
     flow = module.ABBWelcomeConfigFlow()
     flow.hass = _FakeHass()
     flow._gateway_profile = module.GATEWAY_PROFILES[1]
-    base = {
-        module.CONF_ABB_USERNAME: "user",
-        module.CONF_ABB_PASSWORD: "password",
-        module.CONF_GATEWAY_IP: "192.0.2.10",
-    }
-    missing = _run(flow.async_step_credentials(base))
-    assert missing["errors"][module.CONF_GATEWAY_UUID_OVERRIDE] == "uuid_required"
-
     invalid = _run(
-        flow.async_step_credentials(
-            {**base, module.CONF_GATEWAY_UUID_OVERRIDE: "not-a-uuid"}
-        )
+        flow.async_step_credentials(_app_managed_credentials(module, "not-a-uuid"))
     )
     assert invalid["errors"][module.CONF_GATEWAY_UUID_OVERRIDE] == "invalid_uuid"
 
@@ -1165,3 +1261,168 @@ def test_acl_poll_progress_shows_attempts_then_timeout_report() -> None:
         f"WARNING abb_pairing_test.config_flow: [abb] No ACL update arrived after {attempts} checks"
         in final["description_placeholders"]["debug_report"]
     )
+
+
+def _waiting_app_managed_flow(module, calls):
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[1]
+    _stub_app_managed_pairing(module, calls, [_PANEL])
+    module.poll_acl_update = lambda *args: calls.setdefault("poll", []).append(1)
+    waiting = _run(
+        flow.async_step_credentials(_app_managed_credentials(module, _PANEL_UUID))
+    )
+    assert waiting["step_id"] == "app_authorize"
+    return flow
+
+
+def test_failed_resend_returns_to_the_retry_form_without_polling() -> None:
+    module = _load_config_flow()
+    calls = {"certificate": [], "connect": []}
+    flow = _waiting_app_managed_flow(module, calls)
+
+    def _rejected(*args):
+        raise module.PortalError("Connect event failed: ConnectionError")
+
+    module.send_connect_event = _rejected
+    retry = _run(flow.async_step_app_authorize({}))
+
+    assert retry["step_id"] == "app_authorize"
+    assert retry["errors"]["base"] == "resend_failed"
+    assert "Resending the pairing request failed" in (
+        retry["description_placeholders"]["debug_report"]
+    )
+    assert calls["poll"] == [1]
+    stored = flow.hass.storage[module.PENDING_PAIRING_STORAGE_KEY]
+    assert stored["connect_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        ("AclRevokedError", "acl_revoked"),
+        ("ClientRejectedError", "client_rejected"),
+        ("PortalError", "unknown"),
+    ],
+)
+def test_poll_failures_abort_with_a_specific_reason(error, reason) -> None:
+    module = _load_config_flow()
+    calls = {"certificate": [], "connect": []}
+    flow = _waiting_app_managed_flow(module, calls)
+
+    def _fail(*args):
+        raise getattr(module, error)("synthetic failure")
+
+    module.poll_acl_update = _fail
+    result = _run(flow.async_step_app_authorize({}))
+
+    assert result["type"] == "abort"
+    assert result["reason"] == reason
+    assert module.PENDING_PAIRING_STORAGE_KEY in flow.hass.storage
+
+
+@pytest.mark.parametrize("sent_at", ["yesterday", "2026-11-17T10:00:00", 5])
+def test_pending_pairing_with_bad_connect_time_must_be_reset(sent_at) -> None:
+    module = _load_config_flow()
+    backing_store = {}
+    _seed_pending_pairing(module, _FakeHass(backing_store))
+    backing_store[module.PENDING_PAIRING_STORAGE_KEY]["connect_sent_at"] = sent_at
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass(backing_store)
+    flow._gateway_profile = module.GATEWAY_PROFILES[1]
+
+    invalid = _run(flow.async_step_credentials())
+
+    assert invalid["step_id"] == "pending_pairing_invalid"
+
+
+def _legacy_pending_store(module):
+    backing_store = {}
+    _seed_pending_pairing(module, _FakeHass(backing_store))
+    stored = backing_store[module.PENDING_PAIRING_STORAGE_KEY]
+    stored["gateway_uuid"] = "cccccccc-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    for key in ("connect_count", "connect_sent_at", "discovery_status"):
+        del stored[key]
+    return backing_store
+
+
+def _resume(module, backing_store):
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass(backing_store)
+    flow._gateway_profile = module.GATEWAY_PROFILES[1]
+    assert _run(flow.async_step_credentials())["step_id"] == "pending_pairing"
+    return flow, _run(
+        flow.async_step_pending_pairing(
+            {module.PENDING_PAIRING_ACTION: module.PENDING_PAIRING_ACTION_RESUME}
+        )
+    )
+
+
+def test_legacy_resume_retargets_the_only_listed_device() -> None:
+    module = _load_config_flow()
+    backing_store = _legacy_pending_store(module)
+    calls = {"certificate": [], "connect": []}
+    _stub_app_managed_pairing(module, calls, [_PANEL])
+    module.poll_acl_update = lambda *args: None
+
+    flow, waiting = _resume(module, backing_store)
+
+    assert waiting["step_id"] == "app_authorize"
+    assert calls["connect"] == [_PANEL_UUID]
+    assert flow.unique_id == _PANEL_UUID
+    saved = backing_store[module.PENDING_PAIRING_STORAGE_KEY]
+    assert saved["gateway_uuid"] == _PANEL_UUID
+    assert saved["gateway_name"] == "Hallway panel"
+
+
+def test_legacy_resume_stops_when_the_saved_device_is_not_listed() -> None:
+    module = _load_config_flow()
+    backing_store = _legacy_pending_store(module)
+    calls = {"certificate": [], "connect": []}
+    _stub_app_managed_pairing(module, calls, [_GATEWAY, _PANEL])
+
+    _flow, result = _resume(module, backing_store)
+
+    assert result["type"] == "abort"
+    assert result["reason"] == "saved_device_not_listed"
+    listed = result["description_placeholders"]["discovered_devices"]
+    assert f"`{_PANEL_UUID}`" in listed and f"`{_OTHER_UUID}`" in listed
+    assert calls["connect"] == []
+
+
+def test_blank_uuid_checks_the_device_ip_before_registering_a_client() -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[1]
+    calls = {"certificate": [], "connect": []}
+    _stub_app_managed_pairing(module, calls, [_PANEL])
+    flow._async_current_entries = lambda: [
+        types.SimpleNamespace(unique_id="x", data={module.CONF_GATEWAY_IP: "192.0.2.10"})
+    ]
+
+    result = _run(flow.async_step_credentials(_app_managed_credentials(module)))
+
+    assert result == {"type": "abort", "reason": "already_configured"}
+    assert calls == {"certificate": [], "connect": []}
+
+
+def test_discovered_device_that_is_already_set_up_gets_no_pairing_request() -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[1]
+    calls = {"certificate": [], "connect": []}
+    _stub_app_managed_pairing(module, calls, [_PANEL])
+    flow._async_current_entries = lambda: [
+        types.SimpleNamespace(
+            unique_id=_PANEL_UUID, data={module.CONF_GATEWAY_IP: "192.0.2.99"}
+        )
+    ]
+
+    result = _run(flow.async_step_credentials(_app_managed_credentials(module)))
+
+    assert result["type"] == "abort"
+    assert result["reason"] == "already_configured"
+    assert calls["connect"] == []
+    assert module.PENDING_PAIRING_STORAGE_KEY not in flow.hass.storage
