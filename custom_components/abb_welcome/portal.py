@@ -989,7 +989,7 @@ def gateway_local_info(
         _log(logging.INFO, "Gateway op=6 returned gateway metadata (values redacted)")
         if isinstance(info.get("portalname"), str):
             info = {**info, "portalname": repair_utf8_mojibake(info["portalname"])}
-        if "uuid" not in info:
+        if not info.get("uuid"):
             raise GatewayAdminError(
                 "Gateway op=6 response missing uuid "
                 f"(response keys: {sorted(info)}; values redacted)"

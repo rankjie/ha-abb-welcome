@@ -16,6 +16,7 @@ from homeassistant.config_entries import (
 )
 from homeassistant.const import __version__ as HA_VERSION
 from homeassistant.core import callback
+from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers import selector
 from homeassistant.helpers.storage import Store
 
@@ -37,6 +38,7 @@ from .const import (
     DEFAULT_LAN_RTSP_PROXY,
     DOMAIN,
     GATEWAY_CAPABILITIES,
+    GATEWAY_CLIENT_TYPES,
     GATEWAY_PROFILE_APP_MANAGED,
     GATEWAY_PROFILE_WEB_ADMIN,
     GATEWAY_PROFILES,
@@ -185,6 +187,12 @@ def _valid_optional_timestamp(value: object) -> bool:
         return datetime.fromisoformat(value).tzinfo is not None
     except ValueError:
         return False
+
+
+def _op6_without_uuid(err: GatewayAdminError) -> bool:
+    """Return whether the gateway login worked but op=6 gave no UUID."""
+    msg = str(err).lower()
+    return "missing uuid" in msg or "op=6" in msg
 
 
 def _gateway_port_reachable(host: str, port: int, timeout: float = 5) -> bool:
@@ -659,14 +667,23 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._own_uuid = identity["own_portal_uuid"]
 
     def _match_discovered_device(self) -> None:
-        """Pick the app-managed device from the account's discovery list.
+        """Pick the device to pair from the account's discovery list.
 
         The portal accepts a connect for any UUID, so a value that is not a
         device of this account would leave the pairing waiting forever.
+        Web-admin gateways only get here when op=6 gave no UUID; they are
+        IP gateways, so Wi-Fi indoor stations are not offered for them.
         """
         devices = list_pairable_devices(
             self._portal_url, self._cert_pem, self._private_key_pem
         )
+        app_managed = self._gateway_profile == GATEWAY_PROFILE_APP_MANAGED
+        if not app_managed:
+            devices = {
+                uuid: info
+                for uuid, info in devices.items()
+                if info[0] in GATEWAY_CLIENT_TYPES
+            }
         self._discovered_devices = devices
         entered = self._gateway_uuid
         if entered in devices:
@@ -690,7 +707,9 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             self._discovery_status = "unverified"
             return
         else:
-            raise _DeviceChoiceRequired("device_not_found")
+            raise _DeviceChoiceRequired(
+                "device_not_found" if app_managed else "gateway_op6_failed"
+            )
 
         client_type, name = devices[chosen]
         self._gateway_uuid = chosen
@@ -779,14 +798,38 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         # Phase 1: portal-side setup + send connect event to gateway.
         # Errors here are unrecoverable (we never put a pending request on
         # the gateway), so they go straight back to the form.
+        discover = capabilities.approval_method == "automatic_acl"
+        op6_fallback = False
         try:
             self._set_pairing_stage("gateway_uuid")
-            await self.hass.async_add_executor_job(self._resolve_gateway_uuid)
+            try:
+                await self.hass.async_add_executor_job(self._resolve_gateway_uuid)
+            except GatewayAdminError as err:
+                if isinstance(err, GatewayWebAdminMissingError) or not (
+                    _op6_without_uuid(err)
+                ):
+                    raise
+                # Logged in, but op=6 gave no UUID: the MyBuildings discovery
+                # list names the account's gateways instead.
+                self._log_stage_failure(err)
+                _log_info("Looking up the gateway portal UUID in MyBuildings discovery")
+                self._gateway_uuid = ""
+                self._gateway_name = "ABB Welcome Gateway"
+                discover = op6_fallback = True
             self._set_pairing_stage("certificate")
             await self.hass.async_add_executor_job(self._ensure_portal_identity)
-            if capabilities.approval_method == "automatic_acl":
+            if discover:
                 self._set_pairing_stage("discovery")
-                await self.hass.async_add_executor_job(self._match_discovered_device)
+                try:
+                    await self.hass.async_add_executor_job(
+                        self._match_discovered_device
+                    )
+                except PortalError as err:
+                    if not op6_fallback:
+                        raise
+                    # Typing the UUID still works when discovery is down.
+                    self._log_stage_failure(err)
+                    return self._pairing_failed("gateway_op6_failed")
                 if not await self._claim_discovered_device():
                     self._abort_reason = "already_configured"
                     return "pairing_failed"
@@ -802,10 +845,6 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 return self._pairing_failed("gateway_web_admin_missing")
             if "login failed" in msg:
                 return self._pairing_failed("gateway_admin_auth_failed")
-            if "missing uuid" in msg or "op=6" in msg:
-                # Local op=6 lookup failed and user didn't supply an override.
-                # Tell them how to recover.
-                return self._pairing_failed("gateway_op6_failed")
             return self._pairing_failed("gateway_admin_failed")
         except PortalError as err:
             msg = str(err).lower()
@@ -813,6 +852,11 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             if "401" in msg or "auth" in msg:
                 return self._pairing_failed("invalid_auth")
             return self._pairing_failed("unknown")
+        except AbortFlow as err:
+            # Raised by async_set_unique_id when another flow already pairs
+            # this device; the background task must turn it into an abort.
+            self._abort_reason = err.reason
+            return "pairing_failed"
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Unexpected portal setup error")
             return self._pairing_failed("unknown")

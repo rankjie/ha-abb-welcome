@@ -101,9 +101,9 @@ Then fill in:
 - Gateway **web admin password** (web-admin profile only)
 - Gateway **Portal UUID** (optional)
 
-Optional: if automatic setup cannot read the gateway UUID from the local
-`portalclient.cgi` endpoint, fill in **Gateway Portal UUID** from the gateway web
-admin Portal page or ABB Welcome mobile app, then retry.
+Optional: if neither the local `portalclient.cgi` endpoint nor the MyBuildings
+discovery list gives the gateway UUID, fill in **Gateway Portal UUID** from the
+gateway web admin Portal page or ABB Welcome mobile app, then retry.
 
 Both profiles:
 
@@ -120,6 +120,8 @@ The setup dialog shows which stage is running and counts the ACL checks.
 
 For a web-admin gateway, setup reads the gateway UUID from its CGI (unless an
 override was supplied), then logs into the CGI to approve the pending client.
+If the CGI returns no UUID, setup takes the IP gateway listed in the MyBuildings
+discovery list, or asks you to choose when the account has several.
 For an app-managed device, setup reads the MyBuildings discovery list with the
 new certificate and sends the pairing request to the gateway or Wi-Fi indoor
 station listed there, the same way the official app picks its target. An entered

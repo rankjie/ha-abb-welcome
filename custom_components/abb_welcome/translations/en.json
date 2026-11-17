@@ -70,7 +70,7 @@
       "no_pending_app": "The gateway did not see our pairing request. Try again or check that the portal account is linked to this gateway.",
       "integrity_code_rejected": "The gateway rejected the integrity code we computed. Open an issue with your gateway firmware version.",
       "gateway_admin_failed": "Talking to the gateway admin CGI failed. See the debug report below.",
-      "gateway_op6_failed": "Could not read the gateway's portal UUID. Some firmware versions have a broken portal-client endpoint. Fill in the optional 'Gateway Portal UUID' field and try again.",
+      "gateway_op6_failed": "Neither the gateway nor MyBuildings reported this gateway's portal UUID. Fill in the optional 'Gateway Portal UUID' field and try again.",
       "invalid_uuid": "Gateway Portal UUID must look like 8d24f178-9c41-4aed-97e1-6008bb6aef82 (8-4-4-4-12 hex). Leave blank to auto-detect.",
       "invalid_profile": "Choose one of the supported device types.",
       "acl_timeout_retry": "No configuration arrived from the device yet.",

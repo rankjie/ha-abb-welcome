@@ -96,6 +96,16 @@ def _install_stubs() -> None:
     const = types.ModuleType("homeassistant.const")
     const.__version__ = "2099.1.0"
 
+    data_entry_flow = types.ModuleType("homeassistant.data_entry_flow")
+
+    class AbortFlow(Exception):
+        def __init__(self, reason, description_placeholders=None):
+            super().__init__(reason)
+            self.reason = reason
+
+    data_entry_flow.AbortFlow = AbortFlow
+    sys.modules["homeassistant.data_entry_flow"] = data_entry_flow
+
     core = types.ModuleType("homeassistant.core")
     core.callback = lambda function: function
 
@@ -730,8 +740,9 @@ def test_web_admin_pairing_keeps_local_uuid_cgi_path() -> None:
     assert flow._gateway_name == "Test Gateway"
 
 
-def _stub_web_admin_pairing(module, calls):
+def _stub_web_admin_pairing(module, calls, devices=()):
     names = iter(("ha-first", "ha-second", "ha-third"))
+    module.list_pairable_devices = lambda *args: dict(devices)
     module.default_client_name = lambda: next(names)
     module._gateway_port_reachable = lambda *_args: True
     module.generate_keypair_and_csr = lambda username: (b"key", b"csr", object())
@@ -765,31 +776,71 @@ def _web_admin_credentials(module, username="portal-user", uuid=""):
     }
 
 
-def test_web_admin_uuid_lookup_failure_does_not_register_portal_client() -> None:
+def _empty_op6(*args):
+    raise sys.modules["abb_pairing_test.config_flow"].GatewayAdminError(
+        "Gateway op=6 response missing uuid (response keys: []; values redacted)"
+    )
+
+
+def test_web_admin_takes_uuid_from_discovery_when_op6_has_none() -> None:
     module = _load_config_flow()
     flow = module.ABBWelcomeConfigFlow()
     flow.hass = _FakeHass()
     flow._gateway_profile = module.GATEWAY_PROFILES[0]
     calls = {"certificate": [], "connect": []}
-    _stub_web_admin_pairing(module, calls)
+    # The Wi-Fi panel is not an IP gateway, so it is never the target here.
+    _stub_web_admin_pairing(module, calls, [_PANEL, _GATEWAY])
+    module.gateway_local_info = _empty_op6
+    authorized = []
+    module.gateway_authorize = lambda *args: authorized.append(args) or "user_7"
 
-    def _empty_op6(*args):
-        raise module.GatewayAdminError("Gateway op=6 response missing uuid: {}")
+    result = _run(flow.async_step_credentials(_web_admin_credentials(module)))
 
+    assert result["type"] == "abort"
+    assert result["reason"] == "acl_timeout"
+    assert calls == {"certificate": ["portal-user"], "connect": [(b"cert-1", _OTHER_UUID)]}
+    assert len(authorized) == 1
+    assert flow._gateway_name == "Garage gateway"
+    assert flow.unique_id == _OTHER_UUID
+
+
+def test_web_admin_lists_gateways_when_op6_has_no_uuid_and_several_exist() -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[0]
+    calls = {"certificate": [], "connect": []}
+    second = ("dddddddd-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+              ("com.abb.ispf.client.globalip.gateway", "Office gateway"))
+    _stub_web_admin_pairing(module, calls, [_GATEWAY, second, _PANEL])
     module.gateway_local_info = _empty_op6
     module.gateway_authorize = lambda *args: "user_7"
 
-    failed = _run(
-        flow.async_step_credentials(_web_admin_credentials(module))
-    )
-    assert failed["errors"]["base"] == "gateway_op6_failed"
-    assert calls == {"certificate": [], "connect": []}
+    form = _run(flow.async_step_credentials(_web_admin_credentials(module)))
 
-    uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-    _run(
-        flow.async_step_credentials(_web_admin_credentials(module, uuid=uuid))
-    )
-    assert calls == {"certificate": ["portal-user"], "connect": [(b"cert-1", uuid)]}
+    assert form["errors"]["base"] == "device_choice_required"
+    listed = form["description_placeholders"]["discovered_devices"]
+    assert f"`{_OTHER_UUID}`" in listed and f"`{second[0]}`" in listed
+    assert f"`{_PANEL_UUID}`" not in listed
+    assert calls["connect"] == []
+
+    _run(flow.async_step_credentials(_web_admin_credentials(module, uuid=second[0])))
+    assert calls == {"certificate": ["portal-user"], "connect": [(b"cert-1", second[0])]}
+
+
+def test_web_admin_asks_for_uuid_when_neither_source_has_one() -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[0]
+    calls = {"certificate": [], "connect": []}
+    _stub_web_admin_pairing(module, calls, [_PANEL])
+    module.gateway_local_info = _empty_op6
+
+    failed = _run(flow.async_step_credentials(_web_admin_credentials(module)))
+
+    assert failed["errors"]["base"] == "gateway_op6_failed"
+    assert calls == {"certificate": ["portal-user"], "connect": []}
 
 
 def test_web_admin_retry_after_connect_reuses_issued_certificate() -> None:
@@ -1173,7 +1224,8 @@ def test_pairing_failure_shows_redacted_debug_report() -> None:
         isinstance(handler, sys.modules["abb_pairing_test.pairing_report"].PairingReport)
         for handler in portal_logger.handlers
     )
-    assert calls == {"certificate": [], "connect": []}
+    # The discovery fallback needs a certificate; no pairing request is sent.
+    assert calls == {"certificate": ["portal-user"], "connect": []}
 
 
 def test_debug_report_keeps_start_and_end_of_long_runs() -> None:
@@ -1426,3 +1478,52 @@ def test_discovered_device_that_is_already_set_up_gets_no_pairing_request() -> N
     assert result["reason"] == "already_configured"
     assert calls["connect"] == []
     assert module.PENDING_PAIRING_STORAGE_KEY not in flow.hass.storage
+
+
+def test_web_admin_failed_discovery_still_asks_for_the_uuid() -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[0]
+    calls = {"certificate": [], "connect": []}
+    _stub_web_admin_pairing(module, calls)
+    module.gateway_local_info = _empty_op6
+
+    def _down(*args):
+        raise module.PortalError("Discovery request failed: HTTP 503")
+
+    module.list_pairable_devices = _down
+
+    failed = _run(flow.async_step_credentials(_web_admin_credentials(module)))
+
+    assert failed["errors"]["base"] == "gateway_op6_failed"
+    assert calls["connect"] == []
+
+
+@pytest.mark.parametrize("profile_index", [0, 1])
+def test_discovered_device_paired_by_another_flow_aborts_cleanly(profile_index) -> None:
+    module = _load_config_flow()
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILES[profile_index]
+    calls = {"certificate": [], "connect": []}
+    if profile_index == 0:
+        _stub_web_admin_pairing(module, calls, [_GATEWAY])
+        module.gateway_local_info = _empty_op6
+        credentials = _web_admin_credentials(module)
+    else:
+        _stub_app_managed_pairing(module, calls, [_PANEL])
+        credentials = _app_managed_credentials(module)
+
+    async def _in_progress(unique_id, **kwargs):
+        raise sys.modules["homeassistant.data_entry_flow"].AbortFlow(
+            "already_in_progress"
+        )
+
+    flow.async_set_unique_id = _in_progress
+
+    result = _run(flow.async_step_credentials(credentials))
+
+    assert result["type"] == "abort"
+    assert result["reason"] == "already_in_progress"
+    assert calls["connect"] == []

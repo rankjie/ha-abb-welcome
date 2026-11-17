@@ -27,11 +27,11 @@ DEFAULT_PORTAL_URL = "https://api.eu.mybuildings.abb.com"
 CLIENT_TYPE = "com.abb.ispf.client.globalip.app.abb.android"
 # Discovery entries the official app offers for pairing (IP gateways and
 # Wi-Fi indoor stations); the type is compared case-insensitively.
-PAIRABLE_CLIENT_TYPES = (
+GATEWAY_CLIENT_TYPES = (
     "com.abb.ispf.client.welcome.gateway",
     "com.abb.ispf.client.globalip.gateway",
-    "com.abb.ispf.client.welcome.panel",
 )
+PAIRABLE_CLIENT_TYPES = (*GATEWAY_CLIENT_TYPES, "com.abb.ispf.client.welcome.panel")
 
 EVENT_TYPE_DISCOVERY = "com.abb.ispf.event.discovery"
 EVENT_TYPE_CONNECT = "com.abb.ispf.event.welcome.connect"
