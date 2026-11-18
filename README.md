@@ -96,7 +96,10 @@ First choose a device profile:
 For a **Busch-Jaeger IP touch 7** (firmware 3.08) with a Smart Access Point
 (V6.66), enter the **touch panel's IP address** in the app-managed profile.
 The owner verified pairing, ring detection and live video with
-`v1.8.0-dev4`. Door unlock from Home Assistant still fails on this setup.
+`v1.8.0-dev4`. The panel identifies itself as `GlobalIP` and explicitly
+grants HA permission to open the door. With the Standard strategy, the panel
+acknowledges the SIP message but the door stays locked. Re-pairing to obtain
+that permission is unnecessary. [Pairing diagnostics](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6985603402)
 On this installation, enabling the Smart AP's SIP server interrupted calls
 from the H81381P1-S-03 outdoor station to the indoor panel. Keep it off for
 this pairing. [Hardware test results](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6985197643)
@@ -734,7 +737,9 @@ action:
   manually and retry.
 - **The gateway did not see our pairing request**: retry pairing; the
   portal-to-gateway link may have been briefly delayed.
-- **A door does not open**: try **Standard** unlock strategy.
+- **A door does not open**: try **Standard** unlock strategy. On the IP touch 7
+  setup described above, this strategy has already been tested and the Welcome
+  app remains the verified way to open the door.
 - **WebRTC says `wrong response on DESCRIBE`**: turn on `Streaming enabled` and
   open the camera within the armed window.
 - **Camera has video but no audio**: confirm you are on a current version and
