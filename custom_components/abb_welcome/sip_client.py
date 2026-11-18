@@ -947,7 +947,7 @@ class SIPClient:
             if response.status_code() != 200:
                 _LOGGER.error("Fast unlock MESSAGE failed for %s: %s", door.name, response.start_line)
                 return False
-            _LOGGER.debug("Fast unlock succeeded for %s", door.name)
+            _LOGGER.debug("Fast unlock MESSAGE received SIP 200 OK for %s", door.name)
             return True
         except RuntimeError as err:
             _LOGGER.error("Fast unlock failed for %s: %s", door.name, err)
@@ -1006,7 +1006,7 @@ class SIPClient:
                 return False
 
             unlocked = True
-            _LOGGER.debug("Invite unlock succeeded for %s", door.name)
+            _LOGGER.debug("Invite unlock MESSAGE received SIP 200 OK for %s", door.name)
             return True
         except TimeoutError as err:
             _LOGGER.error("Invite unlock timed out for %s: %s", door.name, err)
