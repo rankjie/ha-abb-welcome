@@ -97,7 +97,14 @@ For a **Busch-Jaeger IP touch 7** (firmware 3.08) with a Smart Access Point
 (V6.66), enter the **touch panel's IP address** in the app-managed profile.
 The owner verified pairing, ring detection and live video with
 `v1.8.0-dev4`. Door unlock from Home Assistant still fails on this setup.
-[Hardware test results](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6980783307)
+On this installation, enabling the Smart AP's SIP server interrupted calls
+from the H81381P1-S-03 outdoor station to the indoor panel. Keep it off for
+this pairing. [Hardware test results](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6985197643)
+
+For an app-managed entry, **Download diagnostics** checks the latest retained
+pairing record for the panel's system type and this HA client's door-opening
+permission. Only share the `pairing_acl` section. A missing record or an
+unknown permission leaves the grant unconfirmed.
 
 Then fill in:
 

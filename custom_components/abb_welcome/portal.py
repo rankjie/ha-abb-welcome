@@ -540,6 +540,93 @@ def _event_ids(*values: Any) -> list[str]:
     return ids
 
 
+def _pairing_metadata(payload: str, sip_username: str) -> dict[str, str]:
+    # Only the INI after the encrypted SIP password describes capabilities.
+    try:
+        raw = base64.b64decode(payload + "=" * (-len(payload) % 4), validate=True)
+        _, separator, ini = raw.partition(b"\n")
+        config = configparser.ConfigParser(interpolation=None)
+        config.read_string(decode_gateway_text(ini.rstrip(b"\x00")))
+    except (ValueError, configparser.Error):
+        return {"status": "invalid_record"}
+    if not separator or not config.has_section("network") or config.defaults():
+        return {"status": "invalid_record"}
+
+    family = config.get("network", "systemtype", fallback="")
+    grants = []
+    for section in config.sections():
+        if section.startswith("user_"):
+            user = config[section]
+            if user.get("username", user.get("user")) == sip_username:
+                grants.append(user.get("opendoor"))
+    permission = grants[0] if len(grants) == 1 else None
+    return {
+        "status": "found",
+        "system_type": family
+        if family in ("GlobalIP", "mrange", "allegro")
+        else "unknown",
+        "open_door_permission": permission
+        if permission in ("yes", "no")
+        else "unknown",
+    }
+
+
+def read_pairing_diagnostics(
+    portal_url: str,
+    cert_pem: bytes,
+    key_pem: bytes,
+    own_uuid: str,
+    panel_uuid: str,
+    sip_username: str,
+) -> dict[str, str]:
+    """Read the most recent retained ACL addressed to this client by its panel."""
+    if not all((cert_pem, key_pem, own_uuid, panel_uuid, sip_username)):
+        return {"status": "missing_pairing_identity"}
+    session, temps = _mtls_session(cert_pem, key_pem)
+    try:
+        response = session.get(
+            f"{portal_url.rstrip('/')}/event",
+            params={
+                "type": EVENT_TYPE_ACL_UPDATE,
+                "portal_client": panel_uuid,
+                "order": "desc",
+                "pagination_limit": 20,
+                "pagination_page": 1,
+            },
+            timeout=15,
+        )
+        if response.status_code != 200:
+            return {"status": "portal_unavailable"}
+        body = response.json()
+    except (requests.RequestException, ValueError):
+        return {"status": "portal_unavailable"}
+    finally:
+        session.close()
+        _cleanup(temps)
+
+    events = body.get("events") if isinstance(body, dict) else None
+    if not isinstance(events, list):
+        return {"status": "portal_unavailable"}
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != EVENT_TYPE_ACL_UPDATE:
+            continue
+        if panel_uuid.lower() not in _event_ids(
+            event.get("sender"), event.get("source")
+        ):
+            continue
+        if own_uuid.lower() not in _event_ids(
+            event.get("destination"), event.get("destinations")
+        ):
+            continue
+        payload = event.get("payload")
+        if payload == "":
+            return {"status": "revoked"}
+        if not isinstance(payload, str):
+            return {"status": "invalid_record"}
+        return _pairing_metadata(payload, sip_username)
+    return {"status": "not_found"}
+
+
 def poll_acl_update(
     portal_url: str,
     cert_pem: bytes,

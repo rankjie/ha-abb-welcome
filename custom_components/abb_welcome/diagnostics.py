@@ -8,7 +8,13 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from .const import (
+    DEFAULT_PORTAL_URL,
+    DOMAIN,
+    GATEWAY_PROFILE_APP_MANAGED,
+    gateway_profile,
+)
+from .portal import read_pairing_diagnostics
 
 REDACT = "**REDACTED**"
 
@@ -118,7 +124,7 @@ async def async_get_config_entry_diagnostics(
             ),
         }
 
-    return {
+    report = {
         "config_entry": {
             **_redact(data),
             "certificate_pem": cert_info,
@@ -126,3 +132,14 @@ async def async_get_config_entry_diagnostics(
         "options": _redact(options),
         "coordinator": coordinator_info,
     }
+    if gateway_profile(data) == GATEWAY_PROFILE_APP_MANAGED:
+        report["pairing_acl"] = await hass.async_add_executor_job(
+            read_pairing_diagnostics,
+            data.get("portal_url") or DEFAULT_PORTAL_URL,
+            cert_pem.encode(),
+            data.get("private_key_pem", "").encode(),
+            data.get("own_portal_uuid", ""),
+            data.get("gateway_uuid", ""),
+            data.get("sip_username", ""),
+        )
+    return report

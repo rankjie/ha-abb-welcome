@@ -277,3 +277,105 @@ def test_acl_values_with_percent_signs_parse_literally() -> None:
     _, _, doors = portal.parse_acl_update(payload, pem)
 
     assert doors[0]["name"] == "Door 100%"
+
+
+def _pairing_record(system_type, permission, *, user_key="username"):
+    body = (
+        "opaque-first-line\n[network]\n"
+        f"systemtype={system_type}\n[user_1]\nuser=other\nopendoor=yes\n"
+        f"[user_2]\n{user_key}=ha-client\nopendoor={permission}\n"
+    )
+    return base64.b64encode(body.encode()).decode().rstrip("=")
+
+
+def _read_pairing():
+    return portal.read_pairing_diagnostics(
+        URL, b"cert", b"key", OWN, PANEL, "ha-client"
+    )
+
+
+@pytest.mark.parametrize(
+    ("family", "permission", "user_key", "expected"),
+    [
+        (
+            "GlobalIP",
+            "no",
+            "user",
+            {"system_type": "GlobalIP", "open_door_permission": "no"},
+        ),
+        (
+            "mrange",
+            "yes",
+            "username",
+            {"system_type": "mrange", "open_door_permission": "yes"},
+        ),
+        (
+            "private text",
+            "other text",
+            "user",
+            {"system_type": "unknown", "open_door_permission": "unknown"},
+        ),
+    ],
+)
+def test_download_reads_only_own_pairing_metadata(
+    session, family, permission, user_key, expected
+):
+    payload = _pairing_record(family, permission, user_key=user_key)
+    fake = session(
+        _events(
+            _acl_event(destination=OTHER, sender=PANEL),
+            _acl_event(destination=OWN, sender=OTHER),
+            _acl_event(sender=PANEL),
+            _acl_event(payload, destinations=[OWN.upper()], source=PANEL.upper()),
+        )
+    )
+    assert _read_pairing() == {"status": "found", **expected}
+    assert len(fake.params) == 1
+    assert fake.params[0]["type"] == portal.EVENT_TYPE_ACL_UPDATE
+    assert fake.params[0]["portal_client"] == PANEL
+    assert fake.params[0]["order"] == "desc"
+
+
+@pytest.mark.parametrize(
+    ("response", "status"),
+    [
+        (_events(_acl_event(destination=OTHER, sender=PANEL)), "not_found"),
+        (
+            _events(
+                _acl_event("", destination=OWN, sender=PANEL),
+                _acl_event(
+                    _pairing_record("GlobalIP", "yes"), destination=OWN, sender=PANEL
+                ),
+            ),
+            "revoked",
+        ),
+        (
+            _events(_acl_event("broken!", destination=OWN, sender=PANEL)),
+            "invalid_record",
+        ),
+        (_Response(403, {}), "portal_unavailable"),
+        (requests.Timeout(), "portal_unavailable"),
+    ],
+)
+def test_unavailable_pairing_metadata_has_no_inferred_permission(
+    session, response, status
+):
+    session(response)
+    assert _read_pairing() == {"status": status}
+
+
+@pytest.mark.parametrize(
+    "users",
+    [
+        "[user_1]\nuser=other\nopendoor=yes",
+        "[user_1]\nuser=ha-client\nopendoor=yes\n[user_2]\nuser=ha-client\nopendoor=no",
+    ],
+)
+def test_missing_or_ambiguous_client_grant_stays_unknown(session, users):
+    payload = base64.b64encode(f"opaque\n[network]\n{users}\n".encode()).decode()
+    session(_events(_acl_event(payload, destination=OWN, sender=PANEL)))
+    assert _read_pairing() == {
+        "status": "found",
+        "system_type": "unknown",
+        "open_door_permission": "unknown",
+    }

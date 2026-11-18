@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import sys
@@ -236,3 +237,57 @@ def test_diagnostics_redaction_uses_nested_lists_and_dicts() -> None:
     assert "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" not in rendered
     assert "2001:db8::10" not in rendered
     assert "station-front" not in rendered
+
+
+def test_diagnostics_download_uses_existing_app_managed_pairing_only(
+    monkeypatch,
+) -> None:
+    config_entries = types.ModuleType("homeassistant.config_entries")
+    config_entries.ConfigEntry = object
+    core = types.ModuleType("homeassistant.core")
+    core.HomeAssistant = object
+    monkeypatch.setitem(sys.modules, "homeassistant.config_entries", config_entries)
+    monkeypatch.setitem(sys.modules, "homeassistant.core", core)
+    diagnostics = _load("abb_profile_test", "diagnostics")
+    args_seen = []
+    summary = {
+        "status": "found",
+        "system_type": "GlobalIP",
+        "open_door_permission": "no",
+    }
+
+    async def run_job(function, *args):
+        assert function is diagnostics.read_pairing_diagnostics
+        args_seen.append(args)
+        return summary
+
+    hass = types.SimpleNamespace(data={}, async_add_executor_job=run_job)
+    entry = types.SimpleNamespace(
+        entry_id="entry",
+        options={},
+        data={
+            "portal_url": "https://regional.example.invalid",
+            "certificate_pem": "cert",
+            "private_key_pem": "key",
+            "own_portal_uuid": "client",
+            "gateway_uuid": "panel",
+            "sip_username": "ha-client",
+        },
+    )
+    assert "pairing_acl" not in asyncio.run(
+        diagnostics.async_get_config_entry_diagnostics(hass, entry)
+    )
+    entry.data["gateway_profile"] = "app_managed"
+    report = asyncio.run(diagnostics.async_get_config_entry_diagnostics(hass, entry))
+    assert args_seen == [
+        (
+            "https://regional.example.invalid",
+            b"cert",
+            b"key",
+            "client",
+            "panel",
+            "ha-client",
+        )
+    ]
+    assert report["pairing_acl"] == summary
+    assert report["config_entry"]["private_key_pem"] == diagnostics.REDACT
