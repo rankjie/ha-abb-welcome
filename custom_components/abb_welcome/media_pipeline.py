@@ -179,12 +179,28 @@ def _encrypt_rtp_payload(packet: bytes, key: bytes) -> bytes:
     return packet[:offset] + framed + packet[end:]
 
 
+def _abb_frame_fits(packet: bytes, start: int, end: int) -> bool:
+    if end - start < 2:
+        return False
+    length = struct.unpack_from("!H", packet, start)[0]
+    return end - start == 2 + ((length + 15) & ~15)
+
+
 def _decrypt_rtp_payload(packet: bytes, key: bytes) -> bytes:
     """Remove ABB's AES-ECB framing from an RTP payload; RTCP is unchanged."""
     if _is_rtcp_packet(packet):
         return packet
     key = _validate_aes_key(key)
     bounds = _rtp_payload_bounds(packet)
+    # Welcome Android 3.10.9 encrypts the extension words and RTP padding
+    # with the media. Other senders leave both outside the ABB envelope.
+    if len(packet) >= 12 and packet[0] >> 6 == 2 and packet[0] & 0x30:
+        if bounds is None or not _abb_frame_fits(packet, *bounds):
+            start = 12 + (packet[0] & 0x0F) * 4
+            if packet[0] & 0x10:
+                start += 4
+            if _abb_frame_fits(packet, start, len(packet)):
+                bounds = start, len(packet)
     if bounds is None:
         raise ValueError("malformed RTP packet")
     offset, end = bounds
@@ -198,8 +214,13 @@ def _decrypt_rtp_payload(packet: bytes, key: bytes) -> bytes:
     decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
     padded = decryptor.update(ciphertext) + decryptor.finalize()
     if any(padded[plaintext_length:]):
+        if plaintext_length and padded[0] in (0x27, 0x47, 0x67):
+            raise ValueError("invalid ABB encrypted RTP payload padding (possible SPS)")
         raise ValueError("invalid ABB encrypted RTP payload padding")
-    return packet[:offset] + padded[:plaintext_length] + packet[end:]
+    decoded = packet[:offset] + padded[:plaintext_length] + packet[end:]
+    if packet[0] & 0x30 and _rtp_payload_bounds(decoded) is None:
+        raise ValueError("malformed RTP extension or padding after decryption")
+    return decoded
 
 
 @dataclass(frozen=True)
@@ -803,6 +824,7 @@ class _RTPProtocol(asyncio.DatagramProtocol):
         self._rewrites = 0
         self.rtcp_packets = 0
         self.decrypt_errors = 0
+        self._reported_decrypt_errors: set[tuple[str, bool, bool, bool]] = set()
         self.h264_nals = _H264NalCounters() if track_h264_nals else None
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:
@@ -821,9 +843,25 @@ class _RTPProtocol(asyncio.DatagramProtocol):
         elif self._encryption_key is not None:
             try:
                 data = _decrypt_rtp_payload(data, self._encryption_key)
-            except ValueError:
+            except ValueError as err:
                 self.decrypt_errors += 1
-                _LOGGER.debug("Dropping malformed encrypted ABB RTP packet")
+                reason = str(err)
+                payload = _rtp_payload(data)
+                extension = bool(data and data[0] & 0x10)
+                padding = bool(data and data[0] & 0x20)
+                possible_sps = bool(
+                    self.h264_nals is not None and payload
+                    and payload[0] in (0x27, 0x47, 0x67)
+                )
+                signature = (reason, extension, padding, possible_sps)
+                if signature not in self._reported_decrypt_errors:
+                    self._reported_decrypt_errors.add(signature)
+                    _LOGGER.info(
+                        "[abb] dropped encrypted %s RTP: reason=%s bytes=%d "
+                        "extension=%s padding=%s possible_clear_sps=%s",
+                        self.label, reason, len(data),
+                        extension, padding, possible_sps,
+                    )
                 return
         self.packets += 1
         self.bytes_received += len(data)

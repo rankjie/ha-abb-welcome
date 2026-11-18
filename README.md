@@ -93,6 +93,12 @@ First choose a device profile:
   and MyBuildings app pairing; it never contacts port 443
   or asks for a gateway admin password.
 
+For a Welcome IP installation with a Smart Access Point and an IP touch panel,
+one owner paired the app-managed profile using the **touch panel's IP address**
+and registered over SIP-TLS. The Smart AP and the touch panel are separate
+devices. See [the hardware report](https://github.com/rankjie/ha-abb-welcome/issues/15#issuecomment-6973000413)
+for the results and remaining video and unlock limitations.
+
 Then fill in:
 
 - MyBuildings portal **username**

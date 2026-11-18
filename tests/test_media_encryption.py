@@ -187,6 +187,56 @@ def test_encryption_honors_csrc_extensions_and_rtp_padding() -> None:
     assert media._decrypt_rtp_payload(encrypted, _VIDEO_KEY) == packet
 
 
+@pytest.mark.parametrize("flags", [0x10, 0x20, 0x30])
+def test_android_framing_preserves_encrypted_extensions_and_rtp_padding(flags) -> None:
+    # Welcome 3.10.9 keeps CSRCs and the four-byte extension header in the
+    # clear, then frames everything else up to the end of the datagram.
+    header = struct.pack("!BBHII", 0x81 | flags, 102, 1, 9000, 1234)
+    prefix = header + struct.pack("!I", 5678)
+    extension = b""
+    if flags & 0x10:
+        prefix += struct.pack("!HH", 0xBEDE, 1)
+        extension = bytes.fromhex("10010000")
+    sps = bytes.fromhex("6742c01eda0280b7fe5c05050502")
+    padding = bytes([0, 0, 0, 4]) if flags & 0x20 else b""
+    body = extension + sps + padding
+    encrypted_body = media._encrypt_rtp_payload(_rtp(body), _VIDEO_KEY)[12:]
+    forwarded = []
+    receiver = media._RTPProtocol(
+        forwarded.append, 96, None, encryption_key=_VIDEO_KEY, track_h264_nals=True,
+    )
+    receiver.datagram_received(prefix + encrypted_body, ("192.0.2.1", 5004))
+    assert forwarded == [prefix[:1] + bytes([96]) + prefix[2:] + body]
+    assert receiver.h264_nals.sps == 1
+
+
+def test_encrypted_rtp_rejects_invalid_inner_extension_and_padding() -> None:
+    header = _rtp(b"")
+    for flag, prefix, body in [
+        (0x10, struct.pack("!HH", 0xBEDE, 4), b"short"),
+        (0x20, b"", b"bad pad" + bytes([0])),
+    ]:
+        encrypted_body = media._encrypt_rtp_payload(_rtp(body), _VIDEO_KEY)[12:]
+        packet = bytes([header[0] | flag]) + header[1:] + prefix + encrypted_body
+        with pytest.raises(ValueError, match="malformed RTP extension or padding"):
+            media._decrypt_rtp_payload(packet, _VIDEO_KEY)
+
+
+def test_dropped_sps_diagnostic_is_bounded_and_payload_free(caplog) -> None:
+    receiver = media._RTPProtocol(
+        lambda data: pytest.fail("Invalid frame was forwarded"), 96, None,
+        label="video", encryption_key=_VIDEO_KEY, track_h264_nals=True,
+    )
+    packet = _rtp(b"gUNIQUE-MEDIA-PAYLOAD")
+    with caplog.at_level("INFO"):
+        for _ in range(2):
+            receiver.datagram_received(packet, ("192.0.2.1", 5004))
+    assert receiver.decrypt_errors == 2
+    assert caplog.text.count("possible_clear_sps=True") == 1
+    assert "UNIQUE-MEDIA-PAYLOAD" not in caplog.text
+    assert _VIDEO_KEY.decode() not in caplog.text
+
+
 def test_invalid_keys_and_malformed_encrypted_payloads_are_rejected() -> None:
     description = intercom.MediaDescription(
         "video",
