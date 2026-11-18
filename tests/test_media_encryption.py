@@ -232,9 +232,34 @@ def test_dropped_sps_diagnostic_is_bounded_and_payload_free(caplog) -> None:
         for _ in range(2):
             receiver.datagram_received(packet, ("192.0.2.1", 5004))
     assert receiver.decrypt_errors == 2
+    assert caplog.text.count("reason=block_length") == 1
     assert caplog.text.count("possible_clear_sps=True") == 1
     assert "UNIQUE-MEDIA-PAYLOAD" not in caplog.text
     assert _VIDEO_KEY.decode() not in caplog.text
+
+
+def test_session_reports_each_video_drop_cause_after_redaction(caplog) -> None:
+    session = media.StreamSession(
+        dialer=object(), door=intercom.Door("door", "address"), gateway_host="192.0.2.10",
+    )
+    receiver = media._RTPProtocol(
+        lambda data: pytest.fail("Invalid frame was forwarded"), 96, None,
+        label="video", encryption_key=_VIDEO_KEY, track_h264_nals=True,
+    )
+    session._video_proto = receiver
+    # Both wire sizes match the panel report. The causes are deliberately
+    # different so this test does not assume what the hardware sent.
+    bad_tail = bytearray(media._encrypt_rtp_payload(_rtp(b"g" + b"x" * 31), _VIDEO_KEY))
+    bad_tail[12:14] = struct.pack("!H", 29)
+    bad_length = _rtp(struct.pack("!H", 881) + bytes(880))
+    with caplog.at_level("INFO"):
+        for packet in (bytes(bad_tail), bad_length, bytes(bad_tail)):
+            receiver.datagram_received(packet, ("192.0.2.1", 5004))
+        asyncio.run(session.close())
+    assert "reason=fill_sps bytes=46 csrc_count=0 exact_block_count=True" in caplog.text
+    assert "reason=declared_length bytes=894 csrc_count=0 exact_block_count=False" in caplog.text
+    assert "video RTP drop total: reason=fill_sps count=2" in caplog.text
+    assert "video RTP drop total: reason=declared_length count=1" in caplog.text
 
 
 def test_invalid_keys_and_malformed_encrypted_payloads_are_rejected() -> None:

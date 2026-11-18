@@ -23,9 +23,10 @@ import struct
 import threading
 import time
 import wave
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -186,6 +187,21 @@ def _abb_frame_fits(packet: bytes, start: int, end: int) -> bool:
     return end - start == 2 + ((length + 15) & ~15)
 
 
+class _FrameFailure(Enum):
+    HEADER = "malformed RTP packet"
+    BLOCK_LENGTH = "malformed ABB encrypted RTP payload"
+    DECLARED_LENGTH = "invalid ABB encrypted RTP payload length"
+    FILL = "invalid ABB encrypted RTP payload padding"
+    FILL_SPS = "invalid ABB encrypted RTP payload padding (possible SPS)"
+    INNER_HEADER = "malformed RTP extension or padding after decryption"
+
+
+class _MalformedFrame(ValueError):
+    def __init__(self, failure: _FrameFailure) -> None:
+        super().__init__(failure.value)
+        self.failure = failure
+
+
 def _decrypt_rtp_payload(packet: bytes, key: bytes) -> bytes:
     """Remove ABB's AES-ECB framing from an RTP payload; RTCP is unchanged."""
     if _is_rtcp_packet(packet):
@@ -202,24 +218,24 @@ def _decrypt_rtp_payload(packet: bytes, key: bytes) -> bytes:
             if _abb_frame_fits(packet, start, len(packet)):
                 bounds = start, len(packet)
     if bounds is None:
-        raise ValueError("malformed RTP packet")
+        raise _MalformedFrame(_FrameFailure.HEADER)
     offset, end = bounds
     framed = packet[offset:end]
     if len(framed) < 2 or (len(framed) - 2) % 16:
-        raise ValueError("malformed ABB encrypted RTP payload")
+        raise _MalformedFrame(_FrameFailure.BLOCK_LENGTH)
     plaintext_length = struct.unpack_from("!H", framed)[0]
     ciphertext = framed[2:]
     if plaintext_length > len(ciphertext):
-        raise ValueError("invalid ABB encrypted RTP payload length")
+        raise _MalformedFrame(_FrameFailure.DECLARED_LENGTH)
     decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
     padded = decryptor.update(ciphertext) + decryptor.finalize()
     if any(padded[plaintext_length:]):
         if plaintext_length and padded[0] in (0x27, 0x47, 0x67):
-            raise ValueError("invalid ABB encrypted RTP payload padding (possible SPS)")
-        raise ValueError("invalid ABB encrypted RTP payload padding")
+            raise _MalformedFrame(_FrameFailure.FILL_SPS)
+        raise _MalformedFrame(_FrameFailure.FILL)
     decoded = packet[:offset] + padded[:plaintext_length] + packet[end:]
     if packet[0] & 0x30 and _rtp_payload_bounds(decoded) is None:
-        raise ValueError("malformed RTP extension or padding after decryption")
+        raise _MalformedFrame(_FrameFailure.INNER_HEADER)
     return decoded
 
 
@@ -824,7 +840,8 @@ class _RTPProtocol(asyncio.DatagramProtocol):
         self._rewrites = 0
         self.rtcp_packets = 0
         self.decrypt_errors = 0
-        self._reported_decrypt_errors: set[tuple[str, bool, bool, bool]] = set()
+        self.frame_failures: Counter[_FrameFailure] = Counter()
+        self._reported_decrypt_errors: set[tuple[_FrameFailure, bool, bool, bool]] = set()
         self.h264_nals = _H264NalCounters() if track_h264_nals else None
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:
@@ -843,9 +860,9 @@ class _RTPProtocol(asyncio.DatagramProtocol):
         elif self._encryption_key is not None:
             try:
                 data = _decrypt_rtp_payload(data, self._encryption_key)
-            except ValueError as err:
+            except _MalformedFrame as err:
                 self.decrypt_errors += 1
-                reason = str(err)
+                self.frame_failures[err.failure] += 1
                 payload = _rtp_payload(data)
                 extension = bool(data and data[0] & 0x10)
                 padding = bool(data and data[0] & 0x20)
@@ -853,13 +870,17 @@ class _RTPProtocol(asyncio.DatagramProtocol):
                     self.h264_nals is not None and payload
                     and payload[0] in (0x27, 0x47, 0x67)
                 )
-                signature = (reason, extension, padding, possible_sps)
+                signature = (err.failure, extension, padding, possible_sps)
                 if signature not in self._reported_decrypt_errors:
                     self._reported_decrypt_errors.add(signature)
                     _LOGGER.info(
-                        "[abb] dropped encrypted %s RTP: reason=%s bytes=%d "
+                        # Only the enum label enters the template. Packet data and
+                        # free-form errors must stay out of preformatted messages.
+                        f"[abb] dropped encrypted %s RTP: reason={err.failure.name.lower()} "
+                        "bytes=%d csrc_count=%d exact_block_count=%s "
                         "extension=%s padding=%s possible_clear_sps=%s",
-                        self.label, reason, len(data),
+                        self.label, len(data), data[0] & 0x0F if data else 0,
+                        bool(payload and _abb_frame_fits(payload, 0, len(payload))),
                         extension, padding, possible_sps,
                     )
                 return
@@ -1584,6 +1605,11 @@ class StreamSession:
             self._video_proto.decrypt_errors if self._video_proto else 0,
             self._audio_proto.decrypt_errors if self._audio_proto else 0,
         )
+        if self._video_proto is not None:
+            for failure, count in self._video_proto.frame_failures.items():
+                _LOGGER.info(
+                    f"[abb] video RTP drop total: reason={failure.name.lower()} count=%d", count,
+                )
         if (
             self._incoming_end_task is not None
             and self._incoming_end_task is not current_task
