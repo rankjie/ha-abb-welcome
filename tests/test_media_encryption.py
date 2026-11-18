@@ -238,6 +238,23 @@ def test_dropped_sps_diagnostic_is_bounded_and_payload_free(caplog) -> None:
     assert _VIDEO_KEY.decode() not in caplog.text
 
 
+def test_ip_touch_sps_uses_declared_length_with_nonzero_block_fill() -> None:
+    sps = bytes.fromhex("6764000aacd9420db0110000030001000003000a0f122596")
+    encrypted = media._encrypt_rtp_payload(_rtp(sps + bytes([0xA5]) * 8), _VIDEO_KEY)
+    wire = encrypted[:12] + struct.pack("!H", len(sps)) + encrypted[14:]
+    assert len(wire) == 46
+    forwarded = []
+    receiver = media._RTPProtocol(
+        forwarded.append, 96, None, track_h264_nals=True, encryption_key=_VIDEO_KEY,
+    )
+    receiver.datagram_received(wire, ("192.0.2.1", 5004))
+    assert forwarded == [_rtp(sps, pt=96)]
+    assert receiver.h264_nals.sps == 1
+    assert receiver.decrypt_errors == 0
+    with pytest.raises(ValueError, match="padding"):
+        media._decrypt_rtp_payload(wire, _VIDEO_KEY)
+
+
 def test_session_reports_each_video_drop_cause_after_redaction(caplog) -> None:
     session = media.StreamSession(
         dialer=object(), door=intercom.Door("door", "address"), gateway_host="192.0.2.10",
@@ -247,16 +264,15 @@ def test_session_reports_each_video_drop_cause_after_redaction(caplog) -> None:
         label="video", encryption_key=_VIDEO_KEY, track_h264_nals=True,
     )
     session._video_proto = receiver
-    # Both wire sizes match the panel report. The causes are deliberately
-    # different so this test does not assume what the hardware sent.
+    # Even an SPS header does not justify an extra ciphertext block.
     bad_tail = bytearray(media._encrypt_rtp_payload(_rtp(b"g" + b"x" * 31), _VIDEO_KEY))
-    bad_tail[12:14] = struct.pack("!H", 29)
+    bad_tail[12:14] = struct.pack("!H", 15)
     bad_length = _rtp(struct.pack("!H", 881) + bytes(880))
     with caplog.at_level("INFO"):
         for packet in (bytes(bad_tail), bad_length, bytes(bad_tail)):
             receiver.datagram_received(packet, ("192.0.2.1", 5004))
         asyncio.run(session.close())
-    assert "reason=fill_sps bytes=46 csrc_count=0 exact_block_count=True" in caplog.text
+    assert "reason=fill_sps bytes=46 csrc_count=0 exact_block_count=False" in caplog.text
     assert "reason=declared_length bytes=894 csrc_count=0 exact_block_count=False" in caplog.text
     assert "video RTP drop total: reason=fill_sps count=2" in caplog.text
     assert "video RTP drop total: reason=declared_length count=1" in caplog.text

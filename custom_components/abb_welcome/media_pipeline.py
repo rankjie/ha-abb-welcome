@@ -202,7 +202,7 @@ class _MalformedFrame(ValueError):
         self.failure = failure
 
 
-def _decrypt_rtp_payload(packet: bytes, key: bytes) -> bytes:
+def _decrypt_rtp_payload(packet: bytes, key: bytes, *, h264: bool = False) -> bytes:
     """Remove ABB's AES-ECB framing from an RTP payload; RTCP is unchanged."""
     if _is_rtcp_packet(packet):
         return packet
@@ -229,13 +229,18 @@ def _decrypt_rtp_payload(packet: bytes, key: bytes) -> bytes:
         raise _MalformedFrame(_FrameFailure.DECLARED_LENGTH)
     decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
     padded = decryptor.update(ciphertext) + decryptor.finalize()
-    if any(padded[plaintext_length:]):
-        if plaintext_length and padded[0] in (0x27, 0x47, 0x67):
-            raise _MalformedFrame(_FrameFailure.FILL_SPS)
-        raise _MalformedFrame(_FrameFailure.FILL)
     decoded = packet[:offset] + padded[:plaintext_length] + packet[end:]
     if packet[0] & 0x30 and _rtp_payload_bounds(decoded) is None:
         raise _MalformedFrame(_FrameFailure.INNER_HEADER)
+    if any(padded[plaintext_length:]):
+        # IP touch 7 leaves nonzero bytes after the declared SPS length.
+        # The Welcome Android receiver delivers only the declared bytes.
+        payload = _rtp_payload(decoded) if h264 else None
+        if payload and payload[0] in (0x27, 0x47, 0x67):
+            if len(payload) >= 5 and not (payload[2] & 0x03) and _abb_frame_fits(packet, offset, end):
+                return decoded
+            raise _MalformedFrame(_FrameFailure.FILL_SPS)
+        raise _MalformedFrame(_FrameFailure.FILL)
     return decoded
 
 
@@ -859,7 +864,9 @@ class _RTPProtocol(asyncio.DatagramProtocol):
             return
         elif self._encryption_key is not None:
             try:
-                data = _decrypt_rtp_payload(data, self._encryption_key)
+                data = _decrypt_rtp_payload(
+                    data, self._encryption_key, h264=self.h264_nals is not None,
+                )
             except _MalformedFrame as err:
                 self.decrypt_errors += 1
                 self.frame_failures[err.failure] += 1
@@ -1326,7 +1333,7 @@ class StreamSession:
             rewrite_pt=self.VIDEO_SDP_PT,
             on_first_packet=_video_first,
             label="video",
-            track_h264_nals=True,
+            track_h264_nals=self._video_codec.partition("/")[0].upper() == "H264",
             encryption_key=self._video_receive_key,
             drop_muxed_rtcp=bool(
                 self._endpoints.video and self._endpoints.video.rtcp_mux
