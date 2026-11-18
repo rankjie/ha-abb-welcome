@@ -100,6 +100,12 @@ The owner verified pairing, ring detection and live video with
 grants HA permission to open the door. With the Standard strategy, the panel
 acknowledges the SIP message but the door stays locked. Re-pairing to obtain
 that permission is unnecessary. [Pairing diagnostics](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6985603402)
+
+With the published `v1.8.0-dev5`, the door also stayed locked during an
+active HA live view. The owner confirmed that a locally modified dev5
+opened the primary lock twice through the outdoor station's Lock-GND output.
+The subsidiary relay was not tested. [Field results](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6989189437)
+
 On this installation, enabling the Smart AP's SIP server interrupted calls
 from the H81381P1-S-03 outdoor station to the indoor panel. Keep it off for
 this pairing. [Hardware test results](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6985197643)
@@ -737,9 +743,9 @@ action:
   manually and retry.
 - **The gateway did not see our pairing request**: retry pairing; the
   portal-to-gateway link may have been briefly delayed.
-- **A door does not open**: try **Standard** unlock strategy. On the IP touch 7
-  setup described above, this strategy has already been tested and the Welcome
-  app remains the verified way to open the door.
+- **A door does not open**: try **Standard** unlock strategy. The IP touch 7
+  owner already tested this strategy on the setup described above. With the
+  published dev5 integration, use the Welcome app to open that door.
 - **WebRTC says `wrong response on DESCRIBE`**: turn on `Streaming enabled` and
   open the camera within the armed window.
 - **Camera has video but no audio**: confirm you are on a current version and
