@@ -70,7 +70,7 @@ from .const import (
     gateway_profile,
 )
 from .device import gateway_device_info
-from .intercom_dialer import Door, IntercomDialer
+from .intercom_dialer import Door, GatewayBusyError, IntercomDialer
 from .media_pipeline import StreamSession
 from .redaction import get_redacting_logger
 from .rtsp_server import (
@@ -1147,6 +1147,15 @@ class ABBWelcomeCamera(Camera):
 
         try:
             await self._coordinator.attach_rtsp_session(sess)
+        except GatewayBusyError as err:
+            # Expected while clients reconnect after the gateway ended a call.
+            _LOGGER.info(
+                "[abb] camera %s: stream session not opened camera_index=%s: %s",
+                self._attr_name,
+                self._camera_index if self._camera_index is not None else "default",
+                err,
+            )
+            return
         except Exception as err:  # noqa: BLE001
             _LOGGER.exception(
                 "[abb] camera %s: failed to open stream session "

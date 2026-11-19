@@ -780,6 +780,11 @@ action:
 - **A door does not open**: try **Standard** unlock strategy. If the panel
   accepts the request but the door stays locked, as on the IP touch 7 setup
   described above, set the [door opener code](#door-opener-code).
+- **The live view stops a few seconds after opening the door**: the gateway
+  ends the call about five seconds after a door release and refuses new calls
+  for a short while. This also happens on the physical indoor station. The
+  integration waits 3 to 15 seconds before calling the gateway again, so a
+  reopened stream may need a moment.
 - **WebRTC says `wrong response on DESCRIBE`**: turn on `Streaming enabled` and
   open the camera within the armed window.
 - **Camera has video but no audio**: confirm you are on a current version and

@@ -381,6 +381,20 @@ def _custom_crypto_attribute(key: bytes) -> str:
     )
 
 
+# After the gateway ends or refuses a call it keeps refusing new ones for
+# several seconds (observed for ~10 s after a door release). Stream clients
+# reconnect immediately, so every retry inside that window would be another
+# INVITE. The hold-off doubles while calls keep failing and restarts once a
+# call has stayed up.
+DIAL_HOLDOFF_INITIAL = 3.0
+DIAL_HOLDOFF_MAX = 15.0
+DIAL_HOLDOFF_RESET_AFTER = 10.0
+
+
+class GatewayBusyError(RuntimeError):
+    """A dial was withheld because the gateway just ended or refused a call."""
+
+
 @dataclass
 class CallState:
     door: Door
@@ -394,6 +408,7 @@ class CallState:
     video_local_port: int
     answer: ParsedSdp
     local_send_keys: MediaEncryptionKeys | None = field(default=None, repr=False)
+    established_at: float = field(default_factory=lambda: time.monotonic())
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -501,6 +516,8 @@ class IntercomDialer:
         self._inbound_queue: asyncio.Queue[SipFrame] = asyncio.Queue()
         self._call_end_waiters: dict[str, list[asyncio.Future[str]]] = {}
         self._ended_call_reasons: dict[str, str] = {}
+        self._dial_holdoff = 0.0
+        self._dial_not_before = 0.0
         self._lock = asyncio.Lock()
 
     @property
@@ -658,6 +675,10 @@ class IntercomDialer:
         if not call_id:
             return
         if self._call is not None and self._call.call_id == call_id:
+            if reason == "remote_bye":
+                self._hold_off_dialing(
+                    time.monotonic() - self._call.established_at
+                )
             self._call = None
         if (
             self._pending_camera_count_target is not None
@@ -670,6 +691,19 @@ class IntercomDialer:
         for fut in self._call_end_waiters.pop(call_id, []):
             if not fut.done():
                 fut.set_result(reason)
+
+    def _hold_off_dialing(self, call_duration: float) -> None:
+        """Delay the next dial after the gateway ended or refused a call."""
+        if call_duration >= DIAL_HOLDOFF_RESET_AFTER or not self._dial_holdoff:
+            self._dial_holdoff = DIAL_HOLDOFF_INITIAL
+        else:
+            self._dial_holdoff = min(self._dial_holdoff * 2, DIAL_HOLDOFF_MAX)
+        self._dial_not_before = time.monotonic() + self._dial_holdoff
+        _LOGGER.info(
+            "[abb] dialer: holding off new calls for %.0fs after the gateway "
+            "ended or refused a call",
+            self._dial_holdoff,
+        )
 
     async def _reader_loop(self) -> None:
         assert self._reader is not None
@@ -870,6 +904,11 @@ class IntercomDialer:
         self._cseq += 1
 
     async def dial(self, door: Door, *, audio_port: int, video_port: int) -> CallState:
+        remaining = self._dial_not_before - time.monotonic()
+        if remaining > 0:
+            raise GatewayBusyError(
+                f"gateway just ended or refused a call; retry in {remaining:.0f}s"
+            )
         for attempt in range(2):
             try:
                 await self.ensure_connected()
@@ -975,6 +1014,7 @@ class IntercomDialer:
 
         if frame.status_code != 200:
             self._pending_camera_count_target = None
+            self._hold_off_dialing(0.0)
             raise RuntimeError(f"INVITE rejected: {frame.start_line}")
 
         remote_to = frame.header("To")
