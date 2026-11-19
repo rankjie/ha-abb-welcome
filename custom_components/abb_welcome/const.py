@@ -68,6 +68,12 @@ DEFAULT_ALLOW_PICKUP = True
 #              Most compatible; ~1-2s extra per unlock.
 CONF_UNLOCK_STRATEGY = "unlock_strategy"
 CONF_DEFAULT_UNLOCK_STATION_ID = "default_unlock_station_id"
+# Door opener codes from the outdoor station's "3rd party door opener
+# settings". When set, the lock is opened by an in-call dtmf-relay INFO
+# instead of the MRANGE MESSAGE the unlock strategy selects.
+CONF_DTMF_UNLOCK_CODE = "dtmf_unlock_code"
+CONF_DTMF_SECOND_LOCK_CODE = "dtmf_second_lock_code"
+DTMF_CODE_PATTERN = r"[0-9A-Da-d*#]{1,16}"
 UNLOCK_STRATEGY_HYBRID = "hybrid"
 UNLOCK_STRATEGY_FAST = "fast"
 UNLOCK_STRATEGY_STANDARD = "standard"

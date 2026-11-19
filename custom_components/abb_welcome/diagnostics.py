@@ -34,6 +34,8 @@ SENSITIVE_KEYS = {
     "destination",
     "default_unlock_station_id",
     "door_id",
+    "dtmf_second_lock_code",
+    "dtmf_unlock_code",
     "event_id",
     "gateway_admin_password",
     "gateway_ip",

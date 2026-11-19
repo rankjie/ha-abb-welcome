@@ -306,7 +306,7 @@ def test_refuses_without_sending_unless_the_call_is_with_that_station(
     asyncio.run(scenario())
 
 
-def _client(*, strategy: str = "hybrid", doors=(FRONT, BACK)):
+def _client(*, strategy: str = "hybrid", doors=(FRONT, BACK), **codes):
     return sip_client.SIPClient(
         host="192.0.2.10",
         username="synthetic-user",
@@ -314,6 +314,7 @@ def _client(*, strategy: str = "hybrid", doors=(FRONT, BACK)):
         domain="example.invalid",
         doors=list(doors),
         unlock_strategy=strategy,
+        **codes,
     )
 
 
@@ -416,11 +417,12 @@ def _press(
     second_lock=False,
     strategy="hybrid",
     with_dialer=True,
+    **codes,
 ):
     """Press a door button; return (unlock_door calls, wire requests, error)."""
 
     async def scenario():
-        client = _client(strategy=strategy)
+        client = _client(strategy=strategy, **codes)
         client_calls = []
         client.unlock_door = lambda *args: client_calls.append(args) or True
         dialer, gateway = _dialer(station, scripts)
@@ -595,3 +597,292 @@ def test_invite_route_message_is_addressed_for_tls_whatever_the_invite_transport
         invite_transport="tcp",
     )
     assert client.invite_route_message(BACK).target_uri.endswith(";transport=tls")
+
+
+INFO_BODY = "Signal=12#\r\nDuration=250"
+
+
+def test_unlock_info_is_sent_inside_the_dialog_of_the_active_call():
+    async def scenario():
+        dialer, gateway = _dialer()
+        assert await dialer.send_active_info("100000002", INFO_BODY) is True
+        assert len(gateway.requests) == 1
+        request_line, headers, body = _parse_request(gateway.requests[0])
+        assert request_line == "INFO sip:100000002@192.0.2.10:5061 SIP/2.0"
+        assert headers["Call-ID"] == "dialog-call"
+        assert headers["From"] == (
+            "<sip:synthetic-user@example.invalid;transport=tls>;tag=dialog-local"
+        )
+        assert headers["To"] == "<sip:100000002@example.invalid>;tag=dialog-remote"
+        assert headers["CSeq"] == "7 INFO"
+        assert headers["Content-Type"] == "application/dtmf-relay"
+        assert body == INFO_BODY
+        assert dialer._cseq == 8
+        assert dialer.in_call_with("100000002")
+
+    asyncio.run(scenario())
+
+
+def test_unanswered_unlock_info_counts_as_sent():
+    async def scenario():
+        dialer, gateway = _dialer(scripts=[[]])
+        assert (
+            await dialer.send_active_info("100000002", INFO_BODY, timeout=0.05)
+            is True
+        )
+        assert len(gateway.requests) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status", ["403 Forbidden", "481 No Dialog", "500 Error"])
+def test_rejected_unlock_info_fails_after_one_send(status):
+    async def scenario():
+        dialer, gateway = _dialer(scripts=[[("100 Trying", {}), (status, {})]])
+        assert await dialer.send_active_info("100000002", INFO_BODY) is False
+        assert len(gateway.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_challenged_unlock_info_is_resent_with_credentials_in_the_dialog():
+    async def scenario():
+        dialer, gateway = _dialer(
+            scripts=[[("401 Unauthorized", {"WWW-Authenticate": CHALLENGE})], OK]
+        )
+        assert await dialer.send_active_info("100000002", INFO_BODY) is True
+        assert len(gateway.requests) == 2
+        _, headers, body = _parse_request(gateway.requests[1])
+        assert headers["CSeq"] == "8 INFO"
+        assert headers["Call-ID"] == "dialog-call"
+        assert headers["Authorization"].startswith(
+            'Digest username="synthetic-user", realm="gateway", nonce="abc123", '
+            'uri="sip:100000002@192.0.2.10:5061", response="'
+        )
+        assert body == INFO_BODY
+        assert dialer._cseq == 9
+
+    asyncio.run(scenario())
+
+
+def test_unlock_info_write_error_fails_instead_of_raising():
+    async def scenario():
+        dialer, gateway = _dialer(fail_write=True)
+        assert await dialer.send_active_info("100000002", INFO_BODY) is False
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "call_station, asked, closing",
+    [
+        ("100000002", "100000001", False),
+        (None, "100000001", False),
+        ("100000001", "100000001", True),
+    ],
+)
+def test_unlock_info_is_not_sent_without_a_call_to_that_station(
+    call_station, asked, closing
+):
+    async def scenario():
+        dialer, gateway = _dialer(call_station)
+        gateway.closing = closing
+        assert await dialer.send_active_info(asked, INFO_BODY) is None
+        assert gateway.requests == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "door, station, strategy",
+    [
+        (BACK, "100000002", "hybrid"),
+        # A configured code replaces the MESSAGE whatever route the door is on.
+        (FRONT, "100000001", "hybrid"),
+        (FRONT, "100000001", "fast"),
+    ],
+)
+def test_configured_code_opens_the_door_with_an_info_in_the_active_call(
+    button_module, door, station, strategy
+):
+    client_calls, requests, error = _press(
+        button_module,
+        door,
+        station=station,
+        strategy=strategy,
+        dtmf_unlock_code="12#",
+    )
+    assert error is None
+    assert client_calls == []
+    assert len(requests) == 1
+    request_line, headers, body = _parse_request(requests[0])
+    assert request_line.startswith("INFO ")
+    assert headers["Call-ID"] == "dialog-call"
+    assert body == INFO_BODY
+
+
+def test_each_lock_sends_its_own_code(button_module):
+    codes = {"dtmf_unlock_code": "12#", "dtmf_second_lock_code": "34#"}
+    _, requests, _ = _press(
+        button_module, BACK, station="100000002", second_lock=True, **codes
+    )
+    assert _parse_request(requests[0])[2] == "Signal=34#\r\nDuration=250"
+
+
+def test_lock_without_a_code_keeps_the_message_while_the_other_has_one(
+    button_module,
+):
+    client_calls, requests, error = _press(
+        button_module,
+        BACK,
+        station="100000002",
+        second_lock=True,
+        dtmf_unlock_code="12#",
+    )
+    assert error is None
+    assert client_calls == []
+    request_line, _, body = _parse_request(requests[0])
+    assert request_line.startswith("MESSAGE ")
+    assert body == "a"
+
+
+def test_rejected_info_in_the_active_call_raises_without_a_second_invite(
+    button_module,
+):
+    client_calls, requests, error = _press(
+        button_module,
+        BACK,
+        station="100000002",
+        scripts=[[("403 Forbidden", {})]],
+        dtmf_unlock_code="12#",
+    )
+    assert "Failed to unlock door: Back" in str(error)
+    assert client_calls == []
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    "station, with_dialer",
+    [(None, True), ("100000001", True), ("100000002", False)],
+)
+def test_configured_code_without_a_call_to_the_station_places_its_own_call(
+    button_module, station, with_dialer
+):
+    client_calls, requests, error = _press(
+        button_module,
+        BACK,
+        station=station,
+        with_dialer=with_dialer,
+        dtmf_unlock_code="12#",
+    )
+    assert error is None
+    assert client_calls == [(BACK,)]
+    assert requests == []
+
+
+class _ScriptedSocket:
+    """Gateway stand-in for the unlock client's own blocking connection."""
+
+    def __init__(self, info_responses) -> None:
+        self._info_responses = list(info_responses)
+        self._pending = b""
+        self.requests: list[tuple[str, dict[str, str], str]] = []
+
+    def settimeout(self, _timeout) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def _reply(self, headers, status, extra=()) -> None:
+        lines = [
+            f"SIP/2.0 {status}",
+            f"Call-ID: {headers['Call-ID']}",
+            f"CSeq: {headers['CSeq']}",
+            f"To: {headers['To']};tag=remote",
+            *extra,
+            "Content-Length: 0",
+        ]
+        self._pending += ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+    def sendall(self, data: bytes) -> None:
+        request_line, headers, body = _parse_request(data.decode())
+        self.requests.append((request_line, headers, body))
+        method = request_line.split(" ", 1)[0]
+        if method == "INVITE":
+            self._reply(
+                headers, "200 OK", ["Contact: <sip:100000002@192.0.2.10:5061>"]
+            )
+        elif method == "INFO":
+            if self._info_responses:
+                status, extra = self._info_responses.pop(0)
+                self._reply(headers, status, extra)
+        elif method == "BYE":
+            self._reply(headers, "200 OK")
+
+    def recv(self, _size: int) -> bytes:
+        if not self._pending:
+            raise TimeoutError("synthetic timeout")
+        data, self._pending = self._pending, b""
+        return data
+
+
+def _unlock_over_own_call(monkeypatch, info_responses, **codes):
+    sock = _ScriptedSocket(info_responses)
+    monkeypatch.setattr(
+        sip_client, "_build_socket", lambda *_args: (sock, "192.0.2.20", 40000)
+    )
+    monkeypatch.setattr(sip_client, "_guess_media_ip", lambda *_args: "192.0.2.20")
+    monkeypatch.setattr(sip_client, "_register_client", lambda *_args: None)
+    client = _client(strategy="fast", **codes)
+    return client.unlock_door(BACK), sock.requests
+
+
+@pytest.mark.parametrize(
+    "info_responses, info_cseqs, bye_cseq, unlocked",
+    [
+        # The outdoor station switches the relay without answering the INFO.
+        ([], ["2 INFO"], "4 BYE", True),
+        ([("200 OK", [])], ["2 INFO"], "4 BYE", True),
+        ([("403 Forbidden", [])], ["2 INFO"], "4 BYE", False),
+        (
+            [
+                ("401 Unauthorized", [f"WWW-Authenticate: {CHALLENGE}"]),
+                ("200 OK", []),
+            ],
+            ["2 INFO", "3 INFO"],
+            "4 BYE",
+            True,
+        ),
+    ],
+)
+def test_configured_code_is_sent_as_an_info_inside_the_clients_own_call(
+    monkeypatch, info_responses, info_cseqs, bye_cseq, unlocked
+):
+    result, requests = _unlock_over_own_call(
+        monkeypatch, info_responses, dtmf_unlock_code="12#"
+    )
+    assert result is unlocked
+    methods = [line.split(" ", 1)[0] for line, _, _ in requests]
+    assert methods == ["INVITE", "ACK", *["INFO"] * len(info_cseqs), "BYE"]
+    invite, info, bye = requests[0][1], requests[2], requests[-1][1]
+    assert info[0] == "INFO sip:100000002@192.0.2.10:5061 SIP/2.0"
+    assert info[1]["Call-ID"] == invite["Call-ID"]
+    assert info[1]["From"] == invite["From"]
+    assert info[1]["To"].endswith(";tag=remote")
+    assert info[1]["Content-Type"] == "application/dtmf-relay"
+    assert info[2] == INFO_BODY
+    assert [r[1]["CSeq"] for r in requests[2:-1]] == info_cseqs
+    assert bye["CSeq"] == bye_cseq
+
+
+def test_client_without_a_code_keeps_the_selected_strategy(monkeypatch):
+    calls = []
+    client = _client(strategy="fast", dtmf_second_lock_code="34#")
+    monkeypatch.setattr(
+        client,
+        "_unlock_fast",
+        lambda door, _timeout: calls.append(door.station_id) or True,
+    )
+    assert client.unlock_door(BACK) is True
+    assert calls == ["100000002"]

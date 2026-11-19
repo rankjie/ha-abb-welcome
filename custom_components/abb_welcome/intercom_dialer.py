@@ -1293,6 +1293,102 @@ class IntercomDialer:
                 raise RuntimeError(f"MESSAGE rejected: {frame.start_line}")
             return frame
 
+    async def send_active_info(
+        self, station_id: str, body: str, *, timeout: float = 2.0
+    ) -> bool | None:
+        """Send a dtmf-relay INFO inside the established call with the station.
+
+        Outdoor stations switch the relay on this INFO without answering it, so
+        a missing response counts as sent.  Returns False on a rejection or a
+        network error, and None when nothing was sent because the call with the
+        station is gone.
+        """
+        async with self._lock:
+            if not self.in_call_with(station_id):
+                return None
+            if self._writer is None or self._writer.is_closing():
+                return None
+
+            call = self._call
+            target = call.remote_contact or call.request_uri
+            to_value = (
+                f"<{call.request_uri}>;tag={call.remote_tag}"
+                if call.remote_tag
+                else f"<{call.request_uri}>"
+            )
+
+            async def _transaction(authorization: str = "") -> SipFrame | None:
+                cseq = self._cseq
+                headers = [
+                    f"Via: SIP/2.0/TLS {self._local_ip}:{self._local_port};branch=z9hG4bK-{uuid.uuid4().hex[:12]};rport",
+                    "Max-Forwards: 70",
+                    f"From: <sip:{self.username}@{self.domain};transport=tls>;tag={call.local_tag}",
+                    f"To: {to_value}",
+                    f"Call-ID: {call.call_id}",
+                    f"CSeq: {cseq} INFO",
+                    f"Contact: <sip:{self.username}@{self._local_ip}:{self._local_port};transport=tls>",
+                    f"User-Agent: {USER_AGENT}",
+                    "Content-Type: application/dtmf-relay",
+                    *([authorization] if authorization else []),
+                ]
+                await self._send_request("INFO", target, headers, body)
+                self._cseq += 1
+                try:
+                    while True:
+                        frame = await self._await_response(
+                            lambda f: f.is_response
+                            and f.header("Call-ID") == call.call_id
+                            and f.header("CSeq").split() == [str(cseq), "INFO"],
+                            timeout=timeout,
+                        )
+                        if (frame.status_code or 0) >= 200:
+                            return frame
+                except asyncio.TimeoutError:
+                    return None
+
+            try:
+                frame = await _transaction()
+                if frame is not None and frame.status_code in (401, 407):
+                    proxy = frame.status_code == 407
+                    challenge = _parse_challenge(
+                        frame.header(
+                            "Proxy-Authenticate" if proxy else "WWW-Authenticate"
+                        )
+                    )
+                    if not challenge:
+                        _LOGGER.error(
+                            "[abb] dialer: unlock INFO auth challenge missing: %s",
+                            frame.start_line,
+                        )
+                        return False
+                    auth = _digest(
+                        self.username, self.password, "INFO", target, challenge
+                    )
+                    auth_header = "Proxy-Authorization" if proxy else "Authorization"
+                    frame = await _transaction(f"{auth_header}: {auth}")
+            except OSError as err:
+                _LOGGER.error("[abb] dialer: unlock INFO network error: %s", err)
+                return False
+
+            if frame is None:
+                _LOGGER.info(
+                    "[abb] dialer: unlock INFO sent, no response within %.1fs "
+                    "call_id=%s",
+                    timeout, call.call_id,
+                )
+                return True
+            if (frame.status_code or 0) >= 300:
+                _LOGGER.error(
+                    "[abb] dialer: unlock INFO rejected: %s call_id=%s",
+                    frame.start_line, call.call_id,
+                )
+                return False
+            _LOGGER.info(
+                "[abb] dialer: unlock INFO accepted: %s call_id=%s",
+                frame.start_line, call.call_id,
+            )
+            return True
+
     async def send_unlock_message(
         self, station_id: str, target_uri: str, body: str, *, timeout: float = 5.0
     ) -> bool | None:

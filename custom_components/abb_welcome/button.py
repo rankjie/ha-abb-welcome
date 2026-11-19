@@ -115,6 +115,11 @@ class ABBWelcomeDoorButton(ButtonEntity):
         holds the gateway's only call slot.
         """
         dialer = self.hass.data[DOMAIN][self._entry_id].get("intercom_dialer")
+        dtmf = self._sip_client.dtmf_unlock(self._door, body)
+        if dtmf is not None:
+            if dialer is None:
+                return None
+            return await dialer.send_active_info(dtmf.station_id, dtmf.info_body)
         message = self._sip_client.invite_route_message(self._door, body)
         if (
             dialer is None

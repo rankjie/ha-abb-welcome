@@ -23,6 +23,8 @@ from homeassistant.helpers.storage import Store
 from .const import (
     CONF_ALLOW_PICKUP,
     CONF_DEFAULT_UNLOCK_STATION_ID,
+    CONF_DTMF_SECOND_LOCK_CODE,
+    CONF_DTMF_UNLOCK_CODE,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
     CONF_LAN_RTSP_PROXY,
@@ -175,6 +177,8 @@ PLATFORMS = [
 
 _RELOAD_OPTION_KEYS = (
     CONF_DEFAULT_UNLOCK_STATION_ID,
+    CONF_DTMF_SECOND_LOCK_CODE,
+    CONF_DTMF_UNLOCK_CODE,
     CONF_LAN_RTSP_HOST,
     CONF_LAN_RTSP_PORT,
     CONF_LAN_RTSP_PROXY,
@@ -240,6 +244,10 @@ def _build_client(entry: ConfigEntry) -> SIPClient:
         unlock_strategy=strategy,
         default_unlock_station_id=default_station_id,
         legacy_first_door_hybrid=not is_app_managed,
+        dtmf_unlock_code=str(entry.options.get(CONF_DTMF_UNLOCK_CODE) or ""),
+        dtmf_second_lock_code=str(
+            entry.options.get(CONF_DTMF_SECOND_LOCK_CODE) or ""
+        ),
     )
 
 

@@ -18,7 +18,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .redaction import get_redacting_logger
 
@@ -29,6 +29,8 @@ INVITE_TLS_PORT = 5061
 DEFAULT_INVITE_TRANSPORT = "tls"
 DEFAULT_INVITE_TIMEOUT = 2.5
 DEFAULT_UNLOCK_DELAY = 0.0
+# Outdoor stations switch the relay on a dtmf-relay INFO without answering it.
+DTMF_INFO_RESPONSE_TIMEOUT = 2.0
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,14 @@ class UnlockMessage:
     station_id: str
     target_uri: str
     body: str
+
+
+@dataclass(frozen=True)
+class DtmfUnlock:
+    """In-dialog dtmf-relay INFO that opens one station's door."""
+
+    station_id: str
+    info_body: str = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -108,6 +118,8 @@ class InviteSession:
     remote_contact: str = ""
     audio_sock: socket.socket | None = None
     video_sock: socket.socket | None = None
+    # Highest CSeq this side used in the dialog after the INVITE.
+    last_cseq: int = 0
 
     def close_media(self) -> None:
         for media_sock in (self.audio_sock, self.video_sock):
@@ -535,6 +547,67 @@ def _send_plain_message(
     return response
 
 
+def dtmf_relay_body(code: str) -> str:
+    """Return the application/dtmf-relay body for a door opener code."""
+    return f"Signal={code}\r\nDuration=250"
+
+
+def _send_dialog_info(
+    stream: SipStream,
+    local_ip: str,
+    local_port: int,
+    gw: GatewayConfig,
+    sip_user: str,
+    sip_pass: str,
+    session: InviteSession,
+    body: str,
+) -> SipFrame | None:
+    """Send a dtmf-relay INFO inside the session's dialog.
+
+    Returns the final response, or None when the station does not answer.
+    """
+    transport = gw.transport.upper()
+    request_uri = session.remote_contact or session.request_uri
+    cseq = max(session.invite_cseq, session.last_cseq) + 1
+    headers = [
+        f"Via: SIP/2.0/{transport} {local_ip}:{local_port};branch=z9hG4bK-{uuid.uuid4().hex[:12]};rport",
+        "Max-Forwards: 70",
+        f"From: {session.from_header};tag={session.local_tag}",
+        f"To: {session.remote_to}",
+        f"Call-ID: {session.call_id}",
+        f"CSeq: {cseq} INFO",
+        f"Contact: {session.local_contact}",
+        "User-Agent: ABB-Welcome-HA/1.0",
+        "Content-Type: application/dtmf-relay",
+    ]
+    # A challenged INFO is resent with the next CSeq.
+    session.last_cseq = cseq + 1
+    stream.sock.settimeout(DTMF_INFO_RESPONSE_TIMEOUT)
+    stream.sock.sendall(_sip_request("INFO", request_uri, headers, body))
+    try:
+        response = stream.recv_final_response(
+            call_id=session.call_id, cseq_number=cseq, cseq_method="INFO"
+        )
+        if response.status_code() in (401, 407):
+            response, _ = _maybe_auth_resend(
+                stream,
+                response,
+                "INFO",
+                request_uri,
+                headers,
+                body,
+                sip_user,
+                sip_pass,
+                transport,
+                local_ip,
+                local_port,
+                5,
+            )
+    except TimeoutError:
+        return None
+    return response
+
+
 def _make_dummy_rtp_socket(bind_ip: str) -> tuple[socket.socket, int]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((bind_ip, 0))
@@ -762,13 +835,14 @@ def _send_bye(
 ) -> SipFrame:
     transport = gw.transport.upper()
     request_uri = session.remote_contact or session.request_uri
+    bye_cseq = max(session.invite_cseq, session.last_cseq) + 1
     headers = [
         f"Via: SIP/2.0/{transport} {local_ip}:{local_port};branch=z9hG4bK-{uuid.uuid4().hex[:12]};rport",
         "Max-Forwards: 70",
         f"From: {session.from_header};tag={session.local_tag}",
         f"To: {session.remote_to}",
         f"Call-ID: {session.call_id}",
-        f"CSeq: {session.invite_cseq + 1} BYE",
+        f"CSeq: {bye_cseq} BYE",
         f"Contact: {session.local_contact}",
         "User-Agent: ABB-Welcome-HA/1.0",
     ]
@@ -805,7 +879,7 @@ def _send_bye(
             f"Via: SIP/2.0/{transport} {local_ip}:{local_port};"
             f"branch=z9hG4bK-{uuid.uuid4().hex[:12]};rport"
         )
-        headers[5] = f"CSeq: {session.invite_cseq + 2} BYE"
+        headers[5] = f"CSeq: {bye_cseq + 1} BYE"
         headers.append(auth)
         stream.sock.sendall(
             ("\r\n".join([f"BYE {request_uri} SIP/2.0", *headers, "Content-Length: 0", "", ""])).encode("utf-8")
@@ -836,6 +910,8 @@ class SIPClient:
         unlock_strategy: str = "hybrid",
         default_unlock_station_id: str = "",
         legacy_first_door_hybrid: bool = True,
+        dtmf_unlock_code: str = "",
+        dtmf_second_lock_code: str = "",
     ) -> None:
         self.host = host
         self.username = username
@@ -847,6 +923,8 @@ class SIPClient:
         self.unlock_strategy = unlock_strategy
         self.default_unlock_station_id = default_unlock_station_id.strip()
         self.legacy_first_door_hybrid = legacy_first_door_hybrid
+        self._dtmf_unlock_code = dtmf_unlock_code.strip()
+        self._dtmf_second_lock_code = dtmf_second_lock_code.strip()
         self._first_station_id = self._derive_first_station_id(doors or [])
 
     def _derive_first_station_id(self, doors: list[dict]) -> str:
@@ -958,7 +1036,18 @@ class SIPClient:
         finally:
             sock.close()
 
-    def _unlock_via_invite(self, door: DoorSpec, timeout: float) -> bool:
+    def _dtmf_info_body(self, door: DoorSpec) -> str | None:
+        """Return the dtmf-relay body for the door's lock, if a code is set."""
+        code = (
+            self._dtmf_second_lock_code
+            if door.unlock_body == "a"
+            else self._dtmf_unlock_code
+        )
+        return dtmf_relay_body(code) if code else None
+
+    def _unlock_via_invite(
+        self, door: DoorSpec, timeout: float, info_body: str | None = None
+    ) -> bool:
         gw = _build_gateway_config(self.domain, self.host, self.invite_transport)
         media_ip = _guess_media_ip(gw.gw_host)
         invite_timeout = min(timeout, DEFAULT_INVITE_TIMEOUT) if timeout > 0 else DEFAULT_INVITE_TIMEOUT
@@ -990,6 +1079,31 @@ class SIPClient:
 
             if DEFAULT_UNLOCK_DELAY > 0:
                 time.sleep(DEFAULT_UNLOCK_DELAY)
+
+            if info_body is not None:
+                response = _send_dialog_info(
+                    stream,
+                    local_ip,
+                    local_port,
+                    gw,
+                    self.username,
+                    self.password,
+                    session,
+                    info_body,
+                )
+                if response is not None and (response.status_code() or 0) >= 300:
+                    _LOGGER.error(
+                        "Invite unlock INFO failed for %s: %s",
+                        door.name, response.start_line,
+                    )
+                    return False
+                unlocked = True
+                _LOGGER.debug(
+                    "Invite unlock INFO sent for %s: %s",
+                    door.name,
+                    response.start_line if response is not None else "no response",
+                )
+                return True
 
             response = _send_plain_message(
                 stream,
@@ -1067,6 +1181,19 @@ class SIPClient:
             body=spec.unlock_body,
         )
 
+    def dtmf_unlock(
+        self, door: Mapping[str, object], body: str | None = None
+    ) -> DtmfUnlock | None:
+        """Return the INFO that opens ``door``, or None without a configured code."""
+        try:
+            spec = self._normalize_door(door, body)
+        except ValueError:
+            return None
+        info_body = self._dtmf_info_body(spec)
+        if info_body is None:
+            return None
+        return DtmfUnlock(station_id=spec.station_id, info_body=info_body)
+
     def unlock_door(
         self,
         door: Mapping[str, object] | str,
@@ -1080,6 +1207,9 @@ class SIPClient:
             _LOGGER.error("Invalid ABB Welcome door config: %s", err)
             return False
 
+        info_body = self._dtmf_info_body(spec)
+        if info_body is not None:
+            return self._unlock_via_invite(spec, timeout, info_body)
         if self._use_fast_route(spec):
             return self._unlock_fast(spec, timeout)
         return self._unlock_via_invite(spec, timeout)

@@ -97,14 +97,14 @@ For a **Busch-Jaeger IP touch 7** (firmware 3.08) with a Smart Access Point
 (V6.66), enter the **touch panel's IP address** in the app-managed profile.
 The owner verified pairing, ring detection and live video with
 `v1.8.0-dev4`. The panel identifies itself as `GlobalIP` and explicitly
-grants HA permission to open the door. With the Standard strategy, the panel
-acknowledges the SIP message but the door stays locked. Re-pairing to obtain
-that permission is unnecessary. [Pairing diagnostics](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6985603402)
+grants HA permission to open the door. [Pairing diagnostics](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6985603402)
 
-With the published `v1.8.0-dev5`, the door also stayed locked during an
-active HA live view. The owner confirmed that a locally modified dev5
-opened the primary lock twice through the outdoor station's Lock-GND output.
-The subsidiary relay was not tested. [Field results](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6989189437)
+This panel acknowledges the unlock `MESSAGE` of every unlock strategy but
+leaves the door locked. Set the **Door opener code** option instead (see
+[Door Opener Code](#door-opener-code)). The owner opened the primary lock
+(the outdoor station's Lock-GND output) twice with that SIP `INFO` during an
+HA live view. Unlocking without an open live view and the subsidiary relay
+have not been tested on the device. [Field results](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6989189437)
 
 On this installation, enabling the Smart AP's SIP server interrupted calls
 from the H81381P1-S-03 outdoor station to the indoor panel. Keep it off for
@@ -489,6 +489,8 @@ Open the integration's **Configure** menu to change behavior after setup.
 Options:
 
 - **Unlock strategy**
+- **Door opener code (SIP INFO)** and **Second lock opener code (SIP INFO)**:
+  see [Door Opener Code](#door-opener-code). Blank keeps the unlock strategy.
 - **Physical default door for Hybrid fast path**: app-managed devices only.
   Select the door that the physical indoor panel itself opens by default.
   Home Assistant cannot discover this setting.
@@ -511,6 +513,23 @@ lock keeps the selected strategy. Second-lock availability comes from the
 gateway device list or the pairing ACL's `secondunlock` flag. Reload the
 integration or run `abb_welcome.refresh_doors` after changing this setting on a
 web-admin gateway; app-managed topology changes require re-pairing.
+
+### Door Opener Code
+
+Some outdoor stations ignore the unlock `MESSAGE` and open only on a DTMF code
+sent as SIP `INFO` (RFC 2976) inside a call with that station. The Smart
+Access Point lists the codes on the outdoor station's **3rd party door opener
+settings** page, one for the default lock and one for the subsidiary lock.
+
+Enter them as **Door opener code** and **Second lock opener code**. A lock
+with a code no longer uses the unlock strategy: its button sends the code in
+the running live-view call with that station, or places a short call of its
+own, sends the code and hangs up. The same code is used for every door.
+
+These stations switch the relay without answering the `INFO`, so Home
+Assistant reports the press as successful once the request is sent and not
+rejected. It cannot tell whether the door opened. The codes are stored in the
+config entry and redacted from diagnostics and logs.
 
 If a door does not open with Hybrid, switch to **Standard**. Do not use Fast to
 test targeting on a multi-door app-managed device: the physical panel may
@@ -743,9 +762,9 @@ action:
   manually and retry.
 - **The gateway did not see our pairing request**: retry pairing; the
   portal-to-gateway link may have been briefly delayed.
-- **A door does not open**: try **Standard** unlock strategy. The IP touch 7
-  owner already tested this strategy on the setup described above. With the
-  published dev5 integration, use the Welcome app to open that door.
+- **A door does not open**: try **Standard** unlock strategy. If the panel
+  accepts the request but the door stays locked, as on the IP touch 7 setup
+  described above, set the [door opener code](#door-opener-code).
 - **WebRTC says `wrong response on DESCRIBE`**: turn on `Streaming enabled` and
   open the camera within the armed window.
 - **Camera has video but no audio**: confirm you are on a current version and

@@ -25,6 +25,8 @@ from .const import (
     CONF_ABB_USERNAME,
     CONF_ALLOW_PICKUP,
     CONF_DEFAULT_UNLOCK_STATION_ID,
+    CONF_DTMF_SECOND_LOCK_CODE,
+    CONF_DTMF_UNLOCK_CODE,
     CONF_GATEWAY_IP,
     CONF_GATEWAY_PASSWORD,
     CONF_GATEWAY_PROFILE,
@@ -37,6 +39,7 @@ from .const import (
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_LAN_RTSP_PROXY,
     DOMAIN,
+    DTMF_CODE_PATTERN,
     GATEWAY_CAPABILITIES,
     GATEWAY_CLIENT_TYPES,
     GATEWAY_PROFILE_APP_MANAGED,
@@ -1230,6 +1233,14 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
                 )
             if not is_app_managed or selected_station not in station_id_set:
                 data.pop(CONF_DEFAULT_UNLOCK_STATION_ID, None)
+            for code_key in (CONF_DTMF_UNLOCK_CODE, CONF_DTMF_SECOND_LOCK_CODE):
+                code = str(data.get(code_key) or "").strip().upper()
+                if not code:
+                    data.pop(code_key, None)
+                elif re.fullmatch(DTMF_CODE_PATTERN, code):
+                    data[code_key] = code
+                else:
+                    errors[code_key] = "invalid_dtmf_code"
             data[CONF_LAN_RTSP_HOST] = str(data.get(CONF_LAN_RTSP_HOST) or "").strip()
             data[CONF_LAN_RTSP_PORT] = int(
                 data.get(CONF_LAN_RTSP_PORT) or DEFAULT_LAN_RTSP_PORT
@@ -1280,6 +1291,7 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
             if submitted is not None
             else self._entry.options.get(CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP)
         )
+        current_options = submitted if submitted is not None else self._entry.options
         schema_fields = {
             vol.Required(
                 CONF_UNLOCK_STRATEGY, default=current
@@ -1290,6 +1302,16 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
                     mode=selector.SelectSelectorMode.DROPDOWN,
                 )
             ),
+            **{
+                # A suggested value, unlike a default, lets the field be cleared.
+                vol.Optional(
+                    code_key,
+                    description={
+                        "suggested_value": str(current_options.get(code_key) or "")
+                    },
+                ): selector.TextSelector()
+                for code_key in (CONF_DTMF_UNLOCK_CODE, CONF_DTMF_SECOND_LOCK_CODE)
+            },
             vol.Required(
                 CONF_LAN_RTSP_PROXY, default=current_rtsp_proxy
             ): selector.BooleanSelector(),

@@ -350,6 +350,7 @@ def test_second_button_sends_a_and_surfaces_failure(monkeypatch, success):
     client = types.SimpleNamespace(
         unlock_door=lambda *args: calls.append(args) or success,
         invite_route_message=lambda door, body: None,
+        dtmf_unlock=lambda door, body: None,
     )
     door = {"name": "Front", "station_id": "100000001", "second_lock": True}
     entity = module.ABBWelcomeDoorButton(

@@ -98,6 +98,8 @@
         "data": {
           "unlock_strategy": "Unlock strategy",
           "default_unlock_station_id": "Physical default door for Hybrid fast path",
+          "dtmf_unlock_code": "Door opener code (SIP INFO)",
+          "dtmf_second_lock_code": "Second lock opener code (SIP INFO)",
           "lan_rtsp_proxy": "Serve camera streams to the LAN over RTSP (Scrypted/HomeKit)",
           "lan_rtsp_host": "Advertised Home Assistant LAN host (blank = auto)",
           "lan_rtsp_port": "Preferred LAN RTSP proxy port",
@@ -107,7 +109,8 @@
     },
     "error": {
       "fast_multi_door_unsupported": "Fast cannot safely target a specific door on an app-managed device with multiple doors. Use Standard, or Hybrid with the physical default door selected.",
-      "invalid_default_unlock_station": "Select the door configured as the physical indoor panel default before enabling Hybrid."
+      "invalid_default_unlock_station": "Select the door configured as the physical indoor panel default before enabling Hybrid.",
+      "invalid_dtmf_code": "Use up to 16 DTMF characters: 0-9, A-D, * and #."
     }
   },
   "selector": {
