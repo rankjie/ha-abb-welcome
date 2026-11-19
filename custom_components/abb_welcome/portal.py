@@ -540,6 +540,20 @@ def _event_ids(*values: Any) -> list[str]:
     return ids
 
 
+def _paired_open_door_permission(config: configparser.ConfigParser, sip_username: str) -> str:
+    if not sip_username or config.defaults():
+        return "unknown"
+    grants = []
+    for section in config.sections():
+        if section.startswith("user_"):
+            user = config[section]
+            if user.get("username", user.get("user")) == sip_username:
+                grants.append(user.get("opendoor"))
+    if len(grants) == 1 and grants[0] in ("yes", "no"):
+        return grants[0]
+    return "unknown"
+
+
 def _pairing_metadata(payload: str, sip_username: str) -> dict[str, str]:
     # Only the INI after the encrypted SIP password describes capabilities.
     try:
@@ -553,21 +567,12 @@ def _pairing_metadata(payload: str, sip_username: str) -> dict[str, str]:
         return {"status": "invalid_record"}
 
     family = config.get("network", "systemtype", fallback="")
-    grants = []
-    for section in config.sections():
-        if section.startswith("user_"):
-            user = config[section]
-            if user.get("username", user.get("user")) == sip_username:
-                grants.append(user.get("opendoor"))
-    permission = grants[0] if len(grants) == 1 else None
     return {
         "status": "found",
         "system_type": family
         if family in ("GlobalIP", "mrange", "allegro")
         else "unknown",
-        "open_door_permission": permission
-        if permission in ("yes", "no")
-        else "unknown",
+        "open_door_permission": _paired_open_door_permission(config, sip_username),
     }
 
 
@@ -783,7 +788,7 @@ def poll_acl_update(
 
 
 def parse_acl_update(
-    payload: str, private_key_pem: bytes
+    payload: str, private_key_pem: bytes, app_sip_username: str | None = None
 ) -> tuple[str, str, list[dict[str, Any]]]:
     """Decode an ACL-update payload.
 
@@ -830,6 +835,11 @@ def parse_acl_update(
         else ""
     )
 
+    restrict_unlock = (
+        app_sip_username is not None
+        and config.get("network", "systemtype", fallback="") == "GlobalIP"
+        and _paired_open_door_permission(config, app_sip_username) != "yes"
+    )
     doors: list[dict[str, Any]] = []
     for sec in config.sections():
         if not sec.startswith("outdoorstation_"):
@@ -850,8 +860,8 @@ def parse_acl_update(
             door["local_id"] = local_id
         if station_type:
             door["type"] = station_type
-            if station_type != "1":
-                door["can_unlock"] = False
+        if restrict_unlock or (station_type and station_type != "1"):
+            door["can_unlock"] = False
         if config.has_option(sec, "secondunlock"):
             second_unlock = config.get(sec, "secondunlock").strip()
             if second_unlock not in ("0", "1"):

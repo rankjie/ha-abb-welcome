@@ -991,9 +991,10 @@ def test_acl_parsing_builds_doors_before_confirmation() -> None:
     flow._own_uuid = "11111111-1111-4111-8111-111111111111"
     flow._gateway_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
     flow._client_name = "ha-test"
+    flow._sip_username = "paired-ha"
     flow._integrity_display = "1234 ABCD"
     module.poll_acl_update = lambda *args: "encrypted-acl"
-    module.parse_acl_update = lambda *args: (
+    module.parse_acl_update = lambda payload, key, username: (
         "sip-password",
         "sip.example.invalid",
         [
@@ -1003,6 +1004,7 @@ def test_acl_parsing_builds_doors_before_confirmation() -> None:
                 "station_id": "100000001",
                 "local_id": "synthetic-local-client",
                 "type": "1",
+                "can_unlock": username != "paired-ha",
                 "second_lock": True,
             }
         ],
@@ -1018,6 +1020,7 @@ def test_acl_parsing_builds_doors_before_confirmation() -> None:
             "local_id": "synthetic-local-client",
             "body": "1",
             "index": 0,
+            "can_unlock": False,
             "type": "1",
             "second_lock": True,
         }

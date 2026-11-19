@@ -1093,7 +1093,8 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                 sip_domain,
                 doors_meta,
             ) = await self.hass.async_add_executor_job(
-                parse_acl_update, payload, self._private_key_pem
+                parse_acl_update, payload, self._private_key_pem,
+                self._sip_username if app_managed else None,
             )
         except PortalError as err:
             # Parse errors can quote ACL content, so only the type is logged.

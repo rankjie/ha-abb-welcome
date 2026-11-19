@@ -8,6 +8,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
@@ -78,6 +79,24 @@ def test_acl_network_localid_is_persisted_per_door() -> None:
             "type": "1",
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("users", "unlockable"),
+    [
+        ("[user_1]\nuser=test-ha\nopendoor=yes", True),
+        ("[user_1]\nusername=test-ha\nopendoor=no", False),
+        ("[user_1]\nuser=another-client\nopendoor=yes", False),
+        ("[user_1]\nuser=test-ha\nopendoor=yes\n[user_2]\nuser=test-ha\nopendoor=no", False),
+        ("[DEFAULT]\nopendoor=yes\n[user_1]\nuser=test-ha", False),
+    ],
+)
+def test_globalip_pairing_limits_unlock_to_the_paired_user(users, unlockable):
+    payload, key = _acl_payload(local_id=None)
+    payload = payload.replace("[network]", "[network]\nsystemtype=GlobalIP")
+    _, _, doors = portal.parse_acl_update(payload + "\n" + users, key, "test-ha")
+    assert len(doors) == 1
+    assert (doors[0].get("can_unlock") is not False) is unlockable
 
 
 def test_app_managed_target_uses_exact_acl_uri_and_display_name() -> None:
