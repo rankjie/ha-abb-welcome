@@ -384,11 +384,10 @@ def _custom_crypto_attribute(key: bytes) -> str:
 # After the gateway ends or refuses a call it keeps refusing new ones for
 # several seconds (observed for ~10 s after a door release). Stream clients
 # reconnect immediately, so every retry inside that window would be another
-# INVITE. The hold-off doubles while calls keep failing and restarts once a
-# call has stayed up.
+# INVITE. The hold-off doubles while INVITEs keep being refused and restarts
+# once one is answered.
 DIAL_HOLDOFF_INITIAL = 3.0
 DIAL_HOLDOFF_MAX = 15.0
-DIAL_HOLDOFF_RESET_AFTER = 10.0
 
 
 class GatewayBusyError(RuntimeError):
@@ -408,7 +407,6 @@ class CallState:
     video_local_port: int
     answer: ParsedSdp
     local_send_keys: MediaEncryptionKeys | None = field(default=None, repr=False)
-    established_at: float = field(default_factory=lambda: time.monotonic())
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -676,9 +674,7 @@ class IntercomDialer:
             return
         if self._call is not None and self._call.call_id == call_id:
             if reason == "remote_bye":
-                self._hold_off_dialing(
-                    time.monotonic() - self._call.established_at
-                )
+                self._hold_off_dialing()
             self._call = None
         if (
             self._pending_camera_count_target is not None
@@ -692,12 +688,11 @@ class IntercomDialer:
             if not fut.done():
                 fut.set_result(reason)
 
-    def _hold_off_dialing(self, call_duration: float) -> None:
+    def _hold_off_dialing(self) -> None:
         """Delay the next dial after the gateway ended or refused a call."""
-        if call_duration >= DIAL_HOLDOFF_RESET_AFTER or not self._dial_holdoff:
-            self._dial_holdoff = DIAL_HOLDOFF_INITIAL
-        else:
-            self._dial_holdoff = min(self._dial_holdoff * 2, DIAL_HOLDOFF_MAX)
+        self._dial_holdoff = min(
+            self._dial_holdoff * 2 or DIAL_HOLDOFF_INITIAL, DIAL_HOLDOFF_MAX
+        )
         self._dial_not_before = time.monotonic() + self._dial_holdoff
         _LOGGER.info(
             "[abb] dialer: holding off new calls for %.0fs after the gateway "
@@ -1014,7 +1009,7 @@ class IntercomDialer:
 
         if frame.status_code != 200:
             self._pending_camera_count_target = None
-            self._hold_off_dialing(0.0)
+            self._hold_off_dialing()
             raise RuntimeError(f"INVITE rejected: {frame.start_line}")
 
         remote_to = frame.header("To")
@@ -1105,6 +1100,7 @@ class IntercomDialer:
             )
             self._pending_camera_count_target = None
             self._cseq += 1
+            self._dial_holdoff = 0.0
             return self._call
         except Exception as err:
             self._pending_camera_count_target = None

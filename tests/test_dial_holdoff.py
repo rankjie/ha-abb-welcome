@@ -143,23 +143,7 @@ def test_holdoff_doubles_while_calls_keep_failing_and_is_capped(clock):
     asyncio.run(scenario())
 
 
-def test_a_call_cut_short_by_the_gateway_counts_as_another_failure(clock):
-    async def scenario():
-        dialer, _ = _dialer()
-        call = await _dial(dialer)
-        clock.now += 60
-        _gateway_hangs_up(dialer, call)
-        clock.now += intercom.DIAL_HOLDOFF_INITIAL
-
-        call = await _dial(dialer)
-        clock.now += 1
-        _gateway_hangs_up(dialer, call)
-        assert dialer._dial_not_before - clock.now == 6.0
-
-    asyncio.run(scenario())
-
-
-def test_a_call_that_stayed_up_restarts_the_holdoff(clock):
+def test_an_answered_call_restarts_the_holdoff(clock):
     async def scenario():
         dialer, gateway = _dialer("486 Busy Here")
         for _ in range(3):
@@ -169,7 +153,7 @@ def test_a_call_that_stayed_up_restarts_the_holdoff(clock):
 
         gateway.status = "200 OK"
         call = await _dial(dialer)
-        clock.now += intercom.DIAL_HOLDOFF_RESET_AFTER
+        clock.now += 1
         _gateway_hangs_up(dialer, call)
         assert dialer._dial_not_before - clock.now == intercom.DIAL_HOLDOFF_INITIAL
 
