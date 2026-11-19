@@ -518,6 +518,7 @@ class _PCMATalkSender:
         self.talking = False
         self._marker_next = False
         self._pcm_buffer = bytearray()
+        self._pcma_buffer = bytearray()
         self._queued_pcma: deque[bytes] = deque()
         self._condition = threading.Condition()
         self._thread: threading.Thread | None = None
@@ -600,6 +601,7 @@ class _PCMATalkSender:
             self.talking = False
             self._marker_next = False
             self._pcm_buffer.clear()
+            self._pcma_buffer.clear()
             self._queued_pcma.clear()
             self._condition.notify_all()
 
@@ -630,6 +632,26 @@ class _PCMATalkSender:
                 self.dropped_frames += 1
             self._condition.notify_all()
         return len(encoded)
+
+    def feed_pcma(self, pcma: bytes) -> int:
+        """Queue already-encoded PCMA, reframed to the outgoing packet size."""
+        queued = 0
+        with self._condition:
+            if not self.talking:
+                return 0
+            self._pcma_buffer.extend(pcma)
+            while len(self._pcma_buffer) >= self.samples_per_packet:
+                self._queued_pcma.append(
+                    bytes(self._pcma_buffer[: self.samples_per_packet])
+                )
+                del self._pcma_buffer[: self.samples_per_packet]
+                self.frames_received += 1
+                queued += 1
+            while len(self._queued_pcma) > self.max_queue_frames:
+                self._queued_pcma.popleft()
+                self.dropped_frames += 1
+            self._condition.notify_all()
+        return queued
 
     def _thread_main(self) -> None:
         deadline_ns = self._monotonic_ns()
@@ -1073,6 +1095,10 @@ class StreamSession:
     @property
     def talkback_ready(self) -> bool:
         return self._talk_sender is not None and self._talk_sender.active
+
+    @property
+    def talkback_talking(self) -> bool:
+        return self._talk_sender is not None and self._talk_sender.talking
 
     def talkback_stats(self) -> dict[str, Any]:
         sender = self._talk_sender
@@ -1703,6 +1729,18 @@ class StreamSession:
         stats = sender.stats()
         stats["queued_frames_now"] = queued
         return stats
+
+    def feed_talkback_pcma_rtp(self, packet: bytes) -> int:
+        """Queue the payload of one PCMA RTP packet; return frames queued."""
+        sender = self._talk_sender
+        if sender is None or not sender.active:
+            raise RuntimeError("talkback is not ready; open the camera stream first")
+        if len(packet) < 12 or (packet[1] & 0x7F) != self.AUDIO_SDP_PT:
+            return 0
+        payload = _rtp_payload(packet)
+        if not payload:
+            return 0
+        return sender.feed_pcma(payload)
 
     async def send_talkback_tone(
         self,

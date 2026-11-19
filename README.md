@@ -348,8 +348,26 @@ data:
 
 ## Talkback
 
-HA exposes talkback as services for the currently active stream. These services
-are mainly intended for the Scrypted plugin.
+### Microphone in the live stream
+
+On Home Assistant 2026.11 or newer the camera declares two-way audio, so the
+live stream shows a talk button:
+
+1. Turn on **Settings → System → Labs → Two-way audio**.
+2. Open Home Assistant over HTTPS. Browsers only grant microphone access on a
+   secure connection.
+
+The microphone travels over the same WebRTC session as the video. go2rtc hands
+it to the integration's RTSP server as an ONVIF audio backchannel (PCMA, no
+transcoding), so go2rtc-based cards with their own microphone button work the
+same way.
+
+### Services
+
+HA also exposes talkback as services for the currently active stream. These
+services are mainly intended for the Scrypted plugin. A service call that names
+a `talkback_session_id` takes the talk over from the live-stream microphone
+until it calls `talk_stop`.
 
 - `abb_welcome.talk_start`
 - `abb_welcome.talk_stop`

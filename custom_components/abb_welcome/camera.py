@@ -46,9 +46,7 @@ from go2rtc_client.ws import (
 )
 from homeassistant.components.camera import (
     Camera,
-    CameraCapabilities,
     CameraEntityFeature,
-    StreamType,
     WebRTCAnswer,
     WebRTCCandidate,
     WebRTCError,
@@ -61,6 +59,11 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from webrtc_models import RTCIceCandidateInit
+
+try:
+    from homeassistant.components.camera import CameraEntityCapabilities
+except ImportError:  # Home Assistant before 2026.11 has no two-way audio.
+    CameraEntityCapabilities = None
 
 from .const import (
     DOMAIN,
@@ -75,6 +78,7 @@ from .media_pipeline import StreamSession
 from .redaction import get_redacting_logger
 from .rtsp_server import (
     AUDIO_RTP_CHANNEL,
+    BACKCHANNEL_TRACK_ID,
     VIDEO_RTP_CHANNEL,
     RtspServer,
     RtspSession,
@@ -354,6 +358,10 @@ def _go2rtc_session(hass: HomeAssistant) -> ClientSession:
     return async_get_clientsession(hass)
 
 
+def _backchannel_owner(sess: RtspSession) -> str:
+    return f"rtsp-backchannel:{sess.session_id}"
+
+
 class StationStreamCoordinator:
     """Own one gateway media session and fan it out to RTSP consumers."""
 
@@ -482,6 +490,8 @@ class StationStreamCoordinator:
 
     def detach_rtsp_session(self, sess: RtspSession) -> None:
         self._discard_rtsp_play_session(sess)
+        if self._talkback_owner == _backchannel_owner(sess):
+            self.stop_talkback(self._talkback_owner)
         _LOGGER.info(
             "[abb] stream coordinator: detached RTSP session station=%s "
             "session=%s active=%s clients=%d",
@@ -634,6 +644,21 @@ class StationStreamCoordinator:
             self._notify_state()
         return stats
 
+    def feed_backchannel_rtp(self, sess: RtspSession, packet: bytes) -> None:
+        """Send one RTSP backchannel packet to the door station.
+
+        The backchannel talks whenever nobody else does: a talk service that
+        names its own session takes over, and an audio file plays undisturbed.
+        """
+        if self._active_file_playbacks or not self.session.talkback_ready:
+            return
+        owner = _backchannel_owner(sess)
+        if self._talkback_owner not in ("", owner):
+            return
+        if self._talkback_owner != owner or not self.session.talkback_talking:
+            self.start_talkback(owner)
+        self.session.feed_talkback_pcma_rtp(packet)
+
     async def send_talkback_tone(
         self,
         *,
@@ -712,6 +737,10 @@ class ABBWelcomeCamera(Camera):
     _attr_has_entity_name = True
     _attr_supported_features = CameraEntityFeature.STREAM
     _attr_icon = "mdi:doorbell-video"
+    if CameraEntityCapabilities is not None:
+        _attr_camera_entity_capabilities = CameraEntityCapabilities(
+            two_way_audio=True
+        )
 
     def __init__(
         self,
@@ -757,6 +786,7 @@ class ABBWelcomeCamera(Camera):
             on_describe=self._on_rtsp_describe,
             on_play=self._on_rtsp_play,
             on_teardown=self._on_rtsp_teardown,
+            on_backchannel_rtp=self._coordinator.feed_backchannel_rtp,
         )
 
         # WebRTC session bookkeeping (one Go2RtcWsClient per HA frontend
@@ -776,10 +806,6 @@ class ABBWelcomeCamera(Camera):
             self._attr_name, count,
         )
         self.async_write_ha_state()
-
-    @property
-    def camera_capabilities(self) -> CameraCapabilities:
-        return CameraCapabilities(frontend_stream_types={StreamType.WEB_RTC})
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -1069,7 +1095,7 @@ class ABBWelcomeCamera(Camera):
     # RTSP server callbacks                                              #
     # ------------------------------------------------------------------ #
 
-    async def _on_rtsp_describe(self) -> str | None:
+    async def _on_rtsp_describe(self, backchannel: bool) -> str | None:
         armed_state = get_state(self.hass, self._entry_id)
         _LOGGER.info(
             "[abb] camera %s: DESCRIBE armed=%s target_station=%s "
@@ -1124,8 +1150,16 @@ class ABBWelcomeCamera(Camera):
             "m=audio 0 RTP/AVP 8",
             "a=rtpmap:8 PCMA/8000",
             "a=control:trackID=1",
-            "",
         ]
+        if backchannel:
+            # ONVIF audio backchannel: the track the client sends talkback on.
+            sdp_lines += [
+                "m=audio 0 RTP/AVP 8",
+                "a=rtpmap:8 PCMA/8000",
+                f"a=control:trackID={BACKCHANNEL_TRACK_ID}",
+                "a=sendonly",
+            ]
+        sdp_lines.append("")
         _LOGGER.info(
             "[abb] camera %s: DESCRIBE returning SDP codec=%s fmtp=%s "
             "camera_index=%s",
