@@ -118,7 +118,7 @@ GATEWAY_CAPABILITIES = {
         approval_method="automatic_acl",
         admin_available=False,
         topology_refresh=False,
-        model="Wi-Fi Indoor Station (M2240x / ASI22)",
+        model="App-managed indoor station",
         default_unlock_strategy=UNLOCK_STRATEGY_STANDARD,
     ),
 }

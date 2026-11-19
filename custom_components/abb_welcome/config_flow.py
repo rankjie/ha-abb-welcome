@@ -59,6 +59,7 @@ from .portal import (
     GatewayAdminError,
     GatewayWebAdminMissingError,
     PortalError,
+    acl_system_type,
     compute_integrity_code,
     default_client_name,
     derive_identity,
@@ -103,6 +104,14 @@ DEVICE_KINDS = {
     "com.abb.ispf.client.globalip.gateway": "IP gateway",
     "com.abb.ispf.client.welcome.panel": "Wi-Fi indoor station",
 }
+
+# Shown on the confirm step only when it asks for a door opener code.
+OPENER_CODE_HINT = (
+    "\n\nThis panel opens doors with a door opener code. Enter the code listed "
+    "under **3rd party door opener settings** for the outdoor station in the "
+    "Smart Access Point. Without it the door buttons are accepted by the panel "
+    "but the door stays locked. You can also set it later under **Configure**."
+)
 
 PENDING_PAIRING_STORAGE_VERSION = 1
 PENDING_PAIRING_SCHEMA_VERSION = 1
@@ -239,6 +248,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self._integrity_eight = ""
         self._integrity_display = ""
         self._doors: list[dict] = []
+        self._system_type = ""
         self._manual_authorize = False
         self._gateway_profile = GATEWAY_PROFILE_WEB_ADMIN
         self._app_authorize_error = ""
@@ -345,6 +355,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
                     "sip_password": self._sip_password,
                     "sip_domain": self._sip_domain,
                     "doors": self._doors,
+                    "system_type": self._system_type,
                 }
             )
         return data
@@ -375,6 +386,8 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             self._sip_password = str(data["sip_password"])
             self._sip_domain = str(data["sip_domain"])
             self._doors = list(data["doors"])
+            # Absent from state saved before the opener-code setup step.
+            self._system_type = str(data.get("system_type", ""))
 
     async def _async_find_pending_pairing(self) -> ConfigFlowResult | None:
         """Offer recovery before accepting credentials for a new identity."""
@@ -1107,6 +1120,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
 
         self._sip_password = sip_password
         self._sip_domain = sip_domain
+        self._system_type = acl_system_type(payload)
         self._doors = []
         for idx, d in enumerate(doors_meta):
             door = {
@@ -1151,7 +1165,19 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict | None = None
     ) -> ConfigFlowResult:
         """Show discovered doors and create the entry."""
-        if user_input is not None:
+        code_keys = self._opener_code_keys()
+        errors: dict[str, str] = {}
+        options: dict[str, str] = {}
+        for code_key in code_keys if user_input is not None else ():
+            code = str(user_input.get(code_key) or "").strip().upper()
+            if not code:
+                continue
+            if re.fullmatch(DTMF_CODE_PATTERN, code):
+                options[code_key] = code
+            else:
+                errors[code_key] = "invalid_dtmf_code"
+
+        if user_input is not None and not errors:
             entry_data = {
                 CONF_GATEWAY_PROFILE: self._gateway_profile,
                 CONF_GATEWAY_IP: self._gateway_ip,
@@ -1172,6 +1198,7 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
             result = self.async_create_entry(
                 title=f"ABB Welcome ({self._gateway_name})",
                 data=entry_data,
+                options=options,
             )
             if not capabilities.admin_available:
                 try:
@@ -1190,14 +1217,44 @@ class ABBWelcomeConfigFlow(ConfigFlow, domain=DOMAIN):
         )
         return self.async_show_form(
             step_id="confirm",
-            data_schema=vol.Schema({}),
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        code_key,
+                        description={
+                            "suggested_value": str(
+                                (user_input or {}).get(code_key) or ""
+                            )
+                        },
+                    ): selector.TextSelector()
+                    for code_key in code_keys
+                }
+            ),
+            errors=errors,
             description_placeholders={
                 "door_count": str(len(self._doors)),
                 "door_names": door_lines,
                 "sip_username": self._sip_username,
                 "sip_domain": self._sip_domain,
+                "opener_code_hint": OPENER_CODE_HINT if code_keys else "",
             },
         )
+
+    def _opener_code_keys(self) -> tuple[str, ...]:
+        """Return the opener-code fields this panel's doors need at setup.
+
+        GlobalIP panels acknowledge the MRANGE unlock MESSAGE without opening
+        the door, so their setup asks for the code right away.
+        """
+        if (
+            self._gateway_profile != GATEWAY_PROFILE_APP_MANAGED
+            or self._system_type != "GlobalIP"
+            or not unlockable_station_ids(self._doors)
+        ):
+            return ()
+        if any(door.get("second_lock") is True for door in self._doors):
+            return (CONF_DTMF_UNLOCK_CODE, CONF_DTMF_SECOND_LOCK_CODE)
+        return (CONF_DTMF_UNLOCK_CODE,)
 
 
 class ABBWelcomeOptionsFlow(OptionsFlow):

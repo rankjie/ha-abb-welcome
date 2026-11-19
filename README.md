@@ -46,7 +46,9 @@ doorbell notifications, and two-way audio.
 - **Refresh Events** button for a manual portal event poll.
 - **Refresh outdoor stations** service for re-reading the door list on
   web-admin gateways. App-managed topology currently requires re-pairing.
-- Switchable unlock strategy for gateways that need a different SIP unlock path.
+- Switchable unlock strategy for gateways that need a different SIP unlock path,
+  and a **door opener code** for panels that open only on a DTMF code.
+- Door buttons exposed to the Scrypted plugin as HomeKit **locks**.
 - LAN RTSP proxy for Scrypted/HomeKit, with automatic free-port selection and
   discovery refresh events.
 
@@ -54,7 +56,8 @@ doorbell notifications, and two-way audio.
 
 - A supported ABB Welcome device reachable on your local network:
   - ABB **83342** or another `mrange` IP gateway with web admin, or
-  - an **M2240x/ASI22 Wi-Fi indoor station** with SIP-TLS port 5061 reachable.
+  - an **M2240x/ASI22 Wi-Fi indoor station** or a **Busch-Jaeger IP touch**
+    panel, with SIP-TLS port 5061 reachable.
 - An **ABB-Welcome / Busch-Jaeger MyBuildings** account already linked to that
   gateway.
 - For web-admin gateways only, the gateway admin password used at
@@ -89,8 +92,8 @@ Open Settings -> **Devices & Services** -> **Add Integration** -> **ABB Welcome*
 First choose a device profile:
 
 - **Web-admin IP gateway (83342 / MRANGE)** keeps the existing HTTPS/CGI setup.
-- **App-managed Wi-Fi indoor station (M2240x / ASI22)** uses SIP-TLS port 5061
-  and MyBuildings app pairing; it never contacts port 443
+- **App-managed indoor station (M2240x / ASI22, IP touch)** uses SIP-TLS port
+  5061 and MyBuildings app pairing; it never contacts port 443
   or asks for a gateway admin password.
 
 For a **Busch-Jaeger IP touch 7** (firmware 3.08) with a Smart Access Point
@@ -100,8 +103,9 @@ The owner verified pairing, ring detection and live video with
 grants HA permission to open the door. [Pairing diagnostics](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6985603402)
 
 This panel acknowledges the unlock `MESSAGE` of every unlock strategy but
-leaves the door locked. Set the **Door opener code** option instead (see
-[Door Opener Code](#door-opener-code)). With `v1.8.0-dev6` the owner opened
+leaves the door locked. It needs the **Door opener code** instead (see
+[Door Opener Code](#door-opener-code)); setup asks for it on the last step
+when the panel reports `GlobalIP`. With `v1.8.0-dev6` the owner opened
 the primary lock (the outdoor station's Lock-GND output) both during an HA
 live view and with no live view open. The subsidiary relay has not been
 tested on the device. [Field results](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-7007694606)
@@ -187,6 +191,7 @@ already been removed/unpaired.
 | Door buttons, HA cameras, ring events, SIP/RTP media, talkback services | This Home Assistant integration |
 | Import ABB stations into Apple Home as full HomeKit doorbells | [ABB HA Doorbell Scrypted plugin][scrypted-bridge] |
 | HomeKit microphone / two-way audio | Scrypted plugin, backed by HA talkback services |
+| Opening the door from Apple Home | Scrypted plugin lock, which presses the HA door button |
 | Apple TV/Home Hub preview blocking | Scrypted plugin **HomeKit Pickup Safety** |
 | Basic one-way HomeKit camera only | HA native HomeKit bridge, if you do not need talkback |
 
@@ -218,9 +223,13 @@ Recommended setup:
 7. Keep Scrypted HomeKit **Transcode Video** and **Transcode Audio** enabled.
    The plugin enables them automatically, but they should stay on for reliable
    Home app video and audio.
+8. To open the door from Apple Home, also add the station's Scrypted lock to
+   the HomeKit plugin and put it in the same room as the doorbell. Apple Home
+   then offers the lock in the doorbell's live view and ring notification.
 
 The Scrypted plugin discovers HA camera entities, station ids, ring state,
-snapshot image data, the streaming switch, and each camera's `lan_rtsp_url`.
+snapshot image data, the streaming switch, and each camera's `lan_rtsp_url`
+and `unlock_button_entity_id`.
 When HA reloads or moves the LAN RTSP proxy to another port, it fires
 `abb_welcome_discovery_changed`; Scrypted listens for that event and refreshes
 without subscribing to every HA entity.
@@ -521,7 +530,9 @@ sent as SIP `INFO` (RFC 2976) inside a call with that station. The Smart
 Access Point lists the codes on the outdoor station's **3rd party door opener
 settings** page, one for the default lock and one for the subsidiary lock.
 
-Enter them as **Door opener code** and **Second lock opener code**. A lock
+Enter them as **Door opener code** and **Second lock opener code**, either on
+the last setup step (shown for `GlobalIP` panels such as the IP touch 7) or
+later under **Configure**. A lock
 with a code no longer uses the unlock strategy: its button sends the code in
 the running live-view call with that station, or places a short call of its
 own, sends the code and hangs up. The same code is used for every door.
@@ -794,6 +805,10 @@ action:
   video, PCMA/G.711 audio, portal history and screenshots, call pickup, and
   two-way talkback. App-managed door topology refresh remains the documented
   exception and requires re-pairing.
+- **Busch-Jaeger IP touch 7**, firmware 3.08, system type `GlobalIP`, behind a
+  Smart Access Point V6.66 with one **H81381P1-S-03** outdoor station. Validated
+  by its owner with app pairing, ring detection, live video and unlocking the
+  primary lock with the door opener code.
 
 Reports for other models and firmware versions are welcome.
 

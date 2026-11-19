@@ -787,6 +787,16 @@ def poll_acl_update(
         _cleanup(temps)
 
 
+def acl_system_type(payload: str) -> str:
+    """Return the ``[network] systemtype`` of an ACL-update payload, or ""."""
+    config = configparser.ConfigParser(interpolation=None)
+    try:
+        config.read_string("\n".join(payload.splitlines()[1:]).replace("\x00", ""))
+    except configparser.Error:
+        return ""
+    return config.get("network", "systemtype", fallback="").strip()
+
+
 def parse_acl_update(
     payload: str, private_key_pem: bytes, app_sip_username: str | None = None
 ) -> tuple[str, str, list[dict[str, Any]]]:

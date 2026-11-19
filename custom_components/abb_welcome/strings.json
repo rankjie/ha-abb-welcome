@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Choose ABB Welcome device type",
-        "description": "Choose **Web-admin IP gateway** for an ABB 83342/MRANGE gateway with a local web admin. Choose **App-managed Wi-Fi indoor station** for an M2240x/ASI22 device managed through MyBuildings/Welcome.",
+        "description": "Choose **Web-admin IP gateway** for an ABB 83342/MRANGE gateway with a local web admin. Choose **App-managed indoor station** for an M2240x/ASI22 Wi-Fi station or an IP touch panel paired through the MyBuildings/Welcome app.",
         "data": {
           "gateway_profile": "Device type"
         }
@@ -50,7 +50,11 @@
       },
       "confirm": {
         "title": "Confirm Setup",
-        "description": "Pairing complete.\n\nSIP user: `{sip_username}@{sip_domain}`\nDoors discovered ({door_count}):\n\n{door_names}"
+        "description": "Pairing complete.\n\nSIP user: `{sip_username}@{sip_domain}`\nDoors discovered ({door_count}):\n\n{door_names}{opener_code_hint}",
+        "data": {
+          "dtmf_unlock_code": "Door opener code",
+          "dtmf_second_lock_code": "Second lock opener code"
+        }
       }
     },
     "progress": {
@@ -77,7 +81,8 @@
       "unknown": "Unexpected error. See the debug report below.",
       "resend_failed": "The pairing request could not be sent again. See the debug report below.",
       "device_not_found": "No IP gateway or Wi-Fi indoor station is visible to this MyBuildings account. Enter the device's Gateway Portal UUID, or check that the device belongs to this account.",
-      "device_choice_required": "Several devices belong to this MyBuildings account. Enter the Gateway Portal UUID of the one to pair from the list above."
+      "device_choice_required": "Several devices belong to this MyBuildings account. Enter the Gateway Portal UUID of the one to pair from the list above.",
+      "invalid_dtmf_code": "Use up to 16 DTMF characters: 0-9, A-D, * and #."
     },
     "abort": {
       "already_configured": "This gateway is already configured.",
@@ -94,10 +99,12 @@
     "step": {
       "init": {
         "title": "ABB Welcome options",
-        "description": "Door unlock behavior and the LAN RTSP endpoint used by Scrypted/HomeKit. On app-managed devices, Hybrid requires the physical panel default door to be selected explicitly. Home Assistant cannot discover this setting.",
+        "description": "Door unlock behavior and the LAN RTSP endpoint used by Scrypted/HomeKit. On app-managed devices, Hybrid requires the physical panel default door to be selected explicitly. Home Assistant cannot discover this setting. A lock with an opener code ignores the unlock strategy.",
         "data": {
           "unlock_strategy": "Unlock strategy",
           "default_unlock_station_id": "Physical default door for Hybrid fast path",
+          "dtmf_unlock_code": "Door opener code (SIP INFO)",
+          "dtmf_second_lock_code": "Second lock opener code (SIP INFO)",
           "lan_rtsp_proxy": "Serve camera streams to the LAN over RTSP (Scrypted/HomeKit)",
           "lan_rtsp_host": "Advertised Home Assistant LAN host (blank = auto)",
           "lan_rtsp_port": "Preferred LAN RTSP proxy port",
@@ -107,14 +114,15 @@
     },
     "error": {
       "fast_multi_door_unsupported": "Fast cannot safely target a specific door on an app-managed device with multiple doors. Use Standard, or Hybrid with the physical default door selected.",
-      "invalid_default_unlock_station": "Select the door configured as the physical indoor panel default before enabling Hybrid."
+      "invalid_default_unlock_station": "Select the door configured as the physical indoor panel default before enabling Hybrid.",
+      "invalid_dtmf_code": "Use up to 16 DTMF characters: 0-9, A-D, * and #."
     }
   },
   "selector": {
     "gateway_profile": {
       "options": {
         "web_admin": "Web-admin IP gateway (83342 / MRANGE)",
-        "app_managed": "App-managed Wi-Fi indoor station (M2240x / ASI22)"
+        "app_managed": "App-managed indoor station (M2240x / ASI22, IP touch)"
       }
     },
     "pending_pairing_action": {

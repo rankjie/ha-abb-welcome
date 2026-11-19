@@ -43,7 +43,6 @@ def test_app_managed_capabilities_and_refresh_policy() -> None:
     assert capabilities.approval_method == "automatic_acl"
     assert capabilities.admin_available is False
     assert capabilities.topology_refresh is False
-    assert "M2240x / ASI22" in capabilities.model
     assert capabilities.default_unlock_strategy == const.UNLOCK_STRATEGY_STANDARD
     assert "re-pair" in const.topology_refresh_error(data)
     assert const.topology_refresh_error({}) is None
@@ -74,4 +73,4 @@ def test_device_info_uses_app_managed_model() -> None:
             "gateway_uuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
         }
     )
-    assert info["model"] == "Wi-Fi Indoor Station (M2240x / ASI22)"
+    assert info["model"] == "App-managed indoor station"

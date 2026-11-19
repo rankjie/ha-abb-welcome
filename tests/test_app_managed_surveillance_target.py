@@ -162,3 +162,17 @@ def test_display_name_strips_header_control_characters() -> None:
     assert "\r" not in to_header
     assert "\n" not in to_header
     assert to_header == '"client  Injected: value" <sip:door@sip.example.invalid>'
+
+
+@pytest.mark.parametrize(
+    ("body", "system_type"),
+    [
+        ("[network]\nsystemtype=GlobalIP\ndomain=sip.example.invalid", "GlobalIP"),
+        ("[network]\ndomain=sip.example.invalid", ""),
+        ("[outdoorstation_1]\nname=Door", ""),
+        ("not an ini section", ""),
+        ("", ""),
+    ],
+)
+def test_acl_system_type_reads_the_network_section(body, system_type) -> None:
+    assert portal.acl_system_type("encrypted-password\n" + body) == system_type

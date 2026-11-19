@@ -56,6 +56,7 @@ from homeassistant.components.camera import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -833,7 +834,23 @@ class ABBWelcomeCamera(Camera):
             attrs["station_type"] = self._station_type
         if self._can_unlock is not None:
             attrs["can_unlock"] = self._can_unlock
+        unlock_button = self._unlock_button_entity_id()
+        if unlock_button:
+            attrs["unlock_button_entity_id"] = unlock_button
         return attrs
+
+    def _unlock_button_entity_id(self) -> str | None:
+        """Return the station's door button, which the Scrypted lock presses."""
+        station_id = self._door.station_id
+        if (
+            not station_id
+            or self._can_unlock is False
+            or self._station_type not in ("", "1")
+        ):
+            return None
+        return er.async_get(self.hass).async_get_entity_id(
+            "button", DOMAIN, f"{self._gateway_uuid}_{station_id}"
+        )
 
     def _lan_rtsp_url(self) -> str:
         entry_data = self.hass.data.get(DOMAIN, {}).get(self._entry_id)

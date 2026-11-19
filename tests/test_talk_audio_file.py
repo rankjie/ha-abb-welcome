@@ -10,6 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 import wave
 
 _PKG_DIR = Path(__file__).resolve().parent.parent / "custom_components" / "abb_welcome"
@@ -138,6 +139,7 @@ def _ensure_stub_dependencies() -> None:
             },
         ),
         ("homeassistant.helpers.entity_platform", {"AddEntitiesCallback": object}),
+        ("homeassistant.helpers.entity_registry", {"async_get": lambda hass: None}),
         ("homeassistant.helpers.device_registry", {"DeviceInfo": dict}),
     ):
         mod = sys.modules.get(subname)
@@ -621,6 +623,41 @@ class TestCoordinatorTalkbackAudioFile(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await cam.async_talkback_audio_file(file_path="/media/abb_welcome/msg.wav")
         self.assertEqual(called, 0)
+
+
+class TestCameraUnlockButtonAttribute(unittest.TestCase):
+    """The Scrypted lock finds a station's door button through its camera."""
+
+    def _unlock_button(self, *, station_id="100000001", can_unlock=None, station_type="1"):
+        _load_submodule("intercom_dialer")
+        _load_submodule("media_pipeline")
+        camera_mod = _load_submodule("camera")
+        registered = {
+            ("button", camera_mod.DOMAIN, "synthetic-gateway_100000001"): (
+                "button.synthetic_front"
+            )
+        }
+        registry = types.SimpleNamespace(
+            async_get_entity_id=lambda *key: registered.get(key)
+        )
+        cam = camera_mod.ABBWelcomeCamera.__new__(camera_mod.ABBWelcomeCamera)
+        cam.hass = object()
+        cam._door = types.SimpleNamespace(station_id=station_id)
+        cam._gateway_uuid = "synthetic-gateway"
+        cam._can_unlock = can_unlock
+        cam._station_type = station_type
+        with mock.patch.object(camera_mod.er, "async_get", lambda hass: registry):
+            return cam._unlock_button_entity_id()
+
+    def test_unlockable_station_reports_its_registered_button(self) -> None:
+        self.assertEqual(self._unlock_button(), "button.synthetic_front")
+        self.assertEqual(self._unlock_button(station_type=""), "button.synthetic_front")
+
+    def test_station_without_a_door_button_reports_none(self) -> None:
+        self.assertIsNone(self._unlock_button(can_unlock=False))
+        self.assertIsNone(self._unlock_button(station_type="2"))
+        self.assertIsNone(self._unlock_button(station_id="100000009"))
+        self.assertIsNone(self._unlock_button(station_id=""))
 
 
 class TestTalkAudioFileAllowlistAndRegistration(unittest.IsolatedAsyncioTestCase):

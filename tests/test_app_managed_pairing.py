@@ -47,8 +47,13 @@ def _install_stubs() -> None:
         def __init_subclass__(cls, **kwargs):
             return super().__init_subclass__()
 
-        def async_create_entry(self, *, title, data):
-            return {"type": "create_entry", "title": title, "data": data}
+        def async_create_entry(self, *, title, data, options=None):
+            return {
+                "type": "create_entry",
+                "title": title,
+                "data": data,
+                "options": options,
+            }
 
         def async_show_form(self, **kwargs):
             return {"type": "form", **kwargs}
@@ -1530,3 +1535,78 @@ def test_discovered_device_paired_by_another_flow_aborts_cleanly(profile_index) 
     assert result["type"] == "abort"
     assert result["reason"] == "already_in_progress"
     assert calls["connect"] == []
+
+
+def _confirm_flow(module, *, system_type, doors=None):
+    flow = module.ABBWelcomeConfigFlow()
+    flow.hass = _FakeHass()
+    flow._gateway_profile = module.GATEWAY_PROFILE_APP_MANAGED
+    flow._gateway_name = "Hallway panel"
+    flow._sip_username = "paired-ha"
+    flow._sip_domain = "sip.example.invalid"
+    flow._system_type = system_type
+    flow._doors = doors or [
+        {"name": "Front", "station_id": "100000001", "type": "1"}
+    ]
+    return flow
+
+
+def test_globalip_setup_asks_for_the_opener_code_and_stores_it() -> None:
+    module = _load_config_flow()
+    flow = _confirm_flow(module, system_type="GlobalIP")
+
+    form = _run(flow.async_step_confirm())
+    assert list(form["data_schema"]) == [
+        module.CONF_DTMF_UNLOCK_CODE
+    ]
+    assert "door opener code" in form["description_placeholders"]["opener_code_hint"]
+
+    rejected = _run(flow.async_step_confirm({module.CONF_DTMF_UNLOCK_CODE: "12 3"}))
+    assert rejected["errors"] == {module.CONF_DTMF_UNLOCK_CODE: "invalid_dtmf_code"}
+
+    created = _run(flow.async_step_confirm({module.CONF_DTMF_UNLOCK_CODE: " 12b# "}))
+    assert created["type"] == "create_entry"
+    assert created["options"] == {module.CONF_DTMF_UNLOCK_CODE: "12B#"}
+
+
+def test_globalip_setup_can_skip_the_opener_code() -> None:
+    module = _load_config_flow()
+    created = _run(_confirm_flow(module, system_type="GlobalIP").async_step_confirm({}))
+    assert created["type"] == "create_entry"
+    assert created["options"] == {}
+
+
+def test_second_lock_code_is_asked_only_when_a_door_has_a_second_lock() -> None:
+    module = _load_config_flow()
+    doors = [
+        {"name": "Front", "station_id": "100000001", "type": "1", "second_lock": True}
+    ]
+    form = _run(
+        _confirm_flow(module, system_type="GlobalIP", doors=doors).async_step_confirm()
+    )
+    assert list(form["data_schema"]) == [
+        module.CONF_DTMF_UNLOCK_CODE,
+        module.CONF_DTMF_SECOND_LOCK_CODE,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("system_type", "doors"),
+    [
+        ("ASI22", None),
+        ("", None),
+        (
+            "GlobalIP",
+            [{"name": "Front", "station_id": "100000001", "can_unlock": False}],
+        ),
+    ],
+)
+def test_setup_without_an_openable_globalip_door_asks_for_no_code(
+    system_type, doors
+) -> None:
+    module = _load_config_flow()
+    form = _run(
+        _confirm_flow(module, system_type=system_type, doors=doors).async_step_confirm()
+    )
+    assert list(form["data_schema"]) == []
+    assert form["description_placeholders"]["opener_code_hint"] == ""
