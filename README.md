@@ -535,7 +535,11 @@ the last setup step (shown for `GlobalIP` panels such as the IP touch 7) or
 later under **Configure**. A lock
 with a code no longer uses the unlock strategy: its button sends the code in
 the running live-view call with that station, or places a short call of its
-own, sends the code and hangs up. The same code is used for every door.
+own, sends the code and hangs up.
+
+One code applies to every door of the entry. Outdoor stations configured with
+different opener codes are not supported: only the stations whose code matches
+the entered one will open.
 
 These stations switch the relay without answering the `INFO`, so Home
 Assistant reports the press as successful once the request is sent and not
