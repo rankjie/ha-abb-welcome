@@ -101,10 +101,10 @@ grants HA permission to open the door. [Pairing diagnostics](https://github.com/
 
 This panel acknowledges the unlock `MESSAGE` of every unlock strategy but
 leaves the door locked. Set the **Door opener code** option instead (see
-[Door Opener Code](#door-opener-code)). The owner opened the primary lock
-(the outdoor station's Lock-GND output) twice with that SIP `INFO` during an
-HA live view. Unlocking without an open live view and the subsidiary relay
-have not been tested on the device. [Field results](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-6989189437)
+[Door Opener Code](#door-opener-code)). With `v1.8.0-dev6` the owner opened
+the primary lock (the outdoor station's Lock-GND output) both during an HA
+live view and with no live view open. The subsidiary relay has not been
+tested on the device. [Field results](https://github.com/rankjie/ha-abb-welcome/issues/45#issuecomment-7007694606)
 
 On this installation, enabling the Smart AP's SIP server interrupted calls
 from the H81381P1-S-03 outdoor station to the indoor panel. Keep it off for
