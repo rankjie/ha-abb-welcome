@@ -24,6 +24,7 @@ from .const import (
     CONF_ABB_PASSWORD,
     CONF_ABB_USERNAME,
     CONF_ALLOW_PICKUP,
+    CONF_CAMERA_STILL_IMAGE,
     CONF_PREVIEW_BEFORE_ANSWER,
     CONF_DEFAULT_UNLOCK_STATION_ID,
     CONF_DTMF_SECOND_LOCK_CODE,
@@ -37,6 +38,7 @@ from .const import (
     CONF_LAN_RTSP_PROXY,
     CONF_UNLOCK_STRATEGY,
     DEFAULT_ALLOW_PICKUP,
+    DEFAULT_CAMERA_STILL_IMAGE,
     DEFAULT_PREVIEW_BEFORE_ANSWER,
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_LAN_RTSP_PROXY,
@@ -1388,6 +1390,14 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
                 default=bool(
                     current_options.get(
                         CONF_PREVIEW_BEFORE_ANSWER, DEFAULT_PREVIEW_BEFORE_ANSWER
+                    )
+                ),
+            ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_CAMERA_STILL_IMAGE,
+                default=bool(
+                    current_options.get(
+                        CONF_CAMERA_STILL_IMAGE, DEFAULT_CAMERA_STILL_IMAGE
                     )
                 ),
             ): selector.BooleanSelector(),

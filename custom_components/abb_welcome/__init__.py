@@ -22,6 +22,7 @@ from homeassistant.helpers.storage import Store
 
 from .const import (
     CONF_ALLOW_PICKUP,
+    CONF_CAMERA_STILL_IMAGE,
     CONF_PREVIEW_BEFORE_ANSWER,
     CONF_DEFAULT_UNLOCK_STATION_ID,
     CONF_DTMF_SECOND_LOCK_CODE,
@@ -31,6 +32,7 @@ from .const import (
     CONF_LAN_RTSP_PROXY,
     CONF_UNLOCK_STRATEGY,
     DEFAULT_ALLOW_PICKUP,
+    DEFAULT_CAMERA_STILL_IMAGE,
     DEFAULT_PREVIEW_BEFORE_ANSWER,
     DEFAULT_LAN_RTSP_BIND_HOST,
     DEFAULT_LAN_RTSP_PORT,
@@ -355,6 +357,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     entry_data["preview_before_answer"] = entry.options.get(
         CONF_PREVIEW_BEFORE_ANSWER, DEFAULT_PREVIEW_BEFORE_ANSWER
+    )
+    entry_data["camera_still_image"] = entry.options.get(
+        CONF_CAMERA_STILL_IMAGE, DEFAULT_CAMERA_STILL_IMAGE
     )
 
     lan_rtsp_host = str(entry.options.get(CONF_LAN_RTSP_HOST, "") or "").strip()
@@ -1331,6 +1336,9 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
         )
         entry_data["preview_before_answer"] = entry.options.get(
             CONF_PREVIEW_BEFORE_ANSWER, DEFAULT_PREVIEW_BEFORE_ANSWER
+        )
+        entry_data["camera_still_image"] = entry.options.get(
+            CONF_CAMERA_STILL_IMAGE, DEFAULT_CAMERA_STILL_IMAGE
         )
         current_reload_options = _reload_relevant_options(entry)
         previous_reload_options = entry_data.get("reload_options")

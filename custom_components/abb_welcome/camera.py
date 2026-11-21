@@ -88,6 +88,7 @@ from .streaming_state import (
     disarm,
     get_state,
     is_armed,
+    is_camera_still_image_enabled,
     is_pickup_allowed,
     is_preview_before_answer,
     is_stream_allowed,
@@ -1382,6 +1383,8 @@ class ABBWelcomeCamera(Camera):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
+        if not is_camera_still_image_enabled(self.hass, self._entry_id):
+            return None
         snapshot = self._station_screenshot()
         return snapshot.image_data if snapshot else None
 

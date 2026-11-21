@@ -53,6 +53,8 @@ Recommended setup:
 The Scrypted plugin discovers HA camera entities, station ids, ring state,
 snapshot image data, the streaming switch, and each camera's `lan_rtsp_url`
 and `unlock_button_entity_id`.
+The doorbell snapshot is the camera's still image, so keep the option **Show
+the last station screenshot as the camera still image** turned on.
 When HA reloads or moves the LAN RTSP proxy to another port, it fires
 `abb_welcome_discovery_changed`; Scrypted listens for that event and refreshes
 without subscribing to every HA entity.

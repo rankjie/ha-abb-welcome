@@ -28,7 +28,12 @@ from dataclasses import dataclass
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .const import DEFAULT_ALLOW_PICKUP, DEFAULT_PREVIEW_BEFORE_ANSWER, DOMAIN
+from .const import (
+    DEFAULT_ALLOW_PICKUP,
+    DEFAULT_CAMERA_STILL_IMAGE,
+    DEFAULT_PREVIEW_BEFORE_ANSWER,
+    DOMAIN,
+)
 from .redaction import get_redacting_logger
 
 _LOGGER = get_redacting_logger(__name__)
@@ -90,6 +95,15 @@ def is_preview_before_answer(hass: HomeAssistant, entry_id: str) -> bool:
     return bool(
         _entry_bucket(hass, entry_id).get(
             "preview_before_answer", DEFAULT_PREVIEW_BEFORE_ANSWER
+        )
+    )
+
+
+def is_camera_still_image_enabled(hass: HomeAssistant, entry_id: str) -> bool:
+    """Return whether cameras serve the last station screenshot as their still."""
+    return bool(
+        _entry_bucket(hass, entry_id).get(
+            "camera_still_image", DEFAULT_CAMERA_STILL_IMAGE
         )
     )
 

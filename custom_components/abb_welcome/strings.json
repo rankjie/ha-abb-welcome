@@ -109,7 +109,8 @@
           "lan_rtsp_host": "Advertised Home Assistant LAN host (blank = auto)",
           "lan_rtsp_port": "Preferred LAN RTSP proxy port",
           "allow_pickup": "Allow pickup from streams",
-          "preview_before_answer": "Preview a ringing call without answering (talking answers it)"
+          "preview_before_answer": "Preview a ringing call without answering (talking answers it)",
+          "camera_still_image": "Show the last station screenshot as the camera still image"
         }
       }
     },

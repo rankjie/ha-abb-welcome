@@ -59,6 +59,8 @@ CONF_ALLOW_PICKUP = "allow_pickup"
 DEFAULT_ALLOW_PICKUP = True
 CONF_PREVIEW_BEFORE_ANSWER = "preview_before_answer"
 DEFAULT_PREVIEW_BEFORE_ANSWER = False
+CONF_CAMERA_STILL_IMAGE = "camera_still_image"
+DEFAULT_CAMERA_STILL_IMAGE = True
 
 # Per-integration option: which unlock strategy to use.
 #   hybrid   — fast plain MESSAGE for an explicit physical-default station,
