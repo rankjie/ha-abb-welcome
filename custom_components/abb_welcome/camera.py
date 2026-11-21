@@ -93,6 +93,7 @@ from .streaming_state import (
     is_preview_before_answer,
     is_stream_allowed,
     signal_armed_changed,
+    signal_preview_before_answer_changed,
 )
 
 _LOGGER = get_redacting_logger(__name__)
@@ -857,6 +858,7 @@ class ABBWelcomeCamera(Camera):
 
         self._state_callback = self.async_write_ha_state
         self._unsub_armed: callable | None = None
+        self._unsub_preview_option: callable | None = None
 
     def set_camera_count(self, count: int) -> None:
         if count <= self._camera_count:
@@ -883,6 +885,9 @@ class ABBWelcomeCamera(Camera):
             "stream_target_station_id": armed_state.target_station_id,
             "stream_allowed": self._stream_allowed(),
             "pickup_allowed": is_pickup_allowed(self.hass, self._entry_id),
+            "preview_before_answer": is_preview_before_answer(
+                self.hass, self._entry_id
+            ),
             "ws_sessions": len(self._ws_clients),
             "rtsp_sessions": self._rtsp.session_count,
             "stream_clients": self._coordinator.client_count,
@@ -989,6 +994,11 @@ class ABBWelcomeCamera(Camera):
             signal_armed_changed(self._entry_id),
             self._on_armed_changed,
         )
+        self._unsub_preview_option = async_dispatcher_connect(
+            self.hass,
+            signal_preview_before_answer_changed(self._entry_id),
+            self.async_write_ha_state,
+        )
         await self._rtsp.start()
         _LOGGER.info(
             "[abb] camera %s: RTSP server ready url=%s stream=%s "
@@ -1011,6 +1021,9 @@ class ABBWelcomeCamera(Camera):
         if self._unsub_armed is not None:
             self._unsub_armed()
             self._unsub_armed = None
+        if self._unsub_preview_option is not None:
+            self._unsub_preview_option()
+            self._unsub_preview_option = None
 
         for ws in list(self._ws_clients.values()):
             try:

@@ -56,6 +56,8 @@ the ring, the way the ABB Welcome app does:
   `talk_pcm16le`, `talk_tone` or `talk_audio_file`.
 - While previewing, the camera reports `previewing: true`, and
   `talkback_ready: true` because talking can start at any time.
+- The camera's `preview_before_answer` attribute tells whether the option is
+  on.
 - The preview lasts as long as the ring, also when no viewer is left, so the
   stream can be reopened. If another station answers or the ring times out, the
   stream closes and the ring's streaming window ends.

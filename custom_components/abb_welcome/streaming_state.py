@@ -55,6 +55,11 @@ def signal_pickup_allowed_changed(entry_id: str) -> str:
     return f"{DOMAIN}_pickup_allowed_changed_{entry_id}"
 
 
+def signal_preview_before_answer_changed(entry_id: str) -> str:
+    """Dispatcher signal raised when the preview option changes for one entry."""
+    return f"{DOMAIN}_preview_before_answer_changed_{entry_id}"
+
+
 @dataclass
 class ArmedState:
     """Mutable armed-state for a single gateway/entry."""
@@ -97,6 +102,22 @@ def is_preview_before_answer(hass: HomeAssistant, entry_id: str) -> bool:
             "preview_before_answer", DEFAULT_PREVIEW_BEFORE_ANSWER
         )
     )
+
+
+@callback
+def set_preview_before_answer(
+    hass: HomeAssistant,
+    entry_id: str,
+    enabled: bool,
+) -> None:
+    """Set whether a stream opened during a ring only previews the call."""
+    bucket = _entry_bucket(hass, entry_id)
+    enabled = bool(enabled)
+    previous = bucket.get("preview_before_answer")
+    bucket["preview_before_answer"] = enabled
+    if previous == enabled:
+        return
+    async_dispatcher_send(hass, signal_preview_before_answer_changed(entry_id))
 
 
 def is_camera_still_image_enabled(hass: HomeAssistant, entry_id: str) -> bool:

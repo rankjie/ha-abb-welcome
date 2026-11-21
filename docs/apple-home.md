@@ -97,8 +97,9 @@ during the ring window. Manual Home app viewing and remote viewing through the
 same Home Hub remain allowed.
 
 With the option **Preview a ringing call without answering** turned on, an
-automatic preview only watches the ring and no longer takes the call. See
-[Calls and streaming](calls.md#preview-before-answering).
+automatic preview only watches the ring and no longer takes the call, so the
+Scrypted plugin (0.1.7 or newer) stops blocking it. The call is answered when
+someone talks. See [Calls and streaming](calls.md#preview-before-answering).
 
 ## RTSP endpoint for Scrypted
 

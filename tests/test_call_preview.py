@@ -535,5 +535,49 @@ class TestCoordinatorPreview(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state.armed)
 
 
+
+class TestPreviewOption(unittest.TestCase):
+    """Bridges read the option from the camera state, so a change must show."""
+
+    def setUp(self) -> None:
+        self.streaming_state = _load_submodule("streaming_state")
+        self.hass = types.SimpleNamespace(data={})
+        self.signals: list[str] = []
+        patcher = mock.patch.object(
+            self.streaming_state,
+            "async_dispatcher_send",
+            lambda hass, signal: self.signals.append(signal),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _set(self, enabled: bool) -> None:
+        self.streaming_state.set_preview_before_answer(self.hass, "entry", enabled)
+
+    def test_option_is_off_until_set(self) -> None:
+        self.assertFalse(
+            self.streaming_state.is_preview_before_answer(self.hass, "entry")
+        )
+
+    def test_a_change_is_stored_and_announced_once(self) -> None:
+        self._set(True)
+        self._set(True)
+        self.assertTrue(
+            self.streaming_state.is_preview_before_answer(self.hass, "entry")
+        )
+        self.assertEqual(
+            self.signals,
+            [self.streaming_state.signal_preview_before_answer_changed("entry")],
+        )
+
+    def test_turning_it_off_again_is_announced(self) -> None:
+        self._set(True)
+        self._set(False)
+        self.assertFalse(
+            self.streaming_state.is_preview_before_answer(self.hass, "entry")
+        )
+        self.assertEqual(len(self.signals), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -80,6 +80,7 @@ from .streaming_state import (
     disarm,
     is_pickup_allowed,
     set_pickup_allowed,
+    set_preview_before_answer,
 )
 from .text import decode_gateway_text, repair_utf8_mojibake
 
@@ -355,8 +356,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.entry_id,
         entry.options.get(CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP),
     )
-    entry_data["preview_before_answer"] = entry.options.get(
-        CONF_PREVIEW_BEFORE_ANSWER, DEFAULT_PREVIEW_BEFORE_ANSWER
+    set_preview_before_answer(
+        hass,
+        entry.entry_id,
+        entry.options.get(CONF_PREVIEW_BEFORE_ANSWER, DEFAULT_PREVIEW_BEFORE_ANSWER),
     )
     entry_data["camera_still_image"] = entry.options.get(
         CONF_CAMERA_STILL_IMAGE, DEFAULT_CAMERA_STILL_IMAGE
@@ -1334,8 +1337,12 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
             entry.entry_id,
             entry.options.get(CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP),
         )
-        entry_data["preview_before_answer"] = entry.options.get(
-            CONF_PREVIEW_BEFORE_ANSWER, DEFAULT_PREVIEW_BEFORE_ANSWER
+        set_preview_before_answer(
+            hass,
+            entry.entry_id,
+            entry.options.get(
+                CONF_PREVIEW_BEFORE_ANSWER, DEFAULT_PREVIEW_BEFORE_ANSWER
+            ),
         )
         entry_data["camera_still_image"] = entry.options.get(
             CONF_CAMERA_STILL_IMAGE, DEFAULT_CAMERA_STILL_IMAGE
