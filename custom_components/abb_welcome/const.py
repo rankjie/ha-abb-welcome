@@ -57,6 +57,8 @@ DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS = 100
 
 CONF_ALLOW_PICKUP = "allow_pickup"
 DEFAULT_ALLOW_PICKUP = True
+CONF_PREVIEW_BEFORE_ANSWER = "preview_before_answer"
+DEFAULT_PREVIEW_BEFORE_ANSWER = False
 
 # Per-integration option: which unlock strategy to use.
 #   hybrid   — fast plain MESSAGE for an explicit physical-default station,

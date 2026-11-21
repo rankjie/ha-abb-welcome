@@ -24,6 +24,7 @@ from .const import (
     CONF_ABB_PASSWORD,
     CONF_ABB_USERNAME,
     CONF_ALLOW_PICKUP,
+    CONF_PREVIEW_BEFORE_ANSWER,
     CONF_DEFAULT_UNLOCK_STATION_ID,
     CONF_DTMF_SECOND_LOCK_CODE,
     CONF_DTMF_UNLOCK_CODE,
@@ -36,6 +37,7 @@ from .const import (
     CONF_LAN_RTSP_PROXY,
     CONF_UNLOCK_STRATEGY,
     DEFAULT_ALLOW_PICKUP,
+    DEFAULT_PREVIEW_BEFORE_ANSWER,
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_LAN_RTSP_PROXY,
     DOMAIN,
@@ -1380,6 +1382,14 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
             ),
             vol.Required(
                 CONF_ALLOW_PICKUP, default=current_allow_pickup
+            ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_PREVIEW_BEFORE_ANSWER,
+                default=bool(
+                    current_options.get(
+                        CONF_PREVIEW_BEFORE_ANSWER, DEFAULT_PREVIEW_BEFORE_ANSWER
+                    )
+                ),
             ): selector.BooleanSelector(),
         }
         if is_app_managed and station_ids:

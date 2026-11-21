@@ -266,6 +266,26 @@ an incoming ringing call.
 This is independent from manual proactive streaming. You can still turn on
 `Streaming enabled` and open a camera outside a ring.
 
+### Preview Before Answering
+
+By default, opening the camera during a ring answers the call: the indoor
+stations stop ringing and nobody else can pick up. With the option **Preview a
+ringing call without answering** turned on, opening the camera only previews
+the ring, the way the ABB Welcome app does:
+
+- Video (and the visitor's audio, if the station sends it) arrives while every
+  other station keeps ringing and can still answer.
+- Talking answers the call: the live-stream microphone, `talk_start`,
+  `talk_pcm16le`, `talk_tone` or `talk_audio_file`.
+- While previewing, the camera reports `previewing: true`, and
+  `talkback_ready: true` because talking can start at any time.
+- The preview lasts as long as the ring, also when no viewer is left, so the
+  stream can be reopened. If another station answers or the ring times out, the
+  stream closes and the ring's streaming window ends.
+
+This only applies to a ringing call. Opening the camera outside a ring still
+places a call to the door station.
+
 ### Apple TV / Home Hub Preview
 
 Apple TV and some Home Hubs may open a local preview immediately after a
@@ -525,6 +545,8 @@ Options:
 - **Preferred LAN RTSP proxy port**: tried first; HA falls back to another free
   port if it is occupied.
 - **Allow pickup from streams**: default for the `Allow pickup` switch.
+- **Preview a ringing call without answering**: off by default. See
+  [Preview Before Answering](#preview-before-answering).
 
 ### Unlock Strategy
 

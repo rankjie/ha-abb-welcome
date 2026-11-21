@@ -471,6 +471,7 @@ class TestCoordinatorTalkbackAudioFile(unittest.IsolatedAsyncioTestCase):
         sender = _FakeTalkSender(active=initially_active)
         session = types.SimpleNamespace(
             active=initially_active,
+            previewing=False,
             load_talkback_wav_frames=mp.StreamSession.load_talkback_wav_frames,
             talkback_stats=lambda: {"active": session.active, "talking": sender.talking},
             set_packet_handlers=lambda **kw: None,

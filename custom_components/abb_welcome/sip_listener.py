@@ -92,11 +92,17 @@ class AcceptedIncomingCall:
     video_local_port: int
     local_send_keys: MediaEncryptionKeys | None = field(default=None, repr=False)
     ack_received: bool = False
+    # False while the call is only previewed: early media flows, but the
+    # door station still rings everywhere and nobody has picked up.
+    answered: bool = True
 
 
 @dataclass
 class _AcceptedDialog:
     call: AcceptedIncomingCall
+    invite: "_SipFrame"
+    answer_headers: list[str]
+    answer_body: str
     ack_received: bool = False
     ack_event: asyncio.Event = field(default_factory=asyncio.Event)
     ended_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -553,8 +559,14 @@ class SipListener:
         media_ip: str,
         audio_port: int,
         video_port: int,
+        preview: bool = False,
     ) -> AcceptedIncomingCall | None:
-        """Answer a pending door-station INVITE with local RTP ports."""
+        """Take a pending door-station INVITE with local RTP ports.
+
+        With ``preview`` the call is left in early media, as the vendor app
+        does while it rings: video arrives, the other stations keep ringing,
+        and :meth:`answer_previewed_call` picks up later.
+        """
         async with self._dialog_lock:
             if self._writer is None or self._writer.is_closing():
                 return None
@@ -662,10 +674,8 @@ class SipListener:
                 audio_local_port=audio_port,
                 video_local_port=video_port,
                 local_send_keys=local_send_keys,
+                answered=not preview,
             )
-            dialog = _AcceptedDialog(call=accepted)
-            self._ended_dialog_reasons.pop(call_id, None)
-            self._accepted_dialogs[call_id] = dialog
             answer_headers = [
                 f"Contact: {local_contact}",
                 (
@@ -675,6 +685,14 @@ class SipListener:
                 "Supported: replaces, outbound",
                 "Content-Type: application/sdp",
             ]
+            dialog = _AcceptedDialog(
+                call=accepted,
+                invite=frame,
+                answer_headers=answer_headers,
+                answer_body=answer,
+            )
+            self._ended_dialog_reasons.pop(call_id, None)
+            self._accepted_dialogs[call_id] = dialog
             # The vendor app is in early media (183 with SDP) before it sends
             # the 200 OK. A gateway that got only the 200 OK acknowledged it
             # but bridged no audio and left the indoor station ringing (#40).
@@ -687,15 +705,17 @@ class SipListener:
                 extra_headers=answer_headers,
                 body=answer,
             )
-            await self._respond(
-                self._writer,
-                frame,
-                200,
-                "OK",
-                to_tag=local_tag,
-                extra_headers=answer_headers,
-                body=answer,
-            )
+            if preview:
+                _LOGGER.info(
+                    "[abb] Previewing incoming call station=%s call_id=%s "
+                    "audio_port=%d video_port=%d",
+                    station_id,
+                    call_id,
+                    audio_port,
+                    video_port,
+                )
+                return accepted
+            await self._send_answer(dialog)
             _LOGGER.info(
                 "[abb] Accepted incoming call station=%s call_id=%s "
                 "audio_port=%d video_port=%d",
@@ -704,25 +724,53 @@ class SipListener:
                 audio_port,
                 video_port,
             )
+        return accepted if await self._wait_for_ack(dialog) else None
+
+    async def answer_previewed_call(self, call_id: str) -> bool:
+        """Pick up a previewed call; False when it already ended."""
+        async with self._dialog_lock:
+            dialog = self._accepted_dialogs.get(call_id)
+            if dialog is None or self._writer is None or self._writer.is_closing():
+                return False
+            if dialog.call.answered:
+                return True
+            await self._send_answer(dialog)
+            dialog.call.answered = True
+            _LOGGER.info("[abb] Answered previewed incoming call call_id=%s", call_id)
+        return await self._wait_for_ack(dialog)
+
+    async def _send_answer(self, dialog: _AcceptedDialog) -> None:
+        await self._respond(
+            self._writer,
+            dialog.invite,
+            200,
+            "OK",
+            to_tag=dialog.call.local_tag,
+            extra_headers=dialog.answer_headers,
+            body=dialog.answer_body,
+        )
+
+    async def _wait_for_ack(self, dialog: _AcceptedDialog) -> bool:
+        """Wait briefly for the ACK; False when the call ended meanwhile."""
+        call = dialog.call
         try:
             await asyncio.wait_for(dialog.ack_event.wait(), timeout=3.0)
-            accepted.ack_received = True
-            _LOGGER.info("[abb] Incoming call ACK received call_id=%s", call_id)
+            _LOGGER.info("[abb] Incoming call ACK received call_id=%s", call.call_id)
         except asyncio.TimeoutError:
             _LOGGER.warning(
                 "[abb] Incoming call ACK not received within timeout call_id=%s; "
                 "continuing media setup",
-                call_id,
+                call.call_id,
             )
         if dialog.ended_event.is_set():
             _LOGGER.warning(
                 "[abb] Incoming call ended while waiting for ACK call_id=%s reason=%s",
-                call_id,
+                call.call_id,
                 dialog.end_reason,
             )
-            return None
-        accepted.ack_received = dialog.ack_received
-        return accepted
+            return False
+        call.ack_received = dialog.ack_received
+        return True
 
     async def wait_accepted_call_end(self, call_id: str) -> str:
         """Wait until an accepted incoming call ends; return the end reason."""
@@ -733,12 +781,26 @@ class SipListener:
         return dialog.end_reason or "ended"
 
     async def hangup_accepted_call(self, call_id: str) -> None:
-        """Send BYE for an incoming call previously accepted by this listener."""
+        """End an incoming call this listener accepted or is previewing."""
         async with self._dialog_lock:
             dialog = self._accepted_dialogs.get(call_id)
             if dialog is None or self._writer is None or self._writer.is_closing():
                 return
             call = dialog.call
+            if not call.answered:
+                # An unanswered INVITE has no dialog to BYE. A 4xx ends only
+                # this branch, so the other stations keep ringing; a 6xx would
+                # decline the call for everyone.
+                await self._respond(
+                    self._writer,
+                    dialog.invite,
+                    480,
+                    "Temporarily Unavailable",
+                    to_tag=call.local_tag,
+                )
+                self._finish_accepted_dialog(call_id, "local_release")
+                _LOGGER.info("[abb] Released previewed incoming call %s", call_id)
+                return
             target = call.remote_contact or call.caller_uri
             branch = "z9hG4bK-" + uuid.uuid4().hex[:12]
             cseq = self._dialog_cseq
@@ -1064,16 +1126,27 @@ class SipListener:
             # 200 OK to the CANCEL itself, then 487 Request Terminated to the
             # original INVITE so the gateway closes the transaction cleanly.
             await self._respond(writer, frame, 200, "OK")
-            invite = self._open_invites.pop(_header(frame.headers, "Call-ID"), None)
+            call_id = _header(frame.headers, "Call-ID")
+            invite = self._open_invites.pop(call_id, None)
+            previewed = self._accepted_dialogs.get(call_id)
             if invite is not None:
                 await self._respond(
                     writer, invite, 487, "Request Terminated", with_to_tag=True
                 )
-            else:
-                _LOGGER.info(
-                    "[abb] CANCEL for non-pending call_id=%s",
-                    _header(frame.headers, "Call-ID"),
+            elif previewed is not None and not previewed.call.answered:
+                # The ring ended while we previewed it: someone else picked
+                # up, or nobody did.
+                await self._respond(
+                    writer,
+                    previewed.invite,
+                    487,
+                    "Request Terminated",
+                    to_tag=previewed.call.local_tag,
                 )
+                self._finish_accepted_dialog(call_id, "remote_cancel")
+                _LOGGER.info("[abb] Previewed incoming call cancelled %s", call_id)
+            else:
+                _LOGGER.info("[abb] CANCEL for non-pending call_id=%s", call_id)
         elif method == "BYE":
             self._finish_accepted_dialog(
                 _header(frame.headers, "Call-ID"), "remote_bye"

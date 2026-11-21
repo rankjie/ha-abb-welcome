@@ -22,6 +22,7 @@ from homeassistant.helpers.storage import Store
 
 from .const import (
     CONF_ALLOW_PICKUP,
+    CONF_PREVIEW_BEFORE_ANSWER,
     CONF_DEFAULT_UNLOCK_STATION_ID,
     CONF_DTMF_SECOND_LOCK_CODE,
     CONF_DTMF_UNLOCK_CODE,
@@ -30,6 +31,7 @@ from .const import (
     CONF_LAN_RTSP_PROXY,
     CONF_UNLOCK_STRATEGY,
     DEFAULT_ALLOW_PICKUP,
+    DEFAULT_PREVIEW_BEFORE_ANSWER,
     DEFAULT_LAN_RTSP_BIND_HOST,
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS,
@@ -350,6 +352,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass,
         entry.entry_id,
         entry.options.get(CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP),
+    )
+    entry_data["preview_before_answer"] = entry.options.get(
+        CONF_PREVIEW_BEFORE_ANSWER, DEFAULT_PREVIEW_BEFORE_ANSWER
     )
 
     lan_rtsp_host = str(entry.options.get(CONF_LAN_RTSP_HOST, "") or "").strip()
@@ -1323,6 +1328,9 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
             hass,
             entry.entry_id,
             entry.options.get(CONF_ALLOW_PICKUP, DEFAULT_ALLOW_PICKUP),
+        )
+        entry_data["preview_before_answer"] = entry.options.get(
+            CONF_PREVIEW_BEFORE_ANSWER, DEFAULT_PREVIEW_BEFORE_ANSWER
         )
         current_reload_options = _reload_relevant_options(entry)
         previous_reload_options = entry_data.get("reload_options")

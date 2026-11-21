@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
-from .const import DEFAULT_ALLOW_PICKUP, DOMAIN
+from .const import DEFAULT_ALLOW_PICKUP, DEFAULT_PREVIEW_BEFORE_ANSWER, DOMAIN
 from .redaction import get_redacting_logger
 
 _LOGGER = get_redacting_logger(__name__)
@@ -83,6 +83,15 @@ def get_state(hass: HomeAssistant, entry_id: str) -> ArmedState:
 def is_pickup_allowed(hass: HomeAssistant, entry_id: str) -> bool:
     """Return whether incoming doorbell calls may be accepted by streams."""
     return bool(_entry_bucket(hass, entry_id).get("allow_pickup", DEFAULT_ALLOW_PICKUP))
+
+
+def is_preview_before_answer(hass: HomeAssistant, entry_id: str) -> bool:
+    """Return whether a stream opened during a ring only previews the call."""
+    return bool(
+        _entry_bucket(hass, entry_id).get(
+            "preview_before_answer", DEFAULT_PREVIEW_BEFORE_ANSWER
+        )
+    )
 
 
 def is_stream_allowed(

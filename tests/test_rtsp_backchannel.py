@@ -172,6 +172,7 @@ class TestPcmaTalkFeed(unittest.TestCase):
 class _FakeStreamSession:
     def __init__(self) -> None:
         self.active = True
+        self.previewing = False
         self.talkback_ready = True
         self.talkback_talking = False
         self.fed: list[bytes] = []

@@ -84,9 +84,12 @@ from .rtsp_server import (
     RtspSession,
 )
 from .streaming_state import (
+    ARM_REASON_RING,
+    disarm,
     get_state,
     is_armed,
     is_pickup_allowed,
+    is_preview_before_answer,
     is_stream_allowed,
     signal_armed_changed,
 )
@@ -383,6 +386,7 @@ class StationStreamCoordinator:
         self._rtsp_play_sessions: list[RtspSession] = []
         self._active_file_playbacks = 0
         self._close_task: asyncio.Task | None = None
+        self._answer_task: asyncio.Task | None = None
         self._talkback_owner = ""
         self._state_callbacks: list[Callable[[], None]] = []
         self.session = StreamSession(
@@ -392,6 +396,9 @@ class StationStreamCoordinator:
             camera_index=camera_index,
             incoming_listener=incoming_listener,
             pickup_allowed=lambda: is_pickup_allowed(self.hass, self.entry_id),
+            preview_incoming=lambda: is_preview_before_answer(
+                self.hass, self.entry_id
+            ),
             on_call_ended=self._on_gateway_call_ended,
         )
 
@@ -417,7 +424,19 @@ class StationStreamCoordinator:
 
     @property
     def talkback_ready(self) -> bool:
-        return self.session.talkback_ready
+        """True when talking can start; on a previewed call that answers it."""
+        return self.session.talkback_ready or self.session.previewing
+
+    @property
+    def previewing(self) -> bool:
+        return self.session.previewing
+
+    async def ensure_answered(self) -> None:
+        """Pick up the call if the stream is only previewing a ring."""
+        if not self.session.previewing:
+            return
+        await self.session.answer()
+        self._notify_state()
 
     @property
     def talkback_owner(self) -> str:
@@ -507,7 +526,16 @@ class StationStreamCoordinator:
         self._notify_state()
 
     def _on_gateway_call_ended(self, call_id: str, reason: str) -> None:
+        if reason == "remote_cancel":
+            # The previewed ring is over, typically because another station
+            # picked up. Stream clients reconnect on their own, and while the
+            # ring arm lasted that would call the door station right into the
+            # conversation.
+            state = get_state(self.hass, self.entry_id)
+            if state.armed and state.reason == ARM_REASON_RING:
+                disarm(self.hass, self.entry_id)
         if not self._rtsp_play_sessions:
+            self._notify_state()
             return
         sessions = list(self._rtsp_play_sessions)
         self._rtsp_play_sessions = []
@@ -546,10 +574,14 @@ class StationStreamCoordinator:
             await asyncio.sleep(_TEARDOWN_GRACE_SECONDS)
         except asyncio.CancelledError:
             return
-        if self._has_active_consumers:
+        # A previewed ring stays up without viewers, as it does in the vendor
+        # app: releasing it would end this branch of the call, and reopening
+        # the stream could then only dial the door station. It ends with the
+        # ring instead.
+        if self._has_active_consumers or self.session.previewing:
             return
         async with self._stream_lock:
-            if self._has_active_consumers:
+            if self._has_active_consumers or self.session.previewing:
                 return
             if self.session.active:
                 await self.session.close()
@@ -615,6 +647,10 @@ class StationStreamCoordinator:
         stats = self.session.stop_talkback()
         self._talkback_owner = ""
         stats["owner"] = self._talkback_owner
+        if self.session.active and not self._has_active_consumers:
+            # A previewed call answered with no viewer left has nothing else
+            # to close it.
+            self._schedule_close()
         self._notify_state()
         return stats
 
@@ -650,7 +686,18 @@ class StationStreamCoordinator:
         The backchannel talks whenever nobody else does: a talk service that
         names its own session takes over, and an audio file plays undisturbed.
         """
-        if self._active_file_playbacks or not self.session.talkback_ready:
+        if self._active_file_playbacks:
+            return
+        if self.session.previewing:
+            # Microphone audio is the viewer picking up; packets are dropped
+            # until the call is answered.
+            if self._answer_task is None or self._answer_task.done():
+                self._answer_task = self.hass.async_create_background_task(
+                    self._answer_for_backchannel(),
+                    name=f"abb_answer_{self.door.station_id or self.door.address}",
+                )
+            return
+        if not self.session.talkback_ready:
             return
         owner = _backchannel_owner(sess)
         if self._talkback_owner not in ("", owner):
@@ -658,6 +705,17 @@ class StationStreamCoordinator:
         if self._talkback_owner != owner or not self.session.talkback_talking:
             self.start_talkback(owner)
         self.session.feed_talkback_pcma_rtp(packet)
+
+    async def _answer_for_backchannel(self) -> None:
+        try:
+            await self.ensure_answered()
+        except RuntimeError as err:
+            _LOGGER.info(
+                "[abb] stream coordinator: microphone could not answer the "
+                "previewed call station=%s: %s",
+                self.door.station_id or self.door.address,
+                err,
+            )
 
     async def send_talkback_tone(
         self,
@@ -673,6 +731,7 @@ class StationStreamCoordinator:
             stats["ignored"] = True
             stats["ignore_reason"] = "talkback_session_owner_mismatch"
             return stats
+        await self.ensure_answered()
         if session_id and not self._talkback_owner:
             self._talkback_owner = session_id
         stats = await self.session.send_talkback_tone(
@@ -711,6 +770,7 @@ class StationStreamCoordinator:
                     await self.session.open()
                     opened_for_talkback = True
 
+            await self.ensure_answered()
             if session_id and not self._talkback_owner:
                 self._talkback_owner = session_id
             stats = await self.session.send_talkback_audio_frames(
@@ -829,6 +889,7 @@ class ABBWelcomeCamera(Camera):
             "snapshot_event_id": snapshot.event_id if snapshot else "",
             "snapshot_station_id": snapshot.station_id if snapshot else "",
             "talkback_ready": self._coordinator.talkback_ready,
+            "previewing": self._coordinator.previewing,
             "talkback_talking": bool(talkback_stats.get("talking")),
             "talkback_packets": int(talkback_stats.get("packets", 0) or 0),
             "talkback_voice_packets": int(
@@ -1255,6 +1316,7 @@ class ABBWelcomeCamera(Camera):
         self,
         talkback_session_id: str = "",
     ) -> dict[str, Any]:
+        await self._coordinator.ensure_answered()
         stats = self._coordinator.start_talkback(talkback_session_id)
         self.async_write_ha_state()
         return stats
@@ -1275,6 +1337,7 @@ class ABBWelcomeCamera(Camera):
         # No per-chunk async_write_ha_state(): the coordinator already writes
         # state on real transitions (talk start/stop, owner claim).  Writing
         # here too would push a full state update on every audio packet.
+        await self._coordinator.ensure_answered()
         return self._coordinator.feed_talkback_pcm16le(
             pcm,
             talkback_session_id,

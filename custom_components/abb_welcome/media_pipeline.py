@@ -1019,6 +1019,7 @@ class StreamSession:
         camera_index: int | None = None,
         incoming_listener: Any | None = None,
         pickup_allowed: Callable[[], bool] | None = None,
+        preview_incoming: Callable[[], bool] | None = None,
         on_call_ended: Callable[[str, str], None] | None = None,
         on_video_packet: Callable[[bytes], None] | None = None,
         on_audio_packet: Callable[[bytes], None] | None = None,
@@ -1029,6 +1030,7 @@ class StreamSession:
         self._camera_index = camera_index
         self._incoming_listener = incoming_listener
         self._pickup_allowed = pickup_allowed
+        self._preview_incoming = preview_incoming
         self._on_call_ended = on_call_ended
         self._on_video_packet = on_video_packet
         self._on_audio_packet = on_audio_packet
@@ -1060,6 +1062,10 @@ class StreamSession:
         self._remote_audio_pt = 8
         self._remote_video_pt = 102
         self._talk_sender: _PCMATalkSender | None = None
+        # Held from open() until the previewed call is answered.
+        self._talkback_sock: socket.socket | None = None
+        self._previewing = False
+        self._answer_lock = asyncio.Lock()
         self._last_pli_at = 0.0
         self._pli_requests_sent = 0
         self._fir_requests_sent = 0
@@ -1095,6 +1101,11 @@ class StreamSession:
     @property
     def talkback_ready(self) -> bool:
         return self._talk_sender is not None and self._talk_sender.active
+
+    @property
+    def previewing(self) -> bool:
+        """True while a ringing call is watched but not yet answered."""
+        return self._previewing
 
     @property
     def talkback_talking(self) -> bool:
@@ -1136,6 +1147,8 @@ class StreamSession:
         self._video_rtcp_sock = None
         self._audio_sock = None
         self._audio_rtcp_sock = None
+        _close_socket(self._talkback_sock)
+        self._talkback_sock = None
 
     def _video_feedback_transport(self) -> asyncio.DatagramTransport | None:
         endpoints = self._endpoints.video
@@ -1192,6 +1205,7 @@ class StreamSession:
         loop = asyncio.get_running_loop()
         self._accepted_incoming_call_id = None
         self._accepted_incoming_ack_received = None
+        self._previewing = False
         self._last_pli_at = 0.0
         self._pli_requests_sent = 0
         self._fir_requests_sent = 0
@@ -1365,13 +1379,12 @@ class StreamSession:
                 self._endpoints.video and self._endpoints.video.rtcp_mux
             ),
         )
-        talkback_sock: socket.socket | None = None
         if self._endpoints.audio is not None and self._audio_sock is not None:
             try:
                 # asyncio takes ownership of the receive socket below. Duplicate
                 # it first so the cadence thread can send from the exact same
                 # negotiated UDP source port without touching the transport.
-                talkback_sock = self._audio_sock.dup()
+                self._talkback_sock = self._audio_sock.dup()
             except OSError:
                 self._close_media_io()
                 raise
@@ -1400,11 +1413,9 @@ class StreamSession:
                 asyncio.DatagramProtocol, sock=self._audio_rtcp_sock
             )
         except BaseException:
-            _close_socket(talkback_sock)
             self._close_media_io()
             raise
 
-        sender: _PCMATalkSender | None = None
         try:
             # Punch audio with PCMA PT (8) and video with H.264 PT (102) so
             # the gateway recognises them as legitimate media flows.
@@ -1424,28 +1435,9 @@ class StreamSession:
                     encryption_key=self._video_send_key,
                 )
 
-            if talkback_sock is not None and self._endpoints.audio is not None:
-                sender = _PCMATalkSender(
-                    talkback_sock,
-                    self._endpoints.audio.rtp,
-                    payload_type=self._remote_audio_pt,
-                    encryption_key=self._audio_send_key,
-                )
-                talkback_sock = None  # Ownership transferred to the sender.
-                await sender.start()
-                self._talk_sender = sender
-                _LOGGER.info(
-                    "[abb] media: talkback RTP leg ready for %s -> %s:%d pt=%d",
-                    self._door.name,
-                    self._endpoints.audio.rtp[0],
-                    self._endpoints.audio.rtp[1],
-                    self._remote_audio_pt,
-                )
+            if not self._previewing:
+                await self._start_talk_sender()
         except BaseException:
-            _close_socket(talkback_sock)
-            if sender is not None:
-                await sender.stop()
-            self._talk_sender = None
             self._close_media_io()
             raise
 
@@ -1462,6 +1454,50 @@ class StreamSession:
             self._stats_loop(),
             name=f"abb_stats_{self._door.station_id}",
         )
+
+    async def _start_talk_sender(self) -> None:
+        """Start the talkback RTP leg on the socket open() set aside."""
+        sock, self._talkback_sock = self._talkback_sock, None
+        if sock is None or self._endpoints.audio is None:
+            _close_socket(sock)
+            return
+        # The sender owns the socket from here and closes it when it stops.
+        sender = _PCMATalkSender(
+            sock,
+            self._endpoints.audio.rtp,
+            payload_type=self._remote_audio_pt,
+            encryption_key=self._audio_send_key,
+        )
+        try:
+            await sender.start()
+        except BaseException:
+            await sender.stop()
+            raise
+        self._talk_sender = sender
+        _LOGGER.info(
+            "[abb] media: talkback RTP leg ready for %s -> %s:%d pt=%d",
+            self._door.name,
+            self._endpoints.audio.rtp[0],
+            self._endpoints.audio.rtp[1],
+            self._remote_audio_pt,
+        )
+
+    async def answer(self) -> None:
+        """Pick up the previewed call so talkback can start."""
+        async with self._answer_lock:
+            if not self._previewing:
+                return
+            call_id = self._accepted_incoming_call_id
+            answered = await self._incoming_listener.answer_previewed_call(call_id)
+            if not answered or self._accepted_incoming_call_id != call_id:
+                raise RuntimeError("the call ended before it could be answered")
+            self._previewing = False
+            _LOGGER.info(
+                "[abb] media: answered previewed call for door=%s call_id=%s",
+                self._door.name,
+                call_id,
+            )
+            await self._start_talk_sender()
 
     def _start_incoming_end_watcher(self, call_id: str) -> None:
         listener = self._incoming_listener
@@ -1564,6 +1600,7 @@ class StreamSession:
                 media_ip=self._media_ip,
                 audio_port=audio_port,
                 video_port=video_port,
+                preview=bool(self._preview_incoming and self._preview_incoming()),
             )
         except Exception as err:  # noqa: BLE001
             _LOGGER.exception(
@@ -1578,6 +1615,7 @@ class StreamSession:
             return None
         self._accepted_incoming_call_id = accepted.call_id
         self._accepted_incoming_ack_received = accepted.ack_received
+        self._previewing = not accepted.answered
         return CallState(
             door=self._door,
             call_id=accepted.call_id,
@@ -1677,6 +1715,7 @@ class StreamSession:
         if self._talk_sender is not None:
             await self._talk_sender.stop()
             self._talk_sender = None
+        self._previewing = False
 
         self._close_media_io()
         self._video_proto = self._audio_proto = None
