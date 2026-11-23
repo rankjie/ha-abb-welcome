@@ -646,13 +646,14 @@ EXPORT_FIELDS = (
 
 _GATEWAY_ADMIN_TIMEOUT = 8
 _GATEWAY_LOGIN_OK_RESPONSES = {"1", "2"}
+_GATEWAY_ERROR_CODE_RE = re.compile(r"-?\d+")
 
 
 def _fetch_gateway_device_list(gateway_ip: str, admin_password: str) -> str:
     """Read the gateway admin device-list CGI response."""
     errors: list[str] = []
-    # The gateway answers "-8" unless the Referer is http://<its IP>/..., so
-    # it can't follow the scheme in use or a hostname.
+    # The gateway answers "-8" to a Referer naming a hostname, so it always
+    # names the IP.
     try:
         referer_host = socket.gethostbyname(gateway_ip)
     except OSError:
@@ -677,19 +678,40 @@ def _fetch_gateway_device_list(gateway_ip: str, admin_password: str) -> str:
                     )
                     continue
 
-                response = session.get(
-                    f"{base}/cgi-bin/adduser.cgi",
-                    params={"type": "getdevicelist"},
-                    headers={"Referer": f"http://{referer_host}/config.html"},
-                    timeout=_GATEWAY_ADMIN_TIMEOUT,
-                    verify=False,
-                )
-                if response.status_code != 200:
-                    errors.append(
-                        f"{scheme}: getdevicelist returned HTTP {response.status_code}"
+                # One V6.25 gateway answers -8 to an https:// Referer; another
+                # served the device list to a browser page loaded over HTTPS.
+                referers = dict.fromkeys(
+                    (
+                        f"http://{referer_host}/config.html",
+                        f"{scheme}://{referer_host}/config.html",
                     )
-                    continue
-                return decode_gateway_text(response.content).strip()
+                )
+                for referer in referers:
+                    response = session.get(
+                        f"{base}/cgi-bin/adduser.cgi",
+                        params={"type": "getdevicelist"},
+                        headers={"Referer": referer},
+                        timeout=_GATEWAY_ADMIN_TIMEOUT,
+                        verify=False,
+                    )
+                    if response.status_code != 200:
+                        errors.append(
+                            f"{scheme}: getdevicelist returned HTTP {response.status_code}"
+                        )
+                        continue
+                    listing = decode_gateway_text(response.content).strip()
+                    if _GATEWAY_ERROR_CODE_RE.fullmatch(listing):
+                        _LOGGER.warning(
+                            "[abb] device list over %s with Referer %s answered %s "
+                            "(login answered %s)",
+                            scheme, referer, listing, body,
+                        )
+                        errors.append(f"{scheme}: getdevicelist answered {listing}")
+                        continue
+                    return listing
+                # The login worked, so trying HTTP after HTTPS would only resend
+                # the password in clear text.
+                break
         except requests.RequestException as err:
             # requests puts the full URL (including ``pwd=``) in the message.
             errors.append(f"{scheme}: {redact_url_credentials(str(err))}")
@@ -755,9 +777,13 @@ def _fetch_topology_from_gateway(
 
     doors = _parse_gateway_doors(raw, sip_domain)
     if not doors:
+        # Item kinds are fixed type labels; the names after them are private.
+        kinds = sorted({item.split("+", 1)[0].split("_", 1)[0][:32] for item in raw.split(";")})
         _LOGGER.warning(
-            "[abb] refresh_doors: gateway returned no outdoorstation entries (raw=%r)",
-            raw,
+            "[abb] device list has no outdoorstation entries "
+            "(%d characters, item kinds: %s)",
+            len(raw),
+            ", ".join(kinds[:10]),
         )
         return None
     return doors, _parse_gateway_relays(raw)
