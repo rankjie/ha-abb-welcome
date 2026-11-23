@@ -31,6 +31,7 @@ DEFAULT_INVITE_TIMEOUT = 2.5
 DEFAULT_UNLOCK_DELAY = 0.0
 # Outdoor stations switch the relay on a dtmf-relay INFO without answering it.
 DTMF_INFO_RESPONSE_TIMEOUT = 2.0
+_GATEWAY_RELAY_STATION_ID = "100000001"
 
 
 @dataclass(frozen=True)
@@ -1193,6 +1194,22 @@ class SIPClient:
         if info_body is None:
             return None
         return DtmfUnlock(station_id=spec.station_id, info_body=info_body)
+
+    def trigger_relay(self, address: str, timeout: float = 5.0) -> bool:
+        """Switch the gateway relay actuator at ``address``.
+
+        This is the official app's command outside a call
+        (libWelcomeJni ``gw_mrange_not_in_call_send_relay``): ``b:<address>``
+        sent to the gateway's ``100000001`` endpoint, not to a station.
+        """
+        target = DoorSpec(
+            name=f"relay {address}",
+            station_id=_GATEWAY_RELAY_STATION_ID,
+            address=f"sip:{_GATEWAY_RELAY_STATION_ID}@{self.domain}",
+            unlock_body=f"b:{address}",
+            index=None,
+        )
+        return self._unlock_fast(target, timeout)
 
     def unlock_door(
         self,

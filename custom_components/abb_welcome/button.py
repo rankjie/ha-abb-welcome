@@ -65,6 +65,10 @@ async def async_setup_entry(
                 sip_client, door, gateway_uuid, entry.entry_id, device_info,
                 second_lock=True,
             ))
+    for relay in entry.data.get("relays", []):
+        entities.append(
+            ABBWelcomeRelayButton(sip_client, relay, gateway_uuid, device_info)
+        )
     if coordinator is not None and coordinator.has_certs:
         entities.append(
             ABBWelcomeRefreshButton(coordinator, gateway_uuid, device_info)
@@ -130,6 +134,27 @@ class ABBWelcomeDoorButton(ButtonEntity):
         return await dialer.send_unlock_message(
             message.station_id, message.target_uri, message.body
         )
+
+
+class ABBWelcomeRelayButton(ButtonEntity):
+    """Button to switch a relay actuator wired to the gateway."""
+
+    _attr_icon = "mdi:electric-switch"
+    _attr_has_entity_name = True
+
+    def __init__(self, sip_client, relay: dict, gateway_uuid: str, device_info) -> None:
+        self._sip_client = sip_client
+        self._address = relay["address"]
+        self._attr_name = relay["name"]
+        self._attr_unique_id = f"{gateway_uuid}_relay_{self._address}"
+        self._attr_device_info = device_info
+
+    async def async_press(self) -> None:
+        success = await self.hass.async_add_executor_job(
+            self._sip_client.trigger_relay, self._address
+        )
+        if not success:
+            raise HomeAssistantError(f"Failed to switch relay: {self._attr_name}")
 
 
 class ABBWelcomeRefreshButton(ButtonEntity):

@@ -43,6 +43,7 @@ def _topology():
     source = _PKG_DIR / "__init__.py"
     names = {
         "_parse_gateway_doors",
+        "_parse_gateway_relays",
         "_doors_equal",
         "_async_refresh_doors_for_entry",
         "_fire_discovery_changed",
@@ -240,7 +241,7 @@ def test_capability_change_updates_topology_and_reloads(
     new = {**old, "second_lock": new_capability}
     if new_capability is None:
         del new["second_lock"]
-    namespace["_fetch_doors_from_gateway"] = lambda *_args: [dict(new)]
+    namespace["_fetch_topology_from_gateway"] = lambda *_args: ([dict(new)], [])
     entry = types.SimpleNamespace(
         entry_id="synthetic-entry",
         data={

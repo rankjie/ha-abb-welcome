@@ -9,6 +9,7 @@ that everything runs on your local network.
 ## What you get
 
 - A **button** for each door, plus a second-lock button where the station has one.
+- A **button** for each relay actuator on the gateway (web-admin setups).
 - A **camera** for each door station, with live video and audio.
 - A **talk button** in the live view.
 - A **ringing sensor** and an event the moment someone presses the doorbell.

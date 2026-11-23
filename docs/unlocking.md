@@ -33,6 +33,15 @@ opens by default and select that exact door in Configure. If the selected
 station disappears after re-pairing or topology changes, every Hybrid unlock
 falls back to Standard; another door is never selected silently.
 
+## Relay actuators
+
+A relay actuator wired to the gateway (`relay_*` in the gateway's device list)
+gets its own button, named as on the gateway. Pressing it sends `b:<address>`
+to the gateway, the command the official app sends from its relay list. It places
+no call, and the unlock strategy does not apply to it. Relays are read from the gateway's admin
+device list, so they appear on web-admin entries after a reload or
+`abb_welcome.refresh_doors`; app-managed entries do not get relay buttons.
+
 ## Door opener code
 
 Some outdoor stations ignore the unlock `MESSAGE` and open only on a DTMF code

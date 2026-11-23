@@ -728,10 +728,25 @@ def _parse_gateway_doors(raw: str, sip_domain: str) -> list[dict]:
     return doors
 
 
-def _fetch_doors_from_gateway(
+def _parse_gateway_relays(raw: str) -> list[dict]:
+    """Parse the relay actuators from adduser.cgi?type=getdevicelist."""
+    relays: list[dict] = []
+    for item in filter(None, raw.split(";")):
+        parts = item.split("+")
+        if len(parts) < 3 or not parts[0].startswith("relay_"):
+            continue
+        address = parts[1].strip()
+        if not address.isdigit():
+            raise ValueError("Invalid relay address in gateway device list")
+        name = repair_utf8_mojibake(unquote(parts[2].strip())) or f"Relay {address}"
+        relays.append({"name": name, "address": address})
+    return relays
+
+
+def _fetch_topology_from_gateway(
     gateway_ip: str, admin_password: str, sip_domain: str
-) -> list[dict] | None:
-    """Pull the current outdoor-station list from the gateway admin CGI."""
+) -> tuple[list[dict], list[dict]] | None:
+    """Pull the outdoor stations and relays from the gateway admin CGI."""
     try:
         raw = _fetch_gateway_device_list(gateway_ip, admin_password)
     except RuntimeError as err:
@@ -745,7 +760,7 @@ def _fetch_doors_from_gateway(
             raw,
         )
         return None
-    return doors
+    return doors, _parse_gateway_relays(raw)
 
 
 def _doors_equal(a: list[dict], b: list[dict]) -> bool:
@@ -795,14 +810,15 @@ async def _async_refresh_doors_for_entry(
         )
         return False
 
-    new_doors = await hass.async_add_executor_job(
-        _fetch_doors_from_gateway,
+    topology = await hass.async_add_executor_job(
+        _fetch_topology_from_gateway,
         gateway_ip,
         admin_password,
         sip_domain,
     )
-    if new_doors is None:
+    if topology is None:
         return False
+    new_doors, new_relays = topology
 
     current = entry.data.get("doors", []) or []
     current_by_station = {
@@ -818,22 +834,27 @@ async def _async_refresh_doors_for_entry(
             if key in old and key not in door:
                 door[key] = old[key]
 
-    if _doors_equal(current, new_doors):
+    current_relays = entry.data.get("relays", []) or []
+    if _doors_equal(current, new_doors) and current_relays == new_relays:
         _LOGGER.info(
-            "[abb] refresh_doors: entry %s already up to date (%d door(s))",
+            "[abb] refresh_doors: entry %s already up to date "
+            "(%d door(s), %d relay(s))",
             entry.entry_id,
             len(current),
+            len(current_relays),
         )
         return False
 
     _LOGGER.warning(
-        "[abb] refresh_doors: entry %s — updating doors %d -> %d",
+        "[abb] refresh_doors: entry %s — updating doors %d -> %d, relays %d -> %d",
         entry.entry_id,
         len(current),
         len(new_doors),
+        len(current_relays),
+        len(new_relays),
     )
     hass.config_entries.async_update_entry(
-        entry, data={**entry.data, "doors": new_doors}
+        entry, data={**entry.data, "doors": new_doors, "relays": new_relays}
     )
     _fire_discovery_changed(
         hass,
