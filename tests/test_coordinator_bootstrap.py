@@ -166,6 +166,120 @@ def _coordinator(session: _Session):
     return instance
 
 
+def test_dedicated_history_ignores_mixed_cache_and_pages_related_events(
+    monkeypatch,
+) -> None:
+    instance = _coordinator(_Session([]))
+    instance._data.events = [
+        coordinator_module.IntercomEvent("view", "call-surveillance", "", "")
+    ]
+    observed = []
+
+    class Response:
+        def __init__(self, events):
+            self.raw = json.dumps({"events": events}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, **_kwargs):
+            return iter([self.raw])
+
+    def get(_url, *, params, stream, allow_redirects, timeout):
+        assert stream and not allow_redirects and 0 < timeout <= 4
+        types, page = params["type"], params["pagination_page"]
+        observed.append((types, page))
+        if types == coordinator_module.RING_HISTORY_TYPE:
+            return Response(
+                [
+                    dict(_event("real-ring"), belongsTo=None),
+                    _event("view-unexpected", event_type="call-surveillance"),
+                ]
+            )
+        if types == coordinator_module.CALL_OUTCOME_HISTORY_TYPES and page == 1:
+            return Response(
+                [
+                    _event(f"unrelated-{number}", event_type="call-terminated")
+                    for number in range(20)
+                ]
+            )
+        if types == coordinator_module.CALL_OUTCOME_HISTORY_TYPES:
+            return Response(
+                [
+                    dict(
+                        _event("missed", event_type="call-missed"),
+                        belongsTo="real-ring",
+                    )
+                ]
+            )
+        assert types == coordinator_module.SCREENSHOT_HISTORY_TYPE
+        return Response([dict(_screenshot("visitor-photo"), belongsTo="real-ring")])
+
+    def use_session():
+        return types.SimpleNamespace(get=get, close=lambda: None), []
+
+    monkeypatch.setattr(instance, "_make_session", use_session)
+    events = instance._fetch_portal_call_history(include_photos=False)
+    assert events[0].event_id == "real-ring"
+    assert events[-1].belongs_to == "real-ring"
+    assert len(events) == 22 and len(observed) == 3
+    assert observed[-1] == (coordinator_module.CALL_OUTCOME_HISTORY_TYPES, 2)
+    observed.clear()
+    events = instance._fetch_portal_call_history(include_photos=True)
+    assert events[-1].image_data == b"\xff\xd8jpeg data"
+    assert observed[-1] == (coordinator_module.SCREENSHOT_HISTORY_TYPE, 1)
+    assert [event.event_id for event in instance._data.events] == ["view"]
+
+
+def test_photo_budget_survives_slow_outcomes_and_partial_is_not_cached(monkeypatch):
+    instance = _coordinator(types.SimpleNamespace(close=lambda: None))
+    clock = [0.0]
+    monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: clock[0])
+    seen = []
+    failures = [True]
+
+    def read(_session, kind, _page, _limit, deadline):
+        seen.append(kind)
+        if kind == coordinator_module.RING_HISTORY_TYPE:
+            return [coordinator_module.IntercomEvent("ring", "ring", "", "")]
+        if kind == coordinator_module.CALL_OUTCOME_HISTORY_TYPES:
+            clock[0] = deadline
+            raise requests.Timeout()
+        assert deadline > clock[0]
+        if failures[0]:
+            raise requests.Timeout()
+        return [coordinator_module.IntercomEvent("shot", "screenshot", "", "", belongs_to="ring")]
+
+    instance._read_call_history_page = read
+    instance._call_history_lock = asyncio.Lock()
+    instance._call_history_cache = {}
+
+    async def executor(func, *args):
+        return func(*args)
+
+    instance.hass = types.SimpleNamespace(async_add_executor_job=executor)
+
+    async def run():
+        partial = await instance.async_fetch_call_history(True)
+        assert partial.photos_incomplete
+        assert True in instance._call_history_cache
+        assert await instance.async_fetch_call_history(True, allow_partial=True) is partial
+        failures[0] = False
+        complete = await instance.async_fetch_call_history(True)
+        assert not complete.photos_incomplete
+        assert complete[-1].event_id == "shot"
+        assert await instance.async_fetch_call_history(True) is complete
+
+    asyncio.run(run())
+    assert seen.count(coordinator_module.SCREENSHOT_HISTORY_TYPE) == 2
+
+
 def test_portal_event_queries_use_configured_regional_url() -> None:
     session = _Session([[], []])
     instance = _coordinator(session)

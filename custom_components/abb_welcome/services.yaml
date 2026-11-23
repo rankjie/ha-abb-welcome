@@ -75,6 +75,17 @@ arm_streaming:
     the armed window to that outdoor station so HomeKit/Scrypted snapshot probes
     for other doorbells cannot start additional intercom calls.
   fields:
+    owner_token:
+      name: Card lease token
+      description: Optional private client token. Requires entry_id and station_id. Other cards retain their own leases.
+      selector:
+        text:
+    release:
+      name: Release card lease
+      description: Release only the matching owner_token lease; never disarm another card or an incoming ring.
+      default: false
+      selector:
+        boolean:
     entry_id:
       name: Entry ID
       description: Optional. Specific config-entry ID to arm. Defaults to all loaded entries.

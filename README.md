@@ -12,6 +12,8 @@ that everything runs on your local network.
 - A **button** for each relay actuator on the gateway (web-admin setups).
 - A **camera** for each door station, with live video and audio.
 - A **talk button** in the live view.
+- An optional [ABB Welcome intercom card](docs/intercom-card.md) with on-demand
+  live video, hold-to-talk and confirmed door opening.
 - A **ringing sensor** and an event the moment someone presses the doorbell.
 - A **Floor call** event when someone presses the bell button at your apartment door.
 - The **latest visitor snapshot** and a history of rings, calls and door openings.

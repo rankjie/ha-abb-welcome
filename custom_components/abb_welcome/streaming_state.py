@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
@@ -69,6 +69,7 @@ class ArmedState:
     target_station_id: str = ""
     until_monotonic: float = 0.0
     auto_disarm_task: asyncio.Task | None = None
+    owner_leases: dict[str, float] = field(default_factory=dict)
 
     def remaining_seconds(self) -> float:
         if not self.armed:
@@ -176,21 +177,52 @@ def arm(
     reason: str,
     duration: float,
     station_id: str | None = None,
+    owner_token: str | None = None,
 ) -> None:
     """Arm streaming for ``duration`` seconds; cancels any existing timer."""
+    station_id = str(station_id or "").strip()
+    owner_token = str(owner_token or "").strip()
+    if owner_token and (not entry_id or not station_id or reason != ARM_REASON_MANUAL):
+        raise ValueError("An owned arm requires an entry, station and manual reason")
     state = get_state(hass, entry_id)
+    if owner_token:
+        if state.armed and state.target_station_id not in ("", station_id):
+            raise ValueError("Another station is already armed")
+        if state.armed and not state.owner_leases:
+            # Borrow an existing ring/switch arm; never take over its lifetime.
+            return
+        state.owner_leases[owner_token] = time.monotonic() + duration
+    else:
+        state.owner_leases.clear()
     if state.auto_disarm_task is not None and not state.auto_disarm_task.done():
         state.auto_disarm_task.cancel()
         state.auto_disarm_task = None
 
     state.armed = True
     state.reason = reason
-    state.target_station_id = str(station_id or "").strip()
-    state.until_monotonic = time.monotonic() + duration
+    state.target_station_id = station_id
+    state.until_monotonic = (
+        max(state.owner_leases.values())
+        if state.owner_leases
+        else time.monotonic() + duration
+    )
 
     async def _auto_off() -> None:
         try:
-            await asyncio.sleep(duration)
+            while state.owner_leases:
+                await asyncio.sleep(
+                    max(0, min(state.owner_leases.values()) - time.monotonic())
+                )
+                now = time.monotonic()
+                state.owner_leases = {
+                    token: expiry
+                    for token, expiry in state.owner_leases.items()
+                    if expiry > now
+                }
+                if state.owner_leases:
+                    state.until_monotonic = max(state.owner_leases.values())
+            if not owner_token:
+                await asyncio.sleep(duration)
         except asyncio.CancelledError:
             return
         # Only disarm if we're still the active timer (a newer arm() may have
@@ -203,6 +235,7 @@ def arm(
         cur.target_station_id = ""
         cur.until_monotonic = 0.0
         cur.auto_disarm_task = None
+        cur.owner_leases.clear()
         async_dispatcher_send(hass, signal_armed_changed(entry_id))
         _LOGGER.info(
             "[abb] streaming auto-disarmed for entry %s after %ss",
@@ -233,9 +266,38 @@ def disarm(hass: HomeAssistant, entry_id: str) -> None:
     state.reason = ""
     state.target_station_id = ""
     state.until_monotonic = 0.0
+    state.owner_leases.clear()
     async_dispatcher_send(hass, signal_armed_changed(entry_id))
     _LOGGER.info("[abb] streaming disarmed for entry %s", entry_id)
 
 
 def is_armed(hass: HomeAssistant, entry_id: str) -> bool:
     return get_state(hass, entry_id).armed
+
+
+@callback
+def release_manual_arm(
+    hass: HomeAssistant,
+    entry_id: str,
+    *,
+    station_id: str,
+    owner_token: str,
+) -> bool:
+    """Release only this card's lease, preserving other cards and ring arms."""
+    if not entry_id or not station_id or not owner_token:
+        return False
+    state = hass.data.get(DOMAIN, {}).get(entry_id, {}).get("armed_state")
+    if (
+        state is None
+        or not state.armed
+        or state.reason != ARM_REASON_MANUAL
+        or state.target_station_id != station_id
+        or owner_token not in state.owner_leases
+    ):
+        return False
+    del state.owner_leases[owner_token]
+    if not state.owner_leases:
+        disarm(hass, entry_id)
+    else:
+        state.until_monotonic = max(state.owner_leases.values())
+    return True
