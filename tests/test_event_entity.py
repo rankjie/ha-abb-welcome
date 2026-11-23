@@ -22,7 +22,7 @@ def _load_event_module():
     entity_platform = types.ModuleType("homeassistant.helpers.entity_platform")
 
     class EventEntity:
-        def _trigger_event(self, event_type, event_attributes) -> None:
+        def _trigger_event(self, event_type, event_attributes=None) -> None:
             if not hasattr(self, "triggered_events"):
                 self.triggered_events = []
             self.triggered_events.append((event_type, event_attributes))

@@ -13,6 +13,7 @@ that everything runs on your local network.
 - A **camera** for each door station, with live video and audio.
 - A **talk button** in the live view.
 - A **ringing sensor** and an event the moment someone presses the doorbell.
+- A **Floor call** event when someone presses the bell button at your apartment door.
 - The **latest visitor snapshot** and a history of rings, calls and door openings.
 - **Apple Home** doorbells through the companion [Scrypted plugin][scrypted-bridge].
 

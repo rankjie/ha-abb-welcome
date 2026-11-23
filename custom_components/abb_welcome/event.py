@@ -35,20 +35,54 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up ABB Welcome event entity from a config entry."""
+    """Set up ABB Welcome event entities from a config entry."""
     data = hass.data[DOMAIN][entry.entry_id]
     coordinator: ABBWelcomeCoordinator = data.get("coordinator")
-    if not coordinator or not coordinator.has_certs:
-        return
     gateway_uuid = entry.data.get("gateway_uuid", "unknown")
-    async_add_entities([
-        ABBWelcomeEventEntity(
-            coordinator,
-            gateway_uuid,
-            entry.data.get("doors", []) or [],
-            gateway_device_info(entry.data),
+    device_info = gateway_device_info(entry.data)
+    entities: list[EventEntity] = [
+        ABBWelcomeFloorCallEntity(data, gateway_uuid, device_info)
+    ]
+    if coordinator and coordinator.has_certs:
+        entities.append(
+            ABBWelcomeEventEntity(
+                coordinator,
+                gateway_uuid,
+                entry.data.get("doors", []) or [],
+                device_info,
+            )
         )
-    ])
+    async_add_entities(entities)
+
+
+class ABBWelcomeFloorCallEntity(EventEntity):
+    """Fires when the floor-call button at the apartment door is pressed.
+
+    The gateway reports the press to registered app clients as a SIP
+    MESSAGE, which the SIP listener hands to ``level_push_handler``.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Floor call"
+    _attr_icon = "mdi:bell-ring-outline"
+    _attr_event_types = ["pressed"]
+
+    def __init__(self, entry_data: dict, gateway_uuid: str, device_info) -> None:
+        self._entry_data = entry_data
+        self._attr_unique_id = f"{gateway_uuid}_floor_call"
+        self._attr_device_info = device_info
+
+    async def async_added_to_hass(self) -> None:
+        self._entry_data["level_push_handler"] = self._handle_press
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._entry_data.get("level_push_handler") == self._handle_press:
+            self._entry_data.pop("level_push_handler")
+
+    @callback
+    def _handle_press(self) -> None:
+        self._trigger_event("pressed")
+        self.async_write_ha_state()
 
 
 class ABBWelcomeEventEntity(EventEntity):

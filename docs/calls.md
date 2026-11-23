@@ -100,3 +100,12 @@ frames are queued into the same RTP sequence.
 
 Scrypted assigns a per-client `talkback_session_id` so stale clients cannot stop
 or overwrite a newer microphone session.
+
+## Floor call
+
+The **Floor call** event entity fires `pressed` when someone presses the
+floor-call button at the apartment door (the bell that rings only this flat,
+not an outdoor station). The gateway reports the press to registered app
+clients as a SIP `MESSAGE`: `8` on MRANGE systems, or a `levelpush` command on
+GlobalIP. Home Assistant receives it while the SIP listener is registered. It
+carries no video and does not arm streaming.

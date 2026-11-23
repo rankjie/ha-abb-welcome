@@ -210,6 +210,23 @@ EVENT_SIP_MESSAGE = f"{DOMAIN}_sip_message"
 EVENT_LISTENER_STATE = f"{DOMAIN}_listener_state"
 
 
+def _is_level_push_message(body: str) -> bool:
+    """Return whether a MESSAGE reports a press of the floor-call button.
+
+    The official app treats a body of ``8`` (MRANGE) or a JSON ``levelpush``
+    command (GlobalIP) as a floor call (LinphoneService.onMessageReceive).
+    """
+    if body == "8":
+        return True
+    if not body.startswith("{"):
+        return False
+    try:
+        message = json.loads(body)
+    except ValueError:
+        return False
+    return isinstance(message, dict) and message.get("cmd") == "levelpush"
+
+
 def _fire_discovery_changed(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -472,6 +489,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         def _on_message(frame) -> None:
             """Handle private MESSAGE content without putting it on the HA bus."""
             body = frame.body.decode("utf-8", errors="replace").strip()
+            if _is_level_push_message(body):
+                handler = entry_data.get("level_push_handler")
+                if callable(handler):
+                    handler()
+                else:
+                    _LOGGER.info("[abb] floor call received before its entity is ready")
+                return
             match = _CAMERA_COUNT_MESSAGE_RE.search(body)
             if match is None:
                 return
