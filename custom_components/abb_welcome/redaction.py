@@ -106,8 +106,8 @@ _ABB_ENCRYPT_KEY_RE = re.compile(
 _SDP_CRYPTO_INLINE_RE = re.compile(
     r"(a=crypto:\d+\s+\S+\s+inline:)[^\s\r\n]+", re.IGNORECASE
 )
-# Credentials sent as URL query or form parameters, e.g. the gateway admin
-# login ``checklogin.cgi?name=admin&pwd=...``.
+# Credentials sent as URL query or form parameters, e.g. the legacy gateway
+# admin login ``checklogin.cgi?name=admin&pwd=...``.
 _CREDENTIAL_PARAM_RE = re.compile(
     r"(?<![A-Za-z0-9_])((?:pwd|passwd|password|pass)=)[^&\s\"'#;]*",
     re.IGNORECASE,
@@ -223,9 +223,9 @@ class CredentialRedactionFilter(logging.Filter):
     """Mask passwords in records of dependency loggers this integration uses.
 
     urllib3 logs every request line, including the query string, at DEBUG.
-    The gateway admin login is a GET with ``pwd=`` in the query, so with
-    ``urllib3`` at DEBUG (e.g. ``logger: default: debug``) the password
-    would be written to the Home Assistant log in clear text. Only password
+    A login that puts ``pwd=`` in the query, like the legacy gateway admin
+    login, would write the password to the Home Assistant log in clear text
+    with ``urllib3`` at DEBUG (e.g. ``logger: default: debug``). Only password
     parameters are touched; everything else in the record stays as is.
     """
 
