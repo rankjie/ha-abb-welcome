@@ -417,16 +417,29 @@ def _press(
     second_lock=False,
     strategy="hybrid",
     with_dialer=True,
+    ringing=None,
     **codes,
 ):
-    """Press a door button; return (unlock_door calls, wire requests, error)."""
+    """Press a door button; return (unlock_door calls, wire requests, error).
+
+    ringing is the station id of an unanswered ring held by the SIP listener.
+    """
 
     async def scenario():
         client = _client(strategy=strategy, **codes)
         client_calls = []
-        client.unlock_door = lambda *args: client_calls.append(args) or True
+        client.unlock_door = (
+            lambda *args, **kwargs: client_calls.append(
+                args + tuple(sorted(kwargs.items()))
+            )
+            or True
+        )
         dialer, gateway = _dialer(station, scripts)
         entry_data = {"intercom_dialer": dialer} if with_dialer else {}
+        if ringing is not None:
+            entry_data["sip_listener"] = types.SimpleNamespace(
+                has_pending_call_for_station=lambda station_id: station_id == ringing
+            )
 
         async def executor(function, *args):
             return function(*args)
@@ -542,6 +555,47 @@ def test_second_lock_press_without_a_call_to_its_station_keeps_the_invite_route(
     assert error is None
     assert client_calls == [(BACK, "a")]
     assert requests == []
+
+
+@pytest.mark.parametrize("strategy", ["hybrid", "standard"])
+def test_press_while_its_station_rings_unanswered_forces_the_fast_route(
+    button_module, strategy
+):
+    client_calls, requests, error = _press(
+        button_module, BACK, station=None, strategy=strategy, ringing="100000002"
+    )
+    assert error is None
+    assert client_calls == [(BACK, ("force_fast", True))]
+    assert requests == []
+
+
+def test_press_while_another_station_rings_keeps_the_old_unlock_path(button_module):
+    client_calls, requests, error = _press(
+        button_module, BACK, station=None, ringing="100000001"
+    )
+    assert error is None
+    assert client_calls == [(BACK,)]
+    assert requests == []
+
+
+def test_second_lock_press_while_its_station_rings_keeps_the_invite_route(
+    button_module,
+):
+    client_calls, requests, error = _press(
+        button_module, BACK, station=None, second_lock=True, ringing="100000002"
+    )
+    assert error is None
+    assert client_calls == [(BACK, "a")]
+    assert requests == []
+
+
+def test_active_dialer_call_wins_over_an_unanswered_ring(button_module):
+    client_calls, requests, error = _press(
+        button_module, BACK, station="100000002", ringing="100000002"
+    )
+    assert error is None
+    assert client_calls == []
+    assert len(requests) == 1
 
 
 def test_press_during_the_dialer_hangup_falls_back_to_the_invite_route(button_module):
@@ -886,3 +940,36 @@ def test_client_without_a_code_keeps_the_selected_strategy(monkeypatch):
     )
     assert client.unlock_door(BACK) is True
     assert calls == ["100000002"]
+
+
+@pytest.mark.parametrize("strategy", ["hybrid", "standard"])
+def test_force_fast_sends_the_message_whatever_the_strategy(monkeypatch, strategy):
+    fast, invite = [], []
+    client = _client(strategy=strategy)
+    monkeypatch.setattr(
+        client,
+        "_unlock_fast",
+        lambda door, _timeout: fast.append(door.station_id) or True,
+    )
+    monkeypatch.setattr(
+        client, "_unlock_via_invite", lambda *args: invite.append(args) or True
+    )
+    assert client.unlock_door(BACK, force_fast=True) is True
+    assert fast == ["100000002"]
+    assert invite == []
+
+
+def test_force_fast_keeps_a_configured_dtmf_code_on_its_own_call(monkeypatch):
+    fast, invite = [], []
+    client = _client(strategy="hybrid", dtmf_unlock_code="12#")
+    monkeypatch.setattr(
+        client, "_unlock_fast", lambda door, _timeout: fast.append(door) or True
+    )
+    monkeypatch.setattr(
+        client,
+        "_unlock_via_invite",
+        lambda door, *_rest: invite.append(door.station_id) or True,
+    )
+    assert client.unlock_door(BACK, force_fast=True) is True
+    assert fast == []
+    assert invite == ["100000002"]

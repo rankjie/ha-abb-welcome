@@ -1,5 +1,6 @@
 """Button platform for ABB Welcome door unlock."""
 
+from functools import partial
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
@@ -102,7 +103,14 @@ class ABBWelcomeDoorButton(ButtonEntity):
         _LOGGER.debug("Unlocking door: %s", self._attr_name)
         body = "a" if self._second_lock else None
         success = await self._unlock_in_active_call(body)
-        if success is None:
+        if success is None and body is None and self._station_is_ringing():
+            # An unanswered ring holds the gateway's only call slot, so an
+            # INVITE gets 486 Busy. A plain MESSAGE works like the panel's
+            # unlock key during the ring and opens this station.
+            success = await self.hass.async_add_executor_job(
+                partial(self._sip_client.unlock_door, self._door, force_fast=True)
+            )
+        elif success is None:
             args = (self._door,) if body is None else (self._door, body)
             success = await self.hass.async_add_executor_job(
                 self._sip_client.unlock_door, *args
@@ -111,6 +119,13 @@ class ABBWelcomeDoorButton(ButtonEntity):
             raise HomeAssistantError(
                 f"Failed to unlock door: {self._attr_name}"
             )
+
+    def _station_is_ringing(self) -> bool:
+        """Return whether this station itself has an unanswered ring."""
+        listener = self.hass.data[DOMAIN][self._entry_id].get("sip_listener")
+        return listener is not None and listener.has_pending_call_for_station(
+            self._sip_client._extract_station_id(self._door)
+        )
 
     async def _unlock_in_active_call(self, body: str | None) -> bool | None:
         """Unlock over the dialer's call with this station, or None if it has none.
