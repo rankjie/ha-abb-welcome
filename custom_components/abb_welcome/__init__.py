@@ -675,48 +675,25 @@ _GATEWAY_ERROR_CODE_RE = re.compile(r"-?\d+")
 
 def _fetch_gateway_device_list(gateway_ip: str, admin_password: str) -> str:
     """Read the gateway admin device-list CGI response."""
-    # The gateway answers "-8" to a Referer naming a hostname, so it always
-    # names the IP.
     try:
-        referer_host = socket.gethostbyname(gateway_ip)
-    except OSError:
-        referer_host = gateway_ip
-    errors: list[str] = []
-    try:
-        # The web UI's own login, which setup already used for this entry. One
-        # 83342 on V6.25 accepted the older GET login but then answered -8 to
-        # the device list.
         session = _gateway_login(gateway_ip, "admin", admin_password)
         with session:
-            # One V6.25 gateway answers -8 to an https:// Referer; another
-            # served the device list to a browser page loaded over HTTPS.
-            for referer in (
-                f"http://{referer_host}/config.html",
-                f"https://{referer_host}/config.html",
-            ):
-                response = session.get(
-                    f"https://{gateway_ip}/cgi-bin/adduser.cgi",
-                    params={"type": "getdevicelist"},
-                    headers={"Referer": referer},
-                    timeout=_GATEWAY_ADMIN_TIMEOUT,
-                    verify=False,
-                )
-                if response.status_code != 200:
-                    errors.append(f"getdevicelist returned HTTP {response.status_code}")
-                    continue
-                listing = decode_gateway_text(response.content).strip()
-                if _GATEWAY_ERROR_CODE_RE.fullmatch(listing):
-                    _LOGGER.warning(
-                        "[abb] device list with Referer %s answered %s",
-                        referer, listing,
-                    )
-                    errors.append(f"getdevicelist answered {listing}")
-                    continue
-                return listing
+            # Must carry the origin _gateway_login gave the gateway.
+            response = session.get(
+                f"https://{gateway_ip}/cgi-bin/adduser.cgi",
+                params={"type": "getdevicelist"},
+                headers={"Referer": f"https://{gateway_ip}/config.html"},
+                timeout=_GATEWAY_ADMIN_TIMEOUT,
+                verify=False,
+            )
     except (GatewayAdminError, requests.RequestException) as err:
-        errors.append(str(err))
-
-    raise RuntimeError("; ".join(errors))
+        raise RuntimeError(str(err)) from err
+    if response.status_code != 200:
+        raise RuntimeError(f"getdevicelist returned HTTP {response.status_code}")
+    listing = decode_gateway_text(response.content).strip()
+    if _GATEWAY_ERROR_CODE_RE.fullmatch(listing):
+        raise RuntimeError(f"getdevicelist answered {listing}")
+    return listing
 
 
 def _parse_gateway_doors(raw: str, sip_domain: str) -> list[dict]:
@@ -772,7 +749,7 @@ def _fetch_topology_from_gateway(
     try:
         raw = _fetch_gateway_device_list(gateway_ip, admin_password)
     except RuntimeError as err:
-        _LOGGER.error("[abb] refresh_doors: gateway HTTP error: %s", err)
+        _LOGGER.error("[abb] refresh_doors: device list request failed: %s", err)
         return None
 
     doors = _parse_gateway_doors(raw, sip_domain)

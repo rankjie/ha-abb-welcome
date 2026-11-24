@@ -1018,9 +1018,9 @@ def _gw_post(
 
     _log(logging.WARNING,
         "Gateway %s op=%s returned empty body with all encodings tried "
-        "(last HTTP %d, body=%r). Likely cause: session not authenticated "
-        "(no auth cookie) — enable DEBUG on custom_components.abb_welcome.portal "
-        "to inspect Set-Cookie from /cgi-bin/checklogin.cgi.",
+        "(last HTTP %d, body=%r). The gateway answers empty when the Referer "
+        "does not match the origin of its most recent web admin login, for "
+        "example after a browser login between ours and this call.",
         path, op_label, last_status, last_text,
     )
     return last_parsed
@@ -1044,7 +1044,14 @@ def _gateway_login(
                 "password": urllib.parse.quote(admin_password, safe=""),
             }
         ),
-        headers={"Content-Type": "application/json"},
+        # The gateway keeps the origin of the last login's Referer and answers
+        # later CGI calls whose Referer lacks "<origin>config.html" with -8 or
+        # an empty body. Without a Referer the login keeps whatever origin the
+        # last browser login left, http:// or https://, IP or hostname.
+        headers={
+            "Content-Type": "application/json",
+            "Referer": f"https://{gateway_ip}/index.html",
+        },
         timeout=15,
         verify=False,
     )

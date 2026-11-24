@@ -949,6 +949,38 @@ def test_gateway_login_tells_a_missing_web_admin_from_a_rejected_login(
     assert type(err.value).__name__ == expected
 
 
+def test_gateway_login_sets_the_https_origin_later_calls_send(monkeypatch) -> None:
+    _load_config_flow()
+    portal = sys.modules["abb_pairing_test.portal"]
+    sent = []
+
+    class _Session:
+        cookies = {"hash_key": "synthetic"}
+
+        def post(self, url, **kwargs):
+            sent.append((url, kwargs["headers"]))
+            return types.SimpleNamespace(
+                status_code=200,
+                content=b"1",
+                headers={},
+                request=types.SimpleNamespace(
+                    method="POST", url=url, headers={}, body=b""
+                ),
+            )
+
+    monkeypatch.setattr(portal.requests, "Session", _Session)
+    portal._gateway_login("abbwelcome.lan", "admin", "synthetic-password")
+    assert sent == [
+        (
+            "https://abbwelcome.lan/cgi-bin/checklogin.cgi",
+            {
+                "Content-Type": "application/json",
+                "Referer": "https://abbwelcome.lan/index.html",
+            },
+        )
+    ]
+
+
 def test_failed_certificate_request_keeps_issued_key_pair() -> None:
     module = _load_config_flow()
     flow = module.ABBWelcomeConfigFlow()

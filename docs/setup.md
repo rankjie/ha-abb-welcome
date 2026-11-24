@@ -40,6 +40,14 @@ For a web-admin gateway, setup reads the gateway UUID from its CGI (unless an
 override was supplied), then logs into the CGI to approve the pending client.
 If the CGI returns no UUID, setup takes the IP gateway listed in the MyBuildings
 discovery list, or asks you to choose when the account has several.
+
+The gateway remembers the address of the most recent web admin login and
+refuses CGI requests sent from any other address. Each integration login, at
+setup and whenever it refreshes the door list, sets that address to
+`https://<configured gateway address>/`. A web admin tab open under a different
+address (`http://` or another hostname) then stops loading data until you log in
+again in the browser.
+
 For an app-managed device, setup reads the MyBuildings discovery list with the
 new certificate and sends the pairing request to the gateway or Wi-Fi indoor
 station listed there, the same way the official app picks its target. An entered
