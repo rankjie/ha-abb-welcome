@@ -65,12 +65,13 @@ The initial connection waits up to 15 seconds for a first frame. Once playback
 has started, a 10-second stall is treated as an error. These are UI safety
 boundaries, not evidence that a physical station or its network is healthy.
 
-Live holds a 60-second streaming lease for its station through
-`abb_welcome.arm_streaming` and renews it every 20 seconds while it runs.
-Closing the dashboard stops the renewals, so the station is released within a
-minute. If a ring or the **Streaming enabled** switch already armed the
-station, Live uses that window and ends with it. When the integration refuses
-a renewal, Live stops and says that the live view ended.
+Live holds its station open through a Home Assistant websocket subscription
+(`abb_welcome/live`) for as long as it runs, with no time limit. **Stop**,
+closing the dashboard, or losing the connection to Home Assistant releases the
+station. Live ends with a message when the door station hangs up the call,
+which ABB stations do on their own call timeout, or when a ring or
+**Streaming enabled** window that Live was using closes. Press **Live** to
+call the station again.
 
 Street audio is controlled by the speaker button and is independent from the
 microphone. The speaker may be turned on or off without changing talkback.

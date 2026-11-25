@@ -86,6 +86,7 @@ from .rtsp_server import (
 from .streaming_state import (
     ARM_REASON_RING,
     disarm,
+    end_live,
     get_state,
     is_armed,
     is_camera_still_image_enabled,
@@ -540,6 +541,7 @@ class StationStreamCoordinator:
     def _on_gateway_call_ended(self, call_id: str, reason: str) -> None:
         self._talkback_owner = ""
         self._stream_generation += 1
+        end_live(self.hass, self.entry_id, str(self.door.station_id or "").strip())
         if reason == "remote_cancel":
             # The previewed ring is over, typically because another station
             # picked up. Stream clients reconnect on their own, and while the

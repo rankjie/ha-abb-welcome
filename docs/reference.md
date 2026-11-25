@@ -33,12 +33,7 @@ Gateway-level entities:
   App-managed devices return an unsupported error; re-pair after topology
   changes.
 - `abb_welcome.arm_streaming` - arm streaming for all stations or one
-  `station_id`. A client that provides an `entry_id`, `station_id` and
-  a unique `owner_token` gets its own bounded lease. With the same fields,
-  `renew: true` extends only an active lease and `release: true` removes
-  only that lease. Clients can borrow an existing compatible ring or switch
-  window without extending or releasing it. Calls without a token retain
-  their original behavior.
+  `station_id`.
 - `abb_welcome.talk_start` - start sending queued microphone audio on the active
   stream.
 - `abb_welcome.talk_stop` - stop voice audio and return the talkback leg to

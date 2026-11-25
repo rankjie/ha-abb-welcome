@@ -5,8 +5,6 @@ import assert from "node:assert/strict";
 
 import {
   AbbWelcomeIntercomCard,
-  LIVE_LEASE_RENEW_MS,
-  LIVE_LEASE_SECONDS,
   LIVE_START_TIMEOUT_MS,
 } from "../../custom_components/abb_welcome/frontend/abb-welcome-intercom-card.js";
 import { deferred, settle } from "./_harness.mjs";
@@ -146,13 +144,18 @@ function makePeer() {
   };
 }
 
-function makeHass({ arm = async () => {}, subscribe } = {}) {
+function makeHass({ live = async () => {}, subscribe } = {}) {
   const calls = [];
   const hass = {
     connected: true,
     connection: {
       connected: true,
       subscribeMessage: (callback, message) => {
+        if (message.type === "abb_welcome/live") {
+          const call = { type: "live", callback, message, releases: 0 };
+          calls.push(call);
+          return live().then(() => () => { call.releases++; });
+        }
         calls.push({ type: "subscribe", callback, message });
         return subscribe ? subscribe(callback, message) : () => {};
       },
@@ -165,18 +168,17 @@ function makeHass({ arm = async () => {}, subscribe } = {}) {
     },
     callService: (domain, service, data) => {
       calls.push({ type: "service", domain, service, data });
-      return arm(domain, service, data);
     },
     callWS: async () => ({ configuration: {} }),
   };
   return { hass, calls };
 }
 
-function makeCard({ arm, subscribe } = {}) {
+function makeCard({ live, subscribe } = {}) {
   const clock = new FakeClock();
   const peer = makePeer();
   installBrowser(clock, peer);
-  const { hass, calls } = makeHass({ arm, subscribe });
+  const { hass, calls } = makeHass({ live, subscribe });
   const card = new AbbWelcomeIntercomCard();
   card.setConfig({ camera: "camera.front", unlock_button: "button.front" });
   card._hass = hass;
@@ -190,8 +192,8 @@ async function startToSubscribed(fixture) {
   return fixture.card.appendedVideo;
 }
 
-function serviceCalls(calls, release) {
-  return calls.filter((call) => call.type === "service" && call.data.release === release);
+function liveWindows(calls) {
+  return calls.filter((call) => call.type === "live");
 }
 
 test("signaling completion sets live true while media is still waiting", async () => {
@@ -203,18 +205,20 @@ test("signaling completion sets live true while media is still waiting", async (
   assert.equal(video.srcObject, null);
 });
 
-test("global startup deadline releases a hung arm request", async () => {
-  const armGate = deferred();
-  const fixture = makeCard({ arm: () => armGate.promise });
-  void fixture.card._startLive();
+test("global startup deadline gives up on a hung live window and releases a late grant", async () => {
+  const windowGate = deferred();
+  const fixture = makeCard({ live: () => windowGate.promise });
+  const pending = fixture.card._startLive();
   await settle();
-  assert.equal(serviceCalls(fixture.calls, undefined).length, 1);
+  const [window] = liveWindows(fixture.calls);
 
   fixture.clock.advance(LIVE_START_TIMEOUT_MS);
   assert.equal(fixture.card._live, false);
   assert.equal(fixture.card._mediaState, "idle");
-  assert.equal(serviceCalls(fixture.calls, true).length, 1);
   assert.equal(fixture.card._playerEl, null);
+  windowGate.resolve();
+  await pending;
+  assert.equal(window.releases, 1);
 });
 
 test("global startup deadline closes and releases a hung signaling subscription", async () => {
@@ -230,7 +234,7 @@ test("global startup deadline closes and releases a hung signaling subscription"
   assert.equal(fixture.card._live, false);
   assert.equal(fixture.card._playerEl, null);
   assert.equal(fixture.peer.closes, 1);
-  assert.equal(serviceCalls(fixture.calls, true).length, 1);
+  assert.equal(liveWindows(fixture.calls)[0].releases, 1);
 });
 
 test("the first decoded frame clears the card-level startup deadline", async () => {
@@ -266,7 +270,7 @@ for (const state of ["closed", "failed"]) {
     assert.equal(fixture.card._live, false);
     assert.equal(fixture.card._playerEl, null);
     assert.equal(fixture.peer.closes, 1);
-    assert.equal(serviceCalls(fixture.calls, true).length, 1);
+    assert.equal(liveWindows(fixture.calls)[0].releases, 1);
   });
 }
 
@@ -442,7 +446,8 @@ test("native Hold leaves the card's player, incoming audio, and owned Live windo
   assert.equal(fixture.card._armLease, lease);
   assert.equal(fixture.card._live, true);
   assert.equal(fixture.peer.closes, 0);
-  assert.deepEqual(fixture.calls.filter(item => item.type === "service").map(item => item.service), ["arm_streaming"]);
+  assert.equal(liveWindows(fixture.calls)[0].releases, 0);
+  assert.deepEqual(fixture.calls.filter(item => item.type === "service"), []);
   fixture.card._stopLive();
   assert.equal(fixture.peer.closes, 1);
 });
@@ -463,77 +468,34 @@ test("native_talkback false keeps Live receive-only even when HA supports Talk",
   fixture.card._stopLive();
 });
 
-function renewals(calls) {
-  return calls.filter((call) => call.type === "service" && call.data.renew === true);
-}
+test("Live holds the station through one live window and Stop releases it once", async () => {
+  const fixture = makeCard();
+  await startToSubscribed(fixture);
+  const windows = liveWindows(fixture.calls);
+  assert.equal(windows.length, 1);
+  assert.deepEqual(windows[0].message, {
+    type: "abb_welcome/live",
+    entry_id: "entry",
+    station_id: "station",
+  });
+  fixture.card._stopLive();
+  fixture.card._stopLive();
+  assert.equal(windows[0].releases, 1);
+});
 
-async function startPlaying(fixture) {
+test("an ended live window stops Live and says so", async () => {
+  const fixture = makeCard();
   const video = await startToSubscribed(fixture);
   video.videoWidth = 1280;
   video.videoHeight = 720;
   video.frame();
-  return video;
-}
-
-// Advances with decoded frames, so only the lease can end Live.
-async function playFor(fixture, video, ms) {
-  for (let step = 0; step < ms; step += 1000) {
-    fixture.clock.advance(1000);
-    if (fixture.card._playerEl === video) video.frame(undefined, video.currentTime + 1);
-    await settle();
-  }
-}
-
-test("Live arms a bounded lease and renews it while open", async () => {
-  const fixture = makeCard();
-  const video = await startPlaying(fixture);
-  const [arm] = serviceCalls(fixture.calls, undefined);
-  assert.equal(arm.data.duration, LIVE_LEASE_SECONDS);
-  assert.ok(LIVE_LEASE_RENEW_MS * 2 < LIVE_LEASE_SECONDS * 1000);
-  for (const expected of [1, 2]) {
-    await playFor(fixture, video, LIVE_LEASE_RENEW_MS);
-    assert.equal(renewals(fixture.calls).length, expected);
-  }
-  assert.deepEqual(renewals(fixture.calls).at(-1).data, {
-    ...arm.data,
-    renew: true,
-  });
-  assert.equal(fixture.card._live, true);
-
-  fixture.card._stopLive();
-  fixture.clock.advance(LIVE_LEASE_RENEW_MS * 3);
-  await settle();
-  assert.equal(renewals(fixture.calls).length, 2);
-  assert.equal(serviceCalls(fixture.calls, true).length, 1);
-});
-
-test("a refused renewal ends Live and says so", async () => {
-  const fixture = makeCard({
-    arm: async (_domain, _service, data) => {
-      if (data.renew) {
-        throw { code: "home_assistant_error", message: "Streaming lease expired" };
-      }
-    },
-  });
-  const video = await startPlaying(fixture);
-  await playFor(fixture, video, LIVE_LEASE_RENEW_MS);
+  const [window] = liveWindows(fixture.calls);
+  window.callback({ ended: true });
   assert.equal(fixture.card._live, false);
   assert.equal(fixture.card._playerEl, null);
   assert.equal(fixture.peer.closes, 1);
   assert.equal(fixture.card._statusOverride, fixture.card._strings.live_ended);
-});
 
-test("a renewal lost to a dropped connection is retried", async () => {
-  let failures = 1;
-  const fixture = makeCard({
-    arm: async (_domain, _service, data) => {
-      if (data.renew && failures-- > 0) throw { code: 3, message: "Connection lost" };
-    },
-  });
-  const video = await startPlaying(fixture);
-  await playFor(fixture, video, LIVE_LEASE_RENEW_MS);
-  assert.equal(fixture.card._live, true);
-  await playFor(fixture, video, LIVE_LEASE_RENEW_MS);
-  assert.equal(renewals(fixture.calls).length, 2);
-  assert.equal(fixture.card._live, true);
+  window.callback({ ended: true });
+  assert.equal(fixture.peer.closes, 1, "a late repeat is ignored");
 });

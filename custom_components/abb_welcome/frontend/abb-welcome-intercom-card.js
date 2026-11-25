@@ -39,10 +39,6 @@ export const CARD_VERSION = (() => {
 export const UNLOCK_CONFIRM_TIMEOUT_MS = 30000;
 export const LIVE_START_TIMEOUT_MS = 15000;
 export const LIVE_STALL_TIMEOUT_MS = 10000;
-// The lease outlives two missed renewals, so a brief WebSocket drop does not
-// end Live, and a closed tab stops holding the station within a minute.
-export const LIVE_LEASE_SECONDS = 60;
-export const LIVE_LEASE_RENEW_MS = 20000;
 const HISTORY_CACHE_MS = 5 * 60 * 1000;
 const MAX_HISTORY_PHOTOS_PER_CALL = 30;
 const HISTORY_PHOTO_CONCURRENCY = 3;
@@ -238,21 +234,6 @@ function validateCardConfig(config) {
   if (config.native_talkback != null && typeof config.native_talkback !== "boolean") {
     throw new Error('abb-welcome-intercom-card: "native_talkback" must be a boolean');
   }
-}
-
-export function makeSessionId(uuidFn) {
-  let raw = "";
-  if (typeof uuidFn === "function") {
-    raw = uuidFn();
-  } else if (
-    typeof crypto !== "undefined" &&
-    typeof crypto.randomUUID === "function"
-  ) {
-    raw = crypto.randomUUID();
-  } else {
-    raw = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-  }
-  return `abbcard-${raw}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1583,61 +1564,22 @@ export class AbbWelcomeIntercomCard extends BaseElement {
 
   // -- live view -----------------------------------------------------------
 
-  _sendArmRelease(lease, phase) {
-    if (!lease || lease.releasePhases.has(phase)) return;
-    lease.releasePhases.add(phase);
-    try {
-      Promise.resolve(
-        lease.hass.callService("abb_welcome", "arm_streaming", {
-          ...lease.scope,
-          owner_token: lease.ownerToken,
-          release: true,
-        })
-      ).catch(() => {});
-    } catch (_err) {
-      /* release is best-effort and owner-scoped */
-    }
-  }
-
-  _requestArmRelease(lease = this._armLease) {
+  // The live subscription is the integration's hold on the station: it
+  // lasts until this card unsubscribes, the browser disconnects, or the
+  // window ends (the station hung up, or a ring or switch window it used
+  // closed).
+  _releaseLiveWindow(lease = this._armLease) {
     if (!lease) return;
     lease.releaseRequested = true;
-    if (lease.renewTimer !== null) window.clearTimeout(lease.renewTimer);
-    lease.renewTimer = null;
-    if (!lease.armSettled) {
-      lease.releaseWhilePending = true;
-      this._sendArmRelease(lease, "eager");
-      return;
-    }
-    this._sendArmRelease(lease, "settled");
     if (this._armLease === lease) this._armLease = null;
-  }
-
-  _scheduleLeaseRenewal(lease) {
-    const owns = () => this._armLease === lease && !lease.releaseRequested;
-    lease.renewTimer = window.setTimeout(async () => {
-      lease.renewTimer = null;
-      if (!owns()) return;
-      try {
-        await lease.hass.callService("abb_welcome", "arm_streaming", {
-          ...lease.scope,
-          owner_token: lease.ownerToken,
-          duration: LIVE_LEASE_SECONDS,
-          renew: true,
-        });
-      } catch (err) {
-        if (!owns()) return;
-        // The integration refused the renewal: the window has ended, for
-        // example when a borrowed ring window closed. Anything else, such as
-        // a dropped connection, is retried while the lease still runs.
-        if (err?.code === "home_assistant_error") {
-          this._stopLive();
-          this._flashStatus(this._strings.live_ended, true, 10000);
-          return;
-        }
-      }
-      if (owns()) this._scheduleLeaseRenewal(lease);
-    }, LIVE_LEASE_RENEW_MS);
+    const unsubscribe = lease.unsubscribe;
+    lease.unsubscribe = null;
+    if (!unsubscribe) return;
+    try {
+      Promise.resolve(unsubscribe()).catch(() => {});
+    } catch (_err) {
+      /* a dropped connection already released the window */
+    }
   }
 
   async _startLive() {
@@ -1651,7 +1593,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     this._live = "starting";
     this._mediaState = "connecting";
     this._clearStatus();
-    // Covers a hung arm request or signaling subscription as well as video.
+    // Covers a hung live window request or signaling subscription as well as video.
     this._liveStartTimer = window.setTimeout(() => {
       if (ownsLive()) this._endVideo("timeout");
     }, LIVE_START_TIMEOUT_MS);
@@ -1676,41 +1618,31 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       this._flashStatus(strings.live_unavailable, true, 10000);
       return;
     }
-    const lease = {
-      hass,
-      scope,
-      ownerToken: makeSessionId(),
-      armSettled: false,
-      releaseRequested: false,
-      releaseWhilePending: false,
-      releasePhases: new Set(),
-      renewTimer: null,
-    };
+    const lease = { unsubscribe: null, releaseRequested: false };
     this._armLease = lease;
-    let armError = null;
+    let unsubscribe;
     try {
-      await hass.callService("abb_welcome", "arm_streaming", {
-        ...scope,
-        owner_token: lease.ownerToken,
-        duration: LIVE_LEASE_SECONDS,
-      });
+      unsubscribe = await hass.connection.subscribeMessage(
+        (event) => {
+          if (!event?.ended || this._armLease !== lease) return;
+          this._stopLive();
+          this._flashStatus(strings.live_ended, true, 10000);
+        },
+        { type: "abb_welcome/live", ...scope },
+        { resubscribe: false }
+      );
     } catch (err) {
-      armError = err;
-    }
-    lease.armSettled = true;
-    if (lease.releaseRequested) this._requestArmRelease(lease);
-    if (armError) {
-      this._requestArmRelease(lease);
+      if (this._armLease === lease) this._armLease = null;
       if (!isCurrent()) return;
       this._stopLive();
-      this._flashStatus(mapServiceError(armError, strings), true);
+      this._flashStatus(mapServiceError(err, strings), true);
       return;
     }
-    if (!isCurrent()) {
-      this._requestArmRelease(lease);
+    lease.unsubscribe = unsubscribe;
+    if (lease.releaseRequested || !isCurrent()) {
+      this._releaseLiveWindow(lease);
       return;
     }
-    this._scheduleLeaseRenewal(lease);
 
     this._mountPlayer();
     const session = new WebRtcSession({
@@ -1877,7 +1809,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     this._clearLiveStartTimer();
     this._pttKey = "";
     this._machine?.setReady(false);
-    this._requestArmRelease();
+    this._releaseLiveWindow();
     this._unmountPlayer();
     this._live = false;
     this._mediaState = "idle";

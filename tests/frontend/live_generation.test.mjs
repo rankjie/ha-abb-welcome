@@ -1,6 +1,6 @@
 /*
  * Card-level live lifecycle: every invalidating event advances a generation,
- * so late arm/signaling completions cannot reopen media or overwrite current UI.
+ * so late live-window/signaling completions cannot reopen media or overwrite current UI.
  */
 
 import { test } from "node:test";
@@ -43,12 +43,16 @@ function installBrowser(peerFactory) {
   };
 }
 
-function makeHass(armStreaming, counters) {
+function makeHass(liveWindow, counters) {
   const hass = {
     connected: true,
     connection: {
       connected: true,
       subscribeMessage: (...args) => {
+        if (args[1]?.type === "abb_welcome/live") {
+          counters.live.push(args);
+          return liveWindow().then(() => () => counters.liveReleases++);
+        }
         counters.subscriptions.push(args);
         return Promise.resolve(() => counters.unsubscribes++);
       },
@@ -70,10 +74,6 @@ function makeHass(armStreaming, counters) {
       },
     },
     devices: { gateway: { primary_config_entry: "entry-front" } },
-    callService: (domain, service, data) => {
-      counters.services.push({ domain, service, data });
-      return armStreaming();
-    },
     callWS: async (message) => {
       counters.ws.push(message);
       return { configuration: {} };
@@ -135,7 +135,8 @@ function invalidate(kind, card, hass) {
 
 function counters() {
   return {
-    services: [],
+    live: [],
+    liveReleases: 0,
     ws: [],
     subscriptions: [],
     unsubscribes: 0,
@@ -154,32 +155,30 @@ for (const kind of [
   "dom-disconnect",
   "visibility-hidden",
 ]) {
-  test(`${kind} during arm prevents every late WebRTC continuation`, async () => {
-    const armGate = deferred();
+  test(`${kind} while the live window is pending prevents every late WebRTC continuation`, async () => {
+    const windowGate = deferred();
     const count = counters();
     installBrowser(() => {
       count.peers++;
-      throw new Error("a stale arm must not create a peer");
+      throw new Error("a stale live window must not create a peer");
     });
-    const hass = makeHass(() => armGate.promise, count);
+    const hass = makeHass(() => windowGate.promise, count);
     const card = makeCard(hass, count);
 
     const pending = card._startLive();
-    assert.equal(count.services.length, 1);
-    const ownerToken = count.services[0].data.owner_token;
-    assert.match(ownerToken, /^abbcard-/);
-    invalidate(kind, card, hass);
-    const statusAfterInvalidation = card._statusOverride;
-    assert.equal(count.services.length, 2);
-    assert.deepEqual(count.services[1].data, {
+    assert.equal(count.live.length, 1);
+    assert.deepEqual(count.live[0][1], {
+      type: "abb_welcome/live",
       entry_id: "entry-front",
       station_id: "station-front",
-      owner_token: ownerToken,
-      release: true,
     });
+    assert.deepEqual(count.live[0][2], { resubscribe: false });
+    invalidate(kind, card, hass);
+    const statusAfterInvalidation = card._statusOverride;
 
-    armGate.resolve();
+    windowGate.resolve();
     await pending;
+    assert.equal(count.liveReleases, 1, "the late grant is released at once");
     assert.equal(card._live, false);
     assert.equal(card._webRtc, null);
     assert.equal(card._playerEl, null);
@@ -187,55 +186,49 @@ for (const kind of [
     assert.equal(count.peers, 0);
     assert.equal(count.mounts, 0);
     assert.equal(card._statusOverride, statusAfterInvalidation);
-    assert.equal(count.services.length, 3);
-    assert.deepEqual(count.services[2].data, count.services[1].data);
   });
 }
 
-test("late arm rejection after Stop is silent and does not retry", async () => {
-  const armGate = deferred();
+test("a late live window refusal after Stop is silent and does not retry", async () => {
+  const windowGate = deferred();
   const count = counters();
   installBrowser(() => {
     count.peers++;
-    throw new Error("a stale arm must not create a peer");
+    throw new Error("a stale live window must not create a peer");
   });
-  const hass = makeHass(() => armGate.promise, count);
+  const hass = makeHass(() => windowGate.promise, count);
   const card = makeCard(hass, count);
 
   const pending = card._startLive();
   card._stopLive();
+  card._stopLive();
   const statusAfterStop = card._statusOverride;
-  armGate.reject(new Error("late arm failure"));
+  windowGate.reject({ code: "station_busy", message: "Another station is already armed" });
   await pending;
 
-  assert.equal(count.services.length, 3);
+  assert.equal(count.live.length, 1);
+  assert.equal(count.liveReleases, 0);
   assert.equal(count.ws.length, 0);
   assert.equal(count.peers, 0);
   assert.equal(card._statusOverride, statusAfterStop);
 });
 
-test("Stop releases a never-settling arm lease immediately and only once per phase", async () => {
-  const never = deferred();
+test("a refused live window stops Live and shows why", async () => {
   const count = counters();
   installBrowser(() => {
-    throw new Error("a pending arm must not create a peer");
+    count.peers++;
+    throw new Error("a refused live window must not create a peer");
   });
-  const hass = makeHass(() => never.promise, count);
+  const hass = makeHass(
+    () => Promise.reject({ code: "station_busy", message: "Another station is already armed" }),
+    count
+  );
   const card = makeCard(hass, count);
 
-  void card._startLive();
-  await settle();
-  assert.equal(count.services.length, 1);
-  const ownerToken = count.services[0].data.owner_token;
-  card._stopLive();
-  card._stopLive();
-  assert.equal(count.services.length, 2);
-  assert.deepEqual(count.services[1].data, {
-    entry_id: "entry-front",
-    station_id: "station-front",
-    owner_token: ownerToken,
-    release: true,
-  });
+  await card._startLive();
+  assert.equal(card._live, false);
+  assert.equal(count.peers, 0);
+  assert.match(card._statusOverride, /Another station is already armed/);
 });
 
 function pendingOfferFixture() {
@@ -284,7 +277,7 @@ for (const kind of [
     assert.equal(count.removals, 1);
     assert.equal(card._webRtc, null);
     assert.equal(card._playerEl, null);
-    assert.equal(count.services.length, 2);
+    assert.equal(count.liveReleases, 1);
 
     offerGate.resolve({ type: "offer", sdp: "late-offer" });
     await pending;
@@ -311,7 +304,7 @@ test("late WebRTC start rejection after config change is silent", async () => {
   assert.equal(count.subscriptions.length, 0);
   assert.equal(card._webRtc, null);
   assert.equal(card._statusOverride, statusAfterChange);
-  assert.equal(count.services.length, 2);
+  assert.equal(count.liveReleases, 1);
 });
 
 test("talkback readiness that arrives during signaling is applied when Live opens", async () => {
@@ -338,7 +331,7 @@ test("talkback readiness that arrives during signaling is applied when Live open
   card._stopLive();
 });
 
-test("unsupported WebRTC fails before any arm service side effect", async () => {
+test("unsupported WebRTC fails before the station is armed", async () => {
   const count = counters();
   installBrowser(() => {
     throw new Error("not used");
@@ -348,7 +341,7 @@ test("unsupported WebRTC fails before any arm service side effect", async () => 
   const card = makeCard(hass, count);
 
   await card._startLive();
-  assert.equal(count.services.length, 0);
+  assert.equal(count.live.length, 0);
   assert.equal(card._live, false);
   assert.equal(card._webRtc, null);
 });

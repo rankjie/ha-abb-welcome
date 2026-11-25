@@ -20,7 +20,6 @@ import {
   capabilityCheck,
   supportMessage,
   mapServiceError,
-  makeSessionId,
 } from "../../custom_components/abb_welcome/frontend/abb-welcome-intercom-card.js";
 
 const HASS = {
@@ -486,12 +485,4 @@ test("mapServiceError translates the known backend messages", () => {
   );
   assert.equal(mapServiceError(new Error("weird"), s), `${s.err_service}: weird`);
   assert.equal(mapServiceError(undefined, s), s.err_service);
-});
-
-test("makeSessionId is unique and prefixed", () => {
-  const a = makeSessionId();
-  const b = makeSessionId();
-  assert.match(a, /^abbcard-/);
-  assert.notEqual(a, b);
-  assert.equal(makeSessionId(() => "fixed"), "abbcard-fixed");
 });

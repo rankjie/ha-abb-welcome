@@ -6,13 +6,16 @@ call.  We never want a stream to start by accident (HA frontend prefetch,
 HomeKit health probe, idle webrtc consumer, etc.), so streaming is
 gated on an explicit *armed* boolean per gateway.
 
-Two paths flip armed True:
+Three paths flip armed True:
 
 * the user toggles ``switch.<gateway>_streaming_enabled`` on
   (manual arm; auto-disarms after ``MANUAL_ARM_SECONDS``)
 * the SIP listener observes an inbound INVITE for an outdoor station
   while pickup is allowed (auto arm; auto-disarms after
   ``RING_ARM_SECONDS``)
+* a live view holds the station open (live arm; no timer). Each holder is
+  a frontend websocket subscription, so a closed or disconnected browser
+  releases it, and the window ends when the station hangs up.
 
 The switch entity, the SIP listener handler, and the camera entity all
 read/write through this small helper so the timer, dispatcher signal,
@@ -43,6 +46,7 @@ RING_ARM_SECONDS = 120
 
 ARM_REASON_MANUAL = "manual"
 ARM_REASON_RING = "ring"
+ARM_REASON_LIVE = "live"
 
 
 def signal_armed_changed(entry_id: str) -> str:
@@ -69,7 +73,7 @@ class ArmedState:
     target_station_id: str = ""
     until_monotonic: float = 0.0
     auto_disarm_task: asyncio.Task | None = None
-    owner_leases: dict[str, float] = field(default_factory=dict)
+    live_owners: set[str] = field(default_factory=set)
 
     def remaining_seconds(self) -> float:
         if not self.armed:
@@ -177,64 +181,26 @@ def arm(
     reason: str,
     duration: float,
     station_id: str | None = None,
-    owner_token: str | None = None,
-    renew: bool = False,
 ) -> None:
-    """Arm streaming or extend an existing, unexpired owner lease."""
-    station_id = str(station_id or "").strip()
-    owner_token = str(owner_token or "").strip()
-    if owner_token and (not entry_id or not station_id or reason != ARM_REASON_MANUAL):
-        raise ValueError("An owned arm requires an entry, station and manual reason")
-    if renew and not owner_token:
-        raise ValueError("A renewal requires an owner token")
+    """Arm streaming for ``duration`` seconds; cancels any existing timer.
+
+    A timed arm takes over a live window: its holders keep streaming until
+    this window ends.
+    """
     state = get_state(hass, entry_id)
-    now = time.monotonic()
-    if owner_token:
-        active_window = state.armed and state.until_monotonic > now
-        if renew and not active_window:
-            raise ValueError("Streaming lease expired")
-        if active_window and state.target_station_id not in ("", station_id):
-            raise ValueError("Another station is already armed")
-        if active_window and not state.owner_leases:
-            # Borrow an existing ring/switch arm; never take over its lifetime.
-            return
-        if renew and state.owner_leases.get(owner_token, 0.0) <= now:
-            raise ValueError("Streaming lease expired")
-        state.owner_leases = {
-            token: expiry for token, expiry in state.owner_leases.items() if expiry > now
-        }
-        state.owner_leases[owner_token] = now + duration
-    else:
-        state.owner_leases.clear()
+    state.live_owners.clear()
     if state.auto_disarm_task is not None and not state.auto_disarm_task.done():
         state.auto_disarm_task.cancel()
         state.auto_disarm_task = None
 
     state.armed = True
     state.reason = reason
-    state.target_station_id = station_id
-    state.until_monotonic = (
-        max(state.owner_leases.values())
-        if state.owner_leases
-        else now + duration
-    )
+    state.target_station_id = str(station_id or "").strip()
+    state.until_monotonic = time.monotonic() + duration
 
     async def _auto_off() -> None:
         try:
-            while state.owner_leases:
-                await asyncio.sleep(
-                    max(0, min(state.owner_leases.values()) - time.monotonic())
-                )
-                now = time.monotonic()
-                state.owner_leases = {
-                    token: expiry
-                    for token, expiry in state.owner_leases.items()
-                    if expiry > now
-                }
-                if state.owner_leases:
-                    state.until_monotonic = max(state.owner_leases.values())
-            if not owner_token:
-                await asyncio.sleep(duration)
+            await asyncio.sleep(duration)
         except asyncio.CancelledError:
             return
         # Only disarm if we're still the active timer (a newer arm() may have
@@ -242,17 +208,15 @@ def arm(
         cur = get_state(hass, entry_id)
         if cur.auto_disarm_task is not asyncio.current_task():
             return
-        expired_reason = cur.reason
         cur.armed = False
         cur.reason = ""
         cur.target_station_id = ""
         cur.until_monotonic = 0.0
         cur.auto_disarm_task = None
-        cur.owner_leases.clear()
         async_dispatcher_send(hass, signal_armed_changed(entry_id))
         _LOGGER.info(
-            "[abb] streaming auto-disarmed for entry %s (reason=%s)",
-            entry_id, expired_reason,
+            "[abb] streaming auto-disarmed for entry %s after %ss",
+            entry_id, duration,
         )
 
     state.auto_disarm_task = hass.async_create_background_task(
@@ -279,7 +243,7 @@ def disarm(hass: HomeAssistant, entry_id: str) -> None:
     state.reason = ""
     state.target_station_id = ""
     state.until_monotonic = 0.0
-    state.owner_leases.clear()
+    state.live_owners.clear()
     async_dispatcher_send(hass, signal_armed_changed(entry_id))
     _LOGGER.info("[abb] streaming disarmed for entry %s", entry_id)
 
@@ -289,28 +253,52 @@ def is_armed(hass: HomeAssistant, entry_id: str) -> bool:
 
 
 @callback
-def release_manual_arm(
-    hass: HomeAssistant,
-    entry_id: str,
-    *,
-    station_id: str,
-    owner_token: str,
-) -> bool:
-    """Release only this card's lease, preserving other cards and ring arms."""
-    if not entry_id or not station_id or not owner_token:
-        return False
+def acquire_live(
+    hass: HomeAssistant, entry_id: str, station_id: str, owner: str
+) -> None:
+    """Hold streaming open for one station until released or disarmed.
+
+    A ring or switch window that already allows the station is used as it
+    is: the live view neither extends nor ends it. Raises ValueError while
+    another station is armed.
+    """
+    state = get_state(hass, entry_id)
+    if state.armed and state.target_station_id not in ("", station_id):
+        raise ValueError("Another station is already armed")
+    if state.armed and not state.live_owners:
+        return
+    state.live_owners.add(owner)
+    if state.armed:
+        return
+    state.armed = True
+    state.reason = ARM_REASON_LIVE
+    state.target_station_id = station_id
+    state.until_monotonic = 0.0
+    async_dispatcher_send(hass, signal_armed_changed(entry_id))
+    _LOGGER.info(
+        "[abb] streaming armed for entry %s (reason=live, target_station=%s)",
+        entry_id, station_id,
+    )
+
+
+@callback
+def release_live(hass: HomeAssistant, entry_id: str, owner: str) -> None:
+    """Drop one live holder; the last one disarms its window."""
     state = hass.data.get(DOMAIN, {}).get(entry_id, {}).get("armed_state")
-    if (
-        state is None
-        or not state.armed
-        or state.reason != ARM_REASON_MANUAL
-        or state.target_station_id != station_id
-        or owner_token not in state.owner_leases
-    ):
-        return False
-    del state.owner_leases[owner_token]
-    if not state.owner_leases:
+    if state is None or owner not in state.live_owners:
+        return
+    state.live_owners.discard(owner)
+    if not state.live_owners:
         disarm(hass, entry_id)
-    else:
-        state.until_monotonic = max(state.owner_leases.values())
-    return True
+
+
+@callback
+def end_live(hass: HomeAssistant, entry_id: str, station_id: str) -> None:
+    """End a live window after its station hung up the call.
+
+    Stream clients reconnect on their own; leaving the window open would
+    call the station again for a viewer that never asked for it.
+    """
+    state = get_state(hass, entry_id)
+    if state.live_owners and state.target_station_id == station_id:
+        disarm(hass, entry_id)

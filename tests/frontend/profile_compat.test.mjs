@@ -120,8 +120,16 @@ for (const profile of ["mrange_ip_gateway", "m22401_wifi_station"]) {
     installWindowStub();
     const fixture = profileFixture(profile);
     const calls = [];
+    const windows = [];
     fixture.hass.callService = async (domain, service, data) => {
       calls.push({ domain, service, data });
+    };
+    const subscribe = fixture.hass.connection.subscribeMessage;
+    fixture.hass.connection.subscribeMessage = async (callback, message, options) => {
+      if (message.type !== "abb_welcome/live") return subscribe(callback, message, options);
+      const window = { message, releases: 0 };
+      windows.push(window);
+      return () => { window.releases++; };
     };
 
     const card = new AbbWelcomeIntercomCard();
@@ -136,33 +144,20 @@ for (const profile of ["mrange_ip_gateway", "m22401_wifi_station"]) {
     };
 
     assert.deepEqual(calls, []);
+    assert.deepEqual(windows, []);
     assert.equal(card._live, false);
     assert.equal(card._playerEl, null);
     assert.equal(card._webRtc, null);
 
     await card._startLive();
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].domain, "abb_welcome");
-    assert.equal(calls[0].service, "arm_streaming");
-    assert.deepEqual(
-      {
-        entry_id: calls[0].data.entry_id,
-        station_id: calls[0].data.station_id,
-      },
-      fixture.scope
-    );
-    assert.match(calls[0].data.owner_token, /^abbcard-/);
-    assert.equal(calls[0].data.release, undefined);
+    assert.deepEqual(calls, []);
+    assert.deepEqual(windows.map(({ message }) => message), [
+      { type: "abb_welcome/live", ...fixture.scope },
+    ]);
     assert.equal(card._live, true);
 
-    const ownerToken = calls[0].data.owner_token;
     card._stopLive();
-    assert.equal(calls.length, 2);
-    assert.deepEqual(calls[1].data, {
-      ...fixture.scope,
-      owner_token: ownerToken,
-      release: true,
-    });
+    assert.equal(windows[0].releases, 1);
     assert.equal(card._live, false);
     assert.equal(card._playerEl, null);
   });
