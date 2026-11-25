@@ -58,6 +58,7 @@ from .coordinator import (
     ABBWelcomeCoordinator,
     station_screenshot_storage_key,
 )
+from .frontend import async_register_frontend, async_unregister_frontend
 from .message_diagnostics import (
     DEFAULT_MESSAGE_DIAGNOSTICS_SECONDS,
     MAX_MESSAGE_DIAGNOSTICS_SECONDS,
@@ -343,6 +344,14 @@ async def _async_start_rtsp_proxy(
         proxy.last_error or "unknown",
     )
     return proxy
+
+
+async def async_setup(hass: HomeAssistant, _config: dict) -> bool:
+    """Register the authenticated history view once, not on every entry reload."""
+    from .call_history import ABBCallHistoryView
+
+    hass.http.register_view(ABBCallHistoryView())
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -645,6 +654,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         port_changed=bool(entry_data.get("lan_rtsp_port_changed")),
     )
     _async_register_services(hass)
+    await async_register_frontend(hass, entry.entry_id)
     return True
 
 
@@ -1408,6 +1418,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload ABB Welcome config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
+        await async_unregister_frontend(hass, entry.entry_id)
         hass.data[DOMAIN].pop(entry.entry_id, None)
     return unload_ok
 

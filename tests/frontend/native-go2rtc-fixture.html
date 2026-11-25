@@ -1,0 +1,116 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Native microphone loopback fixture</title>
+<video autoplay muted playsinline></video>
+<script type="module">
+import { NativeTalkbackMachine, WebRtcSession } from "/card.js";
+
+const video = document.querySelector("video");
+const params = new URLSearchParams(location.search);
+const progress = (value) => document.body.dataset.result = JSON.stringify(value);
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const stats = () => fetch("/stats").then(r => r.json());
+const check = (condition, label) => { if (!condition) throw Error(label); };
+const until = async (get, label) => {
+  for (let i = 0; i < 70; i++) {
+    const value = await get();
+    if (value) return value;
+    await sleep(100);
+  }
+  throw Error(label);
+};
+
+let ws, pending = [], peer, captureCount = 0, offers = 0, lastSignal = "", phase = "startup";
+const rtc = new WebRtcSession({
+  entityId: "camera.fixture",
+  nativeTalkback: true,
+  callWS: async (message) => {
+    if (message.type === "camera/capabilities") return { two_way_audio: true };
+    if (message.type === "camera/webrtc/candidate") {
+      const candidate = JSON.stringify({ type: "webrtc/candidate", value: message.candidate.candidate });
+      if (ws?.readyState === WebSocket.OPEN) ws.send(candidate);
+      else pending.push(candidate);
+    }
+    return { configuration: { iceServers: [] } };
+  },
+  subscribeMessage(callback, message) {
+    offers++;
+    ws = new WebSocket(`ws://127.0.0.1:${params.get("rtc")}/api/ws?src=abb_fixture`);
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ type: "webrtc/offer", value: message.offer }));
+      callback({ type: "session", session_id: "local-fixture" });
+      for (const candidate of pending.splice(0)) ws.send(candidate);
+    };
+    ws.onmessage = ({ data }) => {
+      const { type, value } = JSON.parse(data);
+      lastSignal = type;
+      if (type === "webrtc/answer") callback({ type: "answer", answer: value });
+      if (type === "webrtc/candidate" && value)
+        callback({ type: "candidate", candidate: { candidate: value, sdpMid: "0" } });
+      if (type === "error") callback({ type: "error", message: "go2rtc returned a signaling error" });
+    };
+    return () => ws.close();
+  },
+  createPeerConnection: (config) => (peer = new RTCPeerConnection(config)),
+  createMediaStream: () => new MediaStream(),
+  onStream(stream) {
+    if (video.srcObject !== stream) {
+      video.srcObject = stream;
+      video.play().catch(() => {});
+    }
+  },
+  onError: (message) => progress({ error: message, phase }),
+});
+let microphone;
+const machine = new NativeTalkbackMachine({
+  session: () => rtc,
+  acquire: async () => {
+    captureCount++;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    microphone = stream.getAudioTracks()[0];
+    return stream;
+  },
+});
+
+try {
+  check(await rtc.start(), "Live signaling did not start");
+  phase = "initial video";
+  await until(() => video.currentTime > 0, "no decoded video");
+  check(rtc.nativeMicReady, "go2rtc answer did not allow sending audio on the initial offer");
+  check(captureCount === 0 && (await stats()).audio === 0, "audio flowed before the hold");
+  machine.setReady(true);
+  const media = video.srcObject;
+  const picture = media.getVideoTracks()[0];
+  const sender = peer.getTransceivers().find(t => t.receiver.track.kind === "audio").sender;
+  const initial = await stats();
+  for (const releaseEvent of ["pointerup", "keyup-space"]) {
+    phase = `hold for ${releaseEvent}`;
+    const silent = await stats();
+    await machine.press();
+    check(machine.state === "talking" && sender.track === microphone, "mic was not attached");
+    await until(async () => (await stats()).audio >= silent.audio + 5, "go2rtc did not return PCMA to ABB RTSP");
+    phase = releaseEvent;
+    machine.notify(releaseEvent);
+    check(microphone.readyState === "ended" && !microphone.enabled, "release did not stop the microphone");
+    await until(() => sender.track === null, "sender still holds a track");
+    await sleep(400); // allow in-flight RTP to reach the RTSP server
+    const released = await stats();
+    const atRelease = video.currentTime;
+    await until(() => video.currentTime > atRelease + 0.35, "video stopped moving after release");
+    const after = await stats();
+    check(after.audio === released.audio, "audio continued after the sender detached");
+    check(video.srcObject === media && picture.readyState === "live" && offers === 1 &&
+      after.plays === initial.plays, "release restarted the video, RTSP, or the WebRTC negotiation");
+  }
+  const after = await stats();
+  progress({ ok: true, captures: captureCount, offers, rtspAudioPackets: after.audio,
+    rtspPlaybackSessions: after.plays, rtspAudioAfterRelease: 0, ongoingVideo: true,
+    releasedMicrophone: microphone.readyState === "ended" });
+} catch (error) {
+  const state = await stats().catch(() => null);
+  progress({ error: error.message, phase, lastSignal, peer: peer?.connectionState, stats: state });
+} finally {
+  machine.dispose();
+  rtc.stop();
+}
+</script>

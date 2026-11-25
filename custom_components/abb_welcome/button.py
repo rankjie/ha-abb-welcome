@@ -97,6 +97,10 @@ class ABBWelcomeDoorButton(ButtonEntity):
             self._attr_name = f"{door['name']} Second lock"
             self._attr_unique_id += "_second_lock"
         self._attr_device_info = device_info
+        self._attr_extra_state_attributes = {
+            "config_entry_id": entry_id,
+            "station_id": _door_station_key(door),
+        }
 
     async def async_press(self) -> None:
         """Unlock the door."""

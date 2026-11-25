@@ -9,6 +9,7 @@ import json
 import socket
 import ssl
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +48,14 @@ POLL_INTERVAL_SECONDS = 30
 HISTORY_PAGE_SIZE = 20
 HISTORY_EVENT_CAP = 200
 SCREENSHOT_HISTORY_TYPE = "com.abb.ispf.event.welcome.screenshot"
+RING_HISTORY_TYPE = "com.abb.ispf.event.welcome.ring"
+CALL_OUTCOME_HISTORY_TYPES = ",".join(
+    f"com.abb.ispf.event.welcome.{kind}"
+    for kind in ("call-answered", "call-missed", "call-terminated")
+)
+CALL_HISTORY_CACHE_SECONDS = 15
+CALL_HISTORY_READ_SECONDS = 10
+CALL_HISTORY_MAX_PAGE_BYTES = 8 * 1024 * 1024
 RING_EVENT_POLL_DELAYS = (2.0, 5.0, 10.0, 20.0)
 STATION_SCREENSHOT_STORAGE_VERSION = 1
 STATION_SCREENSHOT_SAVE_DELAY_SECONDS = 1.0
@@ -71,6 +80,15 @@ class IntercomEvent:
     station_id: str = ""
     local_id: str = ""
     local_name: str = ""
+
+
+class CallHistoryEvents(tuple):
+    """Events with the completeness of the optional photo enrichment."""
+
+    def __new__(cls, events=(), *, photos_incomplete=False):
+        result = super().__new__(cls, events)
+        result.photos_incomplete = photos_incomplete
+        return result
 
 
 @dataclass
@@ -104,6 +122,8 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
         self._cert_pem: bytes = entry.data.get("certificate_pem", "").encode()
         self._key_pem: bytes = entry.data.get("private_key_pem", "").encode()
         self._ring_poll_task: asyncio.Task[None] | None = None
+        self._call_history_lock = asyncio.Lock()
+        self._call_history_cache: dict[bool, tuple[float, tuple[IntercomEvent, ...]]] = {}
         self._screenshot_history_checked = False
         self._portal_url = str(
             entry.data.get("portal_url", DEFAULT_PORTAL_URL) or DEFAULT_PORTAL_URL
@@ -402,6 +422,171 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
         )
         events = self._response_events(response)
         return [event for event in events if self._raw_event_has_screenshot(event)][:1]
+
+    def _decode_event(self, evt: dict[str, Any]) -> IntercomEvent:
+        """Decode one ABB event without guessing its call or station."""
+        event = IntercomEvent(
+            event_id=evt.get("id", ""),
+            event_type=(evt.get("type") or "").rsplit(".", 1)[-1],
+            timestamp=evt.get("timestamp", ""),
+            sender=evt.get("sender", ""),
+            belongs_to=evt.get("belongsTo") or "",
+        )
+        payload_b64 = evt.get("payload", "")
+        if isinstance(payload_b64, str) and payload_b64:
+            try:
+                raw = base64.b64decode(payload_b64 + "=" * (-len(payload_b64) % 4))
+                if raw.startswith(b"\xff\xd8"):
+                    event.image_data = raw
+                else:
+                    event.payload_text = raw.decode("utf-8", "replace")[:500]
+                    payload = json.loads(event.payload_text)
+                    if isinstance(payload, dict):
+                        event.local_id = str(payload.get("local_id", "")).strip()
+                        event.local_name = repair_utf8_mojibake(
+                            str(payload.get("local_name", "")).strip()
+                        )
+                        if event.local_id:
+                            event.station_id = event.local_id.split("@", 1)[
+                                0
+                            ].removeprefix("sip:")
+            except (TypeError, ValueError):
+                pass
+        if event.station_id and not event.local_name:
+            event.local_name = self._station_names.get(event.station_id, "")
+        return event
+
+    def _read_call_history_page(
+        self,
+        session: requests.Session,
+        types: str,
+        page: int,
+        limit: int,
+        deadline: float,
+    ) -> list[IntercomEvent]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise requests.Timeout("ABB call history read budget expired")
+        with session.get(
+            f"{self._portal_url}/event",
+            params={
+                "type": types,
+                "order": "desc",
+                "pagination_limit": limit,
+                "pagination_page": page,
+            },
+            stream=True,
+            allow_redirects=False,
+            timeout=min(4, remaining),
+        ) as response:
+            response.raise_for_status()
+            raw = bytearray()
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if time.monotonic() >= deadline:
+                    raise requests.Timeout("ABB call history read budget expired")
+                if len(raw) + len(chunk) > CALL_HISTORY_MAX_PAGE_BYTES:
+                    raise ValueError("ABB call history page exceeds size limit")
+                raw.extend(chunk)
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise TypeError("Invalid ABB call history response")
+        items = payload.get("events")
+        if items is None:
+            return []
+        if not isinstance(items, list):
+            raise TypeError("Invalid ABB call history event list")
+        allowed_types = set(types.split(","))
+        return [
+            self._decode_event(item)
+            for item in items[:limit]
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and 0 < len(item["id"]) <= 256
+            and isinstance(item.get("type"), str)
+            and item["type"] in allowed_types
+            and isinstance(item.get("belongsTo"), (str, type(None)))
+        ]
+
+    def _fetch_portal_call_history(
+        self, include_photos: bool
+    ) -> tuple[IntercomEvent, ...]:
+        """Read recent rings and bounded pages of related events independently."""
+        deadline = time.monotonic() + CALL_HISTORY_READ_SECONDS
+        session, tmp_paths = self._make_session()
+        try:
+            rings = self._read_call_history_page(
+                session, RING_HISTORY_TYPE, 1, 20, deadline
+            )
+            if not rings:
+                return ()
+            events = list(rings)
+            ring_times = [self._timestamp_seconds(ring.timestamp) for ring in rings]
+            oldest_ring = min(
+                (stamp for stamp in ring_times if stamp is not None), default=None
+            )
+            groups = [(CALL_OUTCOME_HISTORY_TYPES, 20, 4)]
+            if include_photos:
+                groups.append((SCREENSHOT_HISTORY_TYPE, 10, 3))
+            photos_incomplete = False
+            for types, limit, max_pages in groups:
+                # Each bounded enrichment gets its own budget. A slow outcome
+                # lookup must not consume the photo lookup's entire budget.
+                deadline = time.monotonic() + CALL_HISTORY_READ_SECONDS
+                for page in range(1, max_pages + 1):
+                    try:
+                        related = self._read_call_history_page(
+                            session, types, page, limit, deadline
+                        )
+                    except (requests.RequestException, ValueError, TypeError):
+                        # Unavailable enrichment must not hide verified rings.
+                        if types == SCREENSHOT_HISTORY_TYPE:
+                            photos_incomplete = True
+                        break
+                    events.extend(related)
+                    oldest_related = (
+                        self._timestamp_seconds(related[-1].timestamp)
+                        if related
+                        else None
+                    )
+                    if len(related) < limit or (
+                        oldest_ring is not None
+                        and oldest_related is not None
+                        and oldest_related < oldest_ring
+                    ):
+                        break
+            return CallHistoryEvents(events, photos_incomplete=photos_incomplete)
+        finally:
+            session.close()
+            self._cleanup(tmp_paths)
+
+    async def async_fetch_call_history(
+        self, include_photos: bool, *, allow_partial: bool = False,
+        force_refresh: bool = False,
+    ) -> tuple[IntercomEvent, ...]:
+        """Coalesce reads during a short, in-memory cache window; no archive."""
+        async with self._call_history_lock:
+            cached = self._call_history_cache.get(include_photos)
+            if (not force_refresh and cached is not None
+                and time.monotonic() < cached[0]
+                and (allow_partial or not getattr(cached[1], "photos_incomplete", False))):
+                return cached[1]
+            events = await self.hass.async_add_executor_job(
+                self._fetch_portal_call_history, include_photos
+            )
+            expires_at = time.monotonic() + CALL_HISTORY_CACHE_SECONDS
+            self._call_history_cache[include_photos] = (expires_at, events)
+            asyncio.get_running_loop().call_later(
+                CALL_HISTORY_CACHE_SECONDS,
+                self._expire_call_history,
+                include_photos,
+                expires_at,
+            )
+            return events
+
+    def _expire_call_history(self, include_photos: bool, expires_at: float) -> None:
+        cached = self._call_history_cache.get(include_photos)
+        if cached is not None and cached[0] == expires_at:
+            self._call_history_cache.pop(include_photos, None)
 
     @staticmethod
     def _deduplicate_events(events: list[IntercomEvent]) -> list[IntercomEvent]:

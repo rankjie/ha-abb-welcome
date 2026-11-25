@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="it">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ABB card — offline verification</title>
+<style>
+  :root { font: 14px system-ui; color-scheme: light; --primary-text-color:#141414; --secondary-text-color:#5e5e5e; --primary-color:#0076ad; --secondary-background-color:#e5e5e5; --divider-color:#ccc; --error-color:#b3261e; --success-color:#13763d; --warning-color:#ffd66a; --text-primary-color:#141414; }
+  body { margin:16px; background:#fafafa; color:var(--primary-text-color); }
+  body.dark { color-scheme:dark; background:#111; --primary-text-color:#eee; --secondary-text-color:#bbb; --secondary-background-color:#303030; --divider-color:#555; --primary-color:#006997; }
+  ha-card { display:block; border:1px solid var(--divider-color); border-radius:14px; background:Canvas; }
+  .tools { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:16px; }
+  label { display:flex; flex-direction:column; gap:4px; }
+  select, button { font:inherit; min-height:32px; }
+  main { width:min(100%,500px); }
+  #events { white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; }
+  .notice { max-width:600px; }
+</style>
+<h1>Verifica offline</h1>
+<p class="notice">Solo simulazione locale. Nessuna connessione a Home Assistant, nessun microfono reale e nessun comando al citofono.</p>
+<div class="tools">
+  <label>Lingua<select id="language"><option value="it">Italiano</option><option value="en">English</option></select></label>
+  <label>Tema<select id="theme"><option value="light">Chiaro</option><option value="dark">Scuro</option></select></label>
+  <label>Scenario<select id="scenario"><option value="live">Video sintetico</option><option value="no-frames">Nessun frame</option><option value="http">Microfono HTTP</option><option value="ring">Squillo simulato</option><option value="autoplay">Autoplay bloccato</option></select></label>
+  <button id="freeze">Congela video sintetico</button>
+</div>
+<main><abb-welcome-intercom-card></abb-welcome-intercom-card></main>
+<p>Servizi simulati:</p><pre id="events">Nessuno</pre>
+<script type="module">
+  import { AbbWelcomeIntercomCard } from '../../custom_components/abb_welcome/frontend/abb-welcome-intercom-card.js?v=local-review';
+  customElements.define('ha-card', class extends HTMLElement {
+    constructor() {
+      super();
+      this.attachShadow({mode:'open'}).innerHTML='<style>:host{display:block;border:1px solid var(--divider-color);border-radius:14px;background:Canvas}</style><slot></slot>';
+    }
+  });
+  const card = document.querySelector('abb-welcome-intercom-card');
+  const events = document.querySelector('#events');
+  const language = document.querySelector('#language');
+  const scenario = document.querySelector('#scenario');
+  const canvas = document.createElement('canvas');
+  canvas.width = 640; canvas.height = 360;
+  const context = canvas.getContext('2d');
+  let frames = 0, frozen = false;
+  const syntheticStream = canvas.captureStream(5);
+  setInterval(() => {
+    if (frozen) return;
+    context.fillStyle = frames % 2 ? '#183a49' : '#214758';
+    context.fillRect(0,0,640,360);
+    context.fillStyle = '#fff'; context.font = '26px system-ui';
+    context.fillText('VIDEO SINTETICO — OFFLINE',60,140);
+    context.fillText(`Frame ${++frames}`,60,200);
+  },200);
+  // Synthetic audio stays inside a MediaStream destination, never speakers.
+  const micContext = new AudioContext();
+  const micDestination = micContext.createMediaStreamDestination();
+  const tone = micContext.createOscillator(); tone.frequency.value=220;
+  tone.connect(micDestination); tone.start();
+  Object.defineProperty(navigator, 'mediaDevices', { configurable:true, value:{
+    getUserMedia: async () => { await micContext.resume(); return micDestination.stream.clone(); },
+  }});
+  const calls=[];
+  const hass = {
+    language:'it', connected:true,
+    states:{
+      'camera.fixture': {state:'idle',attributes:{friendly_name:'ABB Welcome Gateway Posto esterno 1-1',config_entry_id:'offline-entry',station_id:'front',talkback_ready:true}},
+      'button.fixture': {state:'idle',attributes:{friendly_name:'Ingresso principale',station_id:'front'}},
+      'binary_sensor.fixture': {state:'off',attributes:{station_id:'front'}},
+    },
+    entities:{'camera.fixture':{device_id:'offline',platform:'abb_welcome'}},
+    devices:{offline:{primary_config_entry:'offline-entry'}},
+    callService:async (domain,service,data)=>{ calls.push({service,target:data.entity_id||data.station_id,...(data.release?{release:true}:{})}); events.textContent=JSON.stringify(calls,null,2); },
+    callWS:async()=>({configuration:{}}),
+    connection:{ connected:true, subscribeMessage:async()=>()=>{} },
+  };
+  class SyntheticPeer {
+    constructor(){ this.iceConnectionState='connected'; this.connectionState='connected'; this.signalingState='stable'; }
+    addTransceiver(){} createDataChannel(){}
+    async createOffer(){return {type:'offer',sdp:'offline'};}
+    async setLocalDescription(){
+      if(scenario.value==='no-frames')return;
+      // A muted element's native autoplay does not call the JS play override.
+      if(scenario.value==='autoplay')card.shadowRoot.querySelector('video').autoplay=false;
+      setTimeout(()=>this.ontrack?.({track:syntheticStream.getVideoTracks()[0].clone()}),250);
+    }
+    close(){this.connectionState='closed';}
+  }
+  window.RTCPeerConnection=SyntheticPeer;
+  card.setConfig({camera:'camera.fixture',unlock_button:'button.fixture',ring_sensor:'binary_sensor.fixture'});
+  const actualPlay=HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play=function(){
+    if(scenario.value==='autoplay')return Promise.reject(new DOMException('Offline autoplay test','NotAllowedError'));
+    return actualPlay.call(this);
+  };
+  function refresh(){
+    card._stopLive(); frozen=false; calls.length=0; events.textContent='Nessuno';
+    hass.language=language.value; document.documentElement.lang=language.value;
+    hass.states['binary_sensor.fixture'].state=scenario.value==='ring'?'on':'off';
+    card.hass={...hass};
+    card._machine.setSupport(scenario.value==='http'?{ok:false,reason:'insecure-context'}:{ok:true});
+  }
+  language.onchange=refresh; scenario.onchange=refresh;
+  document.querySelector('#theme').onchange=e=>document.body.classList.toggle('dark',e.target.value==='dark');
+  document.querySelector('#freeze').onclick=()=>{frozen=!frozen;};
+  refresh();
+</script>
+</html>
