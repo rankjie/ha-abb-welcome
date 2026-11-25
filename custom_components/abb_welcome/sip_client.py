@@ -1216,8 +1216,14 @@ class SIPClient:
         door: Mapping[str, object] | str,
         body: str | None = None,
         timeout: float = 5.0,
+        *,
+        force_fast: bool = False,
     ) -> bool:
-        """Unlock a door using the correct MRANGE path."""
+        """Unlock a door using the correct MRANGE path.
+
+        force_fast sends the plain MESSAGE whatever the strategy; the caller
+        sets it while this station rings unanswered and so is busy for INVITE.
+        """
         try:
             spec = self._normalize_door(door, body)
         except ValueError as err:
@@ -1227,6 +1233,6 @@ class SIPClient:
         info_body = self._dtmf_info_body(spec)
         if info_body is not None:
             return self._unlock_via_invite(spec, timeout, info_body)
-        if self._use_fast_route(spec):
+        if force_fast or self._use_fast_route(spec):
             return self._unlock_fast(spec, timeout)
         return self._unlock_via_invite(spec, timeout)
