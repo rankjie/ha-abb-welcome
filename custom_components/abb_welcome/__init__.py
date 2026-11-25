@@ -80,6 +80,7 @@ from .streaming_state import (
     arm,
     disarm,
     is_pickup_allowed,
+    release_manual_arm,
     set_pickup_allowed,
     set_preview_before_answer,
 )
@@ -1118,6 +1119,17 @@ def _async_register_services(hass: HomeAssistant) -> None:
             target_entry_id = call.data.get("entry_id")
             station_id = str(call.data.get("station_id") or "").strip()
             duration = float(call.data.get("duration") or MANUAL_ARM_SECONDS)
+            owner_token = str(call.data.get("owner_token") or "").strip()
+            release = bool(call.data.get("release", False))
+            renew = bool(call.data.get("renew", False))
+            if release and renew:
+                raise HomeAssistantError("Release and renew are mutually exclusive")
+            if (owner_token or release or renew) and not (
+                target_entry_id and station_id and owner_token
+            ):
+                raise HomeAssistantError(
+                    "Owned arms require entry_id, station_id and owner_token"
+                )
             entries = hass.data.get(DOMAIN, {})
             if not entries:
                 raise ValueError("No ABB Welcome config entries are loaded")
@@ -1128,13 +1140,23 @@ def _async_register_services(hass: HomeAssistant) -> None:
             else:
                 entry_ids = list(entries.keys())
             for eid in entry_ids:
-                arm(
-                    hass,
-                    eid,
-                    reason=ARM_REASON_MANUAL,
-                    duration=duration,
-                    station_id=station_id,
-                )
+                if release:
+                    release_manual_arm(
+                        hass, eid, station_id=station_id, owner_token=owner_token
+                    )
+                    continue
+                try:
+                    arm(
+                        hass,
+                        eid,
+                        reason=ARM_REASON_MANUAL,
+                        duration=duration,
+                        station_id=station_id,
+                        owner_token=owner_token,
+                        renew=renew,
+                    )
+                except ValueError as err:
+                    raise HomeAssistantError(str(err)) from err
 
         hass.services.async_register(
             DOMAIN,
@@ -1144,6 +1166,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 {
                     vol.Optional("entry_id"): str,
                     vol.Optional("station_id"): str,
+                    vol.Optional("owner_token"): str,
+                    vol.Optional("release", default=False): bool,
+                    vol.Optional("renew", default=False): bool,
                     vol.Optional("duration"): vol.All(
                         vol.Coerce(float), vol.Range(min=5, max=600)
                     ),

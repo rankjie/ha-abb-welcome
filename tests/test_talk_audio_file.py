@@ -451,6 +451,7 @@ class TestCoordinatorTalkbackAudioFile(unittest.IsolatedAsyncioTestCase):
             camera_mod.StationStreamCoordinator
         )
         coord._stream_lock = asyncio.Lock()
+        coord._stream_generation = 0
         coord._rtsp_play_sessions = []
         coord._active_file_playbacks = 0
         coord._close_task = None

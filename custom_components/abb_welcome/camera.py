@@ -390,6 +390,7 @@ class StationStreamCoordinator:
         self._close_task: asyncio.Task | None = None
         self._answer_task: asyncio.Task | None = None
         self._talkback_owner = ""
+        self._stream_generation = 0
         self._state_callbacks: list[Callable[[], None]] = []
         self.session = StreamSession(
             dialer=dialer,
@@ -471,6 +472,7 @@ class StationStreamCoordinator:
         self._close_task = None
 
     async def attach_rtsp_session(self, sess: RtspSession) -> bool:
+        generation = self._stream_generation
         self._cancel_close_task()
         _LOGGER.info(
             "[abb] stream coordinator: attach RTSP session station=%s "
@@ -488,6 +490,14 @@ class StationStreamCoordinator:
         self._notify_state()
         try:
             async with self._stream_lock:
+                if (
+                    generation != self._stream_generation
+                    or sess not in self._rtsp_play_sessions
+                ):
+                    return False
+                if sess.writer.is_closing():
+                    self.detach_rtsp_session(sess)
+                    return False
                 if not self.session.active:
                     await self.session.open()
         except Exception:
@@ -528,6 +538,8 @@ class StationStreamCoordinator:
         self._notify_state()
 
     def _on_gateway_call_ended(self, call_id: str, reason: str) -> None:
+        self._talkback_owner = ""
+        self._stream_generation += 1
         if reason == "remote_cancel":
             # The previewed ring is over, typically because another station
             # picked up. Stream clients reconnect on their own, and while the
@@ -554,14 +566,19 @@ class StationStreamCoordinator:
             sess.close()
         self._notify_state()
 
-    async def force_close(self) -> None:
-        self._cancel_close_task()
-        self._rtsp_play_sessions = []
-        self.session.set_packet_handlers(on_video=None, on_audio=None)
+    async def force_close(self, *, only_if: Callable[[], bool] | None = None) -> None:
         async with self._stream_lock:
+            if only_if is not None and not only_if():
+                return
+            self._cancel_close_task()
+            self._stream_generation += 1
+            self._talkback_owner = ""
+            for client in self._rtsp_play_sessions:
+                client.close()
+            self._rtsp_play_sessions = []
+            self.session.set_packet_handlers(on_video=None, on_audio=None)
             if self.session.active:
                 await self.session.close()
-        self._talkback_owner = ""
         self._notify_state()
 
     def _schedule_close(self) -> None:
@@ -585,9 +602,12 @@ class StationStreamCoordinator:
         async with self._stream_lock:
             if self._has_active_consumers or self.session.previewing:
                 return
+            # Only the grace period is cancellable. Once hangup starts, new
+            # attaches wait on this lock until cleanup has fully completed.
+            self._close_task = None
             if self.session.active:
+                self._talkback_owner = ""
                 await self.session.close()
-        self._talkback_owner = ""
         self._notify_state()
 
     def _add_rtsp_play_session(self, sess: RtspSession) -> None:
@@ -876,6 +896,8 @@ class ABBWelcomeCamera(Camera):
         snapshot = self._station_screenshot()
         armed_state = get_state(self.hass, self._entry_id)
         attrs: dict[str, Any] = {
+            "config_entry_id": self._entry_id,
+            "station_id": self._station_id(),
             "go2rtc_stream": self._stream_name,
             "rtsp_url": self._rtsp.url if self._rtsp.port else "",
             "lan_rtsp_url": self._lan_rtsp_url(),
@@ -1085,11 +1107,9 @@ class ABBWelcomeCamera(Camera):
         self.async_write_ha_state()
 
     async def _force_teardown(self) -> None:
-        await self._rtsp.stop()
-        await self._coordinator.force_close()
-        # Restart server so future connections still work.
-        await self._rtsp.start()
-        await self._register_with_go2rtc()
+        # Recheck under the media lock: a newer arm may supersede this queued
+        # teardown. Keep the listener/URL stable and close only its consumers.
+        await self._coordinator.force_close(only_if=lambda: not self._stream_allowed())
         self.async_write_ha_state()
 
     # ------------------------------------------------------------------ #
@@ -1255,7 +1275,8 @@ class ABBWelcomeCamera(Camera):
             return
 
         try:
-            await self._coordinator.attach_rtsp_session(sess)
+            if not await self._coordinator.attach_rtsp_session(sess):
+                return
         except GatewayBusyError as err:
             # Expected while clients reconnect after the gateway ended a call.
             _LOGGER.info(
