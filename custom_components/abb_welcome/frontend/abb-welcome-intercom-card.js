@@ -786,9 +786,12 @@ export class NativeTalkbackMachine {
       if (current()) this._set("talking");
     } catch (err) {
       // The permission prompt often ends the hold before the user denies it,
-      // so a released hold still reports its failure. A newer hold owns the
-      // state instead.
-      if (this._disposed || (this._hold !== hold && this._hold !== null)) return;
+      // so a released hold still reports its failure. A newer hold or an
+      // ended Live owns the state instead.
+      if (
+        this._disposed || !this._ready || this._session() !== session ||
+        (this._hold !== hold && this._hold !== null)
+      ) return;
       if (this._hold === hold) this._release();
       const micDenied = err?.name === "NotAllowedError" || err?.name === "SecurityError";
       this._set(micDenied ? "mic_denied" : "error", err?.message || String(err));

@@ -216,6 +216,19 @@ test("a denial after the permission prompt ended the hold is still reported", as
   assert.equal(h.machine.state, "mic_denied");
 });
 
+test("a denial after Live ended leaves Talk blocked", async () => {
+  const h = setup();
+  await h.rtc.start();
+  await h.answer();
+  const prompt = deferred();
+  h.capture(() => prompt.promise);
+  const hold = h.machine.press();
+  h.machine.setReady(false);
+  prompt.reject(Object.assign(Error("denied"), { name: "NotAllowedError" }));
+  await hold;
+  assert.equal(h.machine.state, "blocked");
+});
+
 test("a newer hold owns the state when an older permission prompt fails", async () => {
   const h = setup();
   await h.rtc.start();
