@@ -107,6 +107,9 @@ class ABBWelcomeDoorButton(ButtonEntity):
             # An unanswered ring (also one HA previews) holds the gateway's
             # only call slot, so an INVITE gets 486 Busy. A plain MESSAGE works
             # like the panel's unlock key during the ring and opens this station.
+            _LOGGER.info(
+                "[abb] Pressed during an unanswered ring: forcing the fast route"
+            )
             success = await self.hass.async_add_executor_job(
                 partial(self._sip_client.unlock_door, self._door, force_fast=True)
             )
@@ -124,7 +127,7 @@ class ABBWelcomeDoorButton(ButtonEntity):
         """Return whether this station itself has an unanswered ring."""
         listener = self.hass.data[DOMAIN][self._entry_id].get("sip_listener")
         return listener is not None and listener.is_station_ringing_unanswered(
-            self._sip_client._extract_station_id(self._door)
+            self._sip_client.door_station_id(self._door)
         )
 
     async def _unlock_in_active_call(self, body: str | None) -> bool | None:

@@ -930,12 +930,12 @@ class SIPClient:
 
     def _derive_first_station_id(self, doors: list[dict]) -> str:
         for door in doors:
-            station_id = self._extract_station_id(door)
+            station_id = self.door_station_id(door)
             if station_id:
                 return station_id
         return ""
 
-    def _extract_station_id(self, door: Mapping[str, object]) -> str:
+    def door_station_id(self, door: Mapping[str, object]) -> str:
         station_id = str(door.get("station_id", "")).strip()
         if station_id:
             return station_id
@@ -955,7 +955,7 @@ class SIPClient:
             if body_override is not None:
                 raw["body"] = body_override
 
-        station_id = self._extract_station_id(raw)
+        station_id = self.door_station_id(raw)
         if not station_id:
             raise ValueError("could not determine door station id")
 

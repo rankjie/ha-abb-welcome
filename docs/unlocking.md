@@ -18,7 +18,10 @@ target:
 
 Second-lock buttons always establish a targeted call, send the MRANGE second-lock
 command `a`, and hang up, including when Fast or Hybrid is selected. The first
-lock keeps the selected strategy. Second-lock availability comes from the
+lock keeps the selected strategy, except while its own station rings
+unanswered: the ring holds the gateway's only call slot, so an `INVITE` gets
+`486 Busy Here`, and the first lock sends the plain `MESSAGE` instead, which
+opens the ringing station. Second-lock availability comes from the
 gateway device list or the pairing ACL's `secondunlock` flag. Reload the
 integration or run `abb_welcome.refresh_doors` after changing this setting on a
 web-admin gateway; app-managed topology changes require re-pairing.
