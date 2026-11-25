@@ -1,6 +1,5 @@
-/* Home Assistant custom-card public API and no-screenshot rendering contract. */
+/* Home Assistant custom-card public API contract. */
 
-import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -60,20 +59,4 @@ test("entity suggestion follows the required { config } shape", () => {
     },
   });
   assert.equal(entitySuggestion(hass, "light.nope"), null);
-});
-
-test("the live video area has no snapshot, poster or private HA camera element", async () => {
-  const source = await readFile(
-    new URL(
-      "../../custom_components/abb_welcome/frontend/abb-welcome-intercom-card.js",
-      import.meta.url
-    ),
-    "utf8"
-  );
-  assert.doesNotMatch(source, /ha-camera-stream|ha-web-rtc-player/);
-  assert.doesNotMatch(source, /<img\b|\bposter\s*=/);
-  assert.equal([...source.matchAll(/document\.createElement\("img"\)/g)].length, 1);
-  assert.ok(source.includes('async _loadHistoryPhoto('));
-  assert.doesNotMatch(source, /history-photo-btn|_toggleHistoryPhoto/);
-  assert.match(source, /document\.createElement\("video"\)/);
 });

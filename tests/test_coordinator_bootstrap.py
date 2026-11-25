@@ -280,6 +280,40 @@ def test_photo_budget_survives_slow_outcomes_and_partial_is_not_cached(monkeypat
     assert seen.count(coordinator_module.SCREENSHOT_HISTORY_TYPE) == 2
 
 
+def test_photo_requests_reuse_a_read_as_old_as_the_row_cache(monkeypatch):
+    instance = _coordinator(types.SimpleNamespace(close=lambda: None))
+    clock = [0.0]
+    monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: clock[0])
+    reads = []
+
+    def fetch(include_photos):
+        reads.append(include_photos)
+        return (coordinator_module.IntercomEvent(f"ring-{len(reads)}", "ring", "", ""),)
+
+    instance._fetch_portal_call_history = fetch
+    instance._call_history_lock = asyncio.Lock()
+    instance._call_history_cache = {}
+
+    async def executor(func, *args):
+        return func(*args)
+
+    instance.hass = types.SimpleNamespace(async_add_executor_job=executor)
+
+    async def run():
+        rows = await instance.async_fetch_call_history(True)
+        clock[0] = coordinator_module.CALL_HISTORY_PHOTO_CACHE_SECONDS - 1
+        assert await instance.async_fetch_call_history(True, allow_partial=True) is rows
+        assert len(reads) == 1
+        # A row request after the short window reads the portal again.
+        assert await instance.async_fetch_call_history(True) is not rows
+        assert len(reads) == 2
+        clock[0] += coordinator_module.CALL_HISTORY_PHOTO_CACHE_SECONDS
+        await instance.async_fetch_call_history(True, allow_partial=True)
+        assert len(reads) == 3
+
+    asyncio.run(run())
+
+
 def test_portal_event_queries_use_configured_regional_url() -> None:
     session = _Session([[], []])
     instance = _coordinator(session)

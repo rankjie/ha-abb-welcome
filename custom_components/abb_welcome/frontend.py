@@ -118,7 +118,10 @@ async def async_register_frontend(hass: HomeAssistant, entry_id: str) -> bool:
                 state.route_registered = True
 
             ha_frontend.add_extra_js_url(hass, url)
-        except Exception:  # frontend setup is intentionally optional
+        # Unreadable card or manifest (OSError, ValueError), a missing asset
+        # directory (ValueError) or an unavailable static-path API
+        # (RuntimeError). Anything else is a bug and fails the setup.
+        except (OSError, ValueError, RuntimeError):
             _LOGGER.warning(
                 "Unable to register the ABB Welcome Lovelace card; "
                 "the backend integration will remain available",
@@ -160,7 +163,7 @@ async def async_unregister_frontend(hass: HomeAssistant, entry_id: str) -> bool:
 
         try:
             remove_extra_js_url(hass, state.url)
-        except Exception:  # frontend teardown is intentionally optional
+        except ValueError:  # the URL was already removed
             _LOGGER.warning(
                 "Unable to unregister the ABB Welcome Lovelace card; "
                 "backend unload will continue",

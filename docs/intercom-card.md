@@ -10,8 +10,14 @@ unlock action. The expandable call history is independent of Live.
 The integration registers the card when an ABB config entry loads. Refresh the
 dashboard, add **ABB Welcome Intercom**, and choose an ABB camera. The editor
 offers an optional title, unlock button, ring sensor and station identifier.
-The version badge shows the integration version and a fingerprint of the card
-so you can confirm which build the browser loaded.
+The browser console logs the loaded card version.
+
+Home Assistant loads the card's module (about 2,500 lines of JavaScript) on
+every dashboard page for every user while an ABB Welcome entry is loaded,
+whether or not a dashboard uses the card.
+
+The card's text is in English and Italian. Every other Home Assistant
+language shows the English text.
 
 The automatic suggestions use the integration's entity metadata to avoid
 guessing across stations. An explicit `unlock_button` override is intentional:
@@ -59,6 +65,13 @@ The initial connection waits up to 15 seconds for a first frame. Once playback
 has started, a 10-second stall is treated as an error. These are UI safety
 boundaries, not evidence that a physical station or its network is healthy.
 
+Live holds a 60-second streaming lease for its station through
+`abb_welcome.arm_streaming` and renews it every 20 seconds while it runs.
+Closing the dashboard stops the renewals, so the station is released within a
+minute. If a ring or the **Streaming enabled** switch already armed the
+station, Live uses that window and ends with it. When the integration refuses
+a renewal, Live stops and says that the live view ended.
+
 Street audio is controlled by the speaker button and is independent from the
 microphone. The speaker may be turned on or off without changing talkback.
 
@@ -86,7 +99,8 @@ The card uses Home Assistant's native two-way WebRTC audio. For a camera with
 the ABB RTSP backchannel enabled, HA can route the microphone through go2rtc
 to the intercom. No audio is captured before the first hold. **Microphone on**
 means the browser attached a track; it does not prove that the visitor heard
-it. A permission denial can be retried on a later hold. If the camera or HA
+it. A permission denial or microphone error stays shown after you release
+Talk and can be retried on a later hold. If the camera or HA
 cannot negotiate a microphone channel, Live and listening still work, but Talk
 is unavailable. The card does not fall back to the ABB PCM services.
 Set `native_talkback: false` in the card YAML to disable the microphone control.
@@ -125,9 +139,8 @@ clears the displayed images from the card.
 
 ## Accessibility and narrow layouts
 
-All controls retain keyboard focus indicators and reachable names. The header
-keeps the version badge visible without obscuring the title on narrow screens;
-the title wraps before controls overlap. The confirmation controls wrap for
+All controls retain keyboard focus indicators and reachable names. On narrow
+screens the title wraps before the header controls overlap. The confirmation controls wrap for
 narrow mobile widths rather than overflowing the card.
 
 ## Tests

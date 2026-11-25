@@ -76,7 +76,6 @@ class FakeRoot extends FakeNode {
     for (const selector of [
       ".name",
       ".ring-badge",
-      ".version-badge",
       ".media",
       ".placeholder",
       ".placeholder-text",

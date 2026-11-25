@@ -54,6 +54,9 @@ CALL_OUTCOME_HISTORY_TYPES = ",".join(
     for kind in ("call-answered", "call-missed", "call-terminated")
 )
 CALL_HISTORY_CACHE_SECONDS = 15
+# Photos are requested lazily for rows the card may have loaded minutes ago,
+# so a photo request reuses a read this old instead of re-reading the portal.
+CALL_HISTORY_PHOTO_CACHE_SECONDS = 5 * 60
 CALL_HISTORY_READ_SECONDS = 10
 CALL_HISTORY_MAX_PAGE_BYTES = 8 * 1024 * 1024
 RING_EVENT_POLL_DELAYS = (2.0, 5.0, 10.0, 20.0)
@@ -123,6 +126,7 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
         self._key_pem: bytes = entry.data.get("private_key_pem", "").encode()
         self._ring_poll_task: asyncio.Task[None] | None = None
         self._call_history_lock = asyncio.Lock()
+        # include_photos -> (monotonic read time, events)
         self._call_history_cache: dict[bool, tuple[float, tuple[IntercomEvent, ...]]] = {}
         self._screenshot_history_checked = False
         self._portal_url = str(
@@ -564,28 +568,31 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
         force_refresh: bool = False,
     ) -> tuple[IntercomEvent, ...]:
         """Coalesce reads during a short, in-memory cache window; no archive."""
+        max_age = (
+            CALL_HISTORY_PHOTO_CACHE_SECONDS if allow_partial else CALL_HISTORY_CACHE_SECONDS
+        )
         async with self._call_history_lock:
             cached = self._call_history_cache.get(include_photos)
             if (not force_refresh and cached is not None
-                and time.monotonic() < cached[0]
+                and time.monotonic() - cached[0] < max_age
                 and (allow_partial or not getattr(cached[1], "photos_incomplete", False))):
                 return cached[1]
             events = await self.hass.async_add_executor_job(
                 self._fetch_portal_call_history, include_photos
             )
-            expires_at = time.monotonic() + CALL_HISTORY_CACHE_SECONDS
-            self._call_history_cache[include_photos] = (expires_at, events)
+            read_at = time.monotonic()
+            self._call_history_cache[include_photos] = (read_at, events)
             asyncio.get_running_loop().call_later(
-                CALL_HISTORY_CACHE_SECONDS,
+                CALL_HISTORY_PHOTO_CACHE_SECONDS,
                 self._expire_call_history,
                 include_photos,
-                expires_at,
+                read_at,
             )
             return events
 
-    def _expire_call_history(self, include_photos: bool, expires_at: float) -> None:
+    def _expire_call_history(self, include_photos: bool, read_at: float) -> None:
         cached = self._call_history_cache.get(include_photos)
-        if cached is not None and cached[0] == expires_at:
+        if cached is not None and cached[0] == read_at:
             self._call_history_cache.pop(include_photos, None)
 
     @staticmethod
@@ -647,45 +654,10 @@ class ABBWelcomeCoordinator(DataUpdateCoordinator[ABBWelcomeData]):
             newest_screenshot_id = ""
 
             for evt in raw_events:
-                etype = (evt.get("type") or "").rsplit(".", 1)[-1]
-                event_id = evt.get("id", "")
-                payload_b64 = evt.get("payload", "")
-
-                ie = IntercomEvent(
-                    event_id=event_id,
-                    event_type=etype,
-                    timestamp=evt.get("timestamp", ""),
-                    sender=evt.get("sender", ""),
-                    belongs_to=evt.get("belongsTo", ""),
-                )
-
-                if payload_b64:
-                    try:
-                        pad = "=" * (-len(payload_b64) % 4)
-                        raw = base64.b64decode(payload_b64 + pad)
-                        if raw[:2] == b"\xff\xd8":
-                            ie.image_data = raw
-                            if not newest_screenshot:
-                                newest_screenshot = raw
-                                newest_screenshot_id = event_id
-                        else:
-                            ie.payload_text = raw.decode("utf-8", "replace")[:500]
-                            payload = json.loads(ie.payload_text)
-                            if isinstance(payload, dict):
-                                ie.local_id = str(payload.get("local_id", "")).strip()
-                                ie.local_name = repair_utf8_mojibake(
-                                    str(payload.get("local_name", "")).strip()
-                                )
-                                if ie.local_id:
-                                    ie.station_id = ie.local_id.split("@", 1)[
-                                        0
-                                    ].removeprefix("sip:")
-                    except Exception:
-                        pass
-
-                if ie.station_id and not ie.local_name:
-                    ie.local_name = self._station_names.get(ie.station_id, "")
-
+                ie = self._decode_event(evt)
+                if ie.image_data and not newest_screenshot:
+                    newest_screenshot = ie.image_data
+                    newest_screenshot_id = ie.event_id
                 polled_events.append(ie)
 
             station_match_events = polled_events + self._data.events

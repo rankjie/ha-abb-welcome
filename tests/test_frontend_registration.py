@@ -148,7 +148,7 @@ def test_unload_removes_module_only_after_last_entry(frontend) -> None:
 
 def test_unregister_failure_is_contained_and_retryable(frontend) -> None:
     hass = _RecordingHass()
-    remove_url = MagicMock(side_effect=[RuntimeError("frontend busy"), None])
+    remove_url = MagicMock(side_effect=[ValueError("url not registered"), None])
     frontend.ha_frontend.remove_extra_js_url = remove_url
     assert asyncio.run(frontend.async_register_frontend(hass, "entry-a")) is True
     assert asyncio.run(frontend.async_unregister_frontend(hass, "entry-a")) is False
@@ -224,3 +224,10 @@ def test_manifest_failure_is_contained_and_retryable(frontend) -> None:
         assert asyncio.run(frontend.async_register_frontend(hass, "entry-a")) is False
         assert asyncio.run(frontend.async_register_frontend(hass, "entry-a")) is True
     frontend.ha_frontend.add_extra_js_url.assert_called_once()
+
+
+def test_unexpected_registration_errors_are_not_hidden(frontend) -> None:
+    hass = _RecordingHass()
+    frontend.ha_frontend.add_extra_js_url = MagicMock(side_effect=KeyError("frontend"))
+    with pytest.raises(KeyError):
+        asyncio.run(frontend.async_register_frontend(hass, "entry-a"))

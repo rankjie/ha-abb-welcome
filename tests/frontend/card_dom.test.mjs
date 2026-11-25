@@ -78,7 +78,6 @@ class FakeRoot extends FakeNode {
       [
         ".name",
         ".ring-badge",
-        ".version-badge",
         ".media",
         ".placeholder",
         ".placeholder-text",
@@ -388,20 +387,6 @@ test("native video unmute and mic-denied retry work through the real card", asyn
   card._mountPlayer();
   card._live = "starting";
   card._render();
-  const headerMarkup =
-    card.shadowRoot.innerHTML.match(
-      /<div class="header">([\s\S]*?)<\/div>/
-    )?.[1] || "";
-  assert.match(headerMarkup, /class="version-badge"/);
-  assert.equal(card._refs.versionBadge.textContent, `v${module.CARD_VERSION}`);
-  assert.equal(
-    card._refs.versionBadge.title,
-    `ABB Welcome Intercom Card v${module.CARD_VERSION}`
-  );
-  assert.equal(
-    card._refs.versionBadge.attributes.get("aria-label"),
-    `ABB Welcome Intercom Card version ${module.CARD_VERSION}`
-  );
   assert.equal(card._refs.liveBtn.textContent, "Stop");
   assert.equal(card._refs.liveBtn.disabled, false);
 

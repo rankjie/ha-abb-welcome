@@ -76,6 +76,7 @@ def history(monkeypatch):
     stub(
         f"{package}.coordinator",
         CALL_HISTORY_CACHE_SECONDS=15,
+        CALL_HISTORY_PHOTO_CACHE_SECONDS=300,
         IntercomEvent=NS,
         ABBWelcomeCoordinator=NS(
             _timestamp_seconds=lambda value: datetime.fromisoformat(value).timestamp(),

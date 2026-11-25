@@ -1133,13 +1133,6 @@ const CARD_CSS = `
     display: inline-flex; align-items: center; justify-content: flex-end;
     flex: 0 0 auto; flex-wrap: wrap; gap: 8px; max-width: 100%; margin-left: auto;
   }
-  .version-badge {
-    flex: 0 0 auto; padding: 2px 7px; border-radius: 10px;
-    background: var(--secondary-background-color, #333);
-    color: var(--secondary-text-color, #aaa);
-    max-width: 100%; box-sizing: border-box; overflow-wrap: anywhere;
-    font-size: 0.8em; line-height: 1.35; font-variant-numeric: tabular-nums;
-  }
   .ring-badge {
     display: inline-flex; align-items: center; gap: 6px;
     background: var(--warning-color, #ffa600); color: var(--text-primary-color, #fff);
@@ -2128,7 +2121,6 @@ export class AbbWelcomeIntercomCard extends BaseElement {
           <span class="name"></span>
           <span class="header-meta">
             <span class="ring-badge hidden" role="status"></span>
-            <span class="version-badge"></span>
           </span>
         </div>
         <div class="media">
@@ -2172,7 +2164,6 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     this._refs = {
       name: root.querySelector(".name"),
       ringBadge: root.querySelector(".ring-badge"),
-      versionBadge: root.querySelector(".version-badge"),
       media: root.querySelector(".media"),
       placeholder: root.querySelector(".placeholder"),
       placeholderText: root.querySelector(".placeholder-text"),
@@ -2359,12 +2350,6 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       (stateObj &&
         (stateObj.attributes.friendly_name || this._config.camera)) ||
       s.name_default;
-    refs.versionBadge.textContent = `v${CARD_VERSION}`;
-    refs.versionBadge.title = `ABB Welcome Intercom Card v${CARD_VERSION}`;
-    refs.versionBadge.setAttribute(
-      "aria-label",
-      `ABB Welcome Intercom Card version ${CARD_VERSION}`
-    );
     refs.history.classList.toggle("hidden", typeof this._hass?.fetchWithAuth !== "function");
     refs.historySummary.textContent = s.history;
     refs.historyRefresh.textContent = s.history_refresh;

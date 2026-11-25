@@ -17,6 +17,7 @@ from homeassistant.helpers import entity_registry as er
 from .const import DOMAIN
 from .coordinator import (
     CALL_HISTORY_CACHE_SECONDS,
+    CALL_HISTORY_PHOTO_CACHE_SECONDS,
     ABBWelcomeCoordinator,
     IntercomEvent,
 )
@@ -26,7 +27,8 @@ if TYPE_CHECKING:
 
 MAX_CALLS = 20
 MAX_JPEG_BYTES = 2 * 1024 * 1024
-METADATA_CACHE_SECONDS = 5 * 60
+# A cached row's photos must still be in the coordinator's event cache.
+METADATA_CACHE_SECONDS = CALL_HISTORY_PHOTO_CACHE_SECONDS
 PRIVATE_HEADERS = {
     "Cache-Control": "private, no-store",
     "X-Content-Type-Options": "nosniff",
