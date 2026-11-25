@@ -105,18 +105,25 @@ def _load_coordinator() -> type[Any]:
     return namespace["StationStreamCoordinator"]
 
 
-def _load_force_teardown() -> Callable[[object], object]:
+def _load_camera_method(name: str) -> Callable[..., object]:
     camera = _class_node("ABBWelcomeCamera")
     method = next(
         node
         for node in camera.body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_force_teardown"
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == name
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
-    namespace: dict[str, Any] = {}
+    namespace: dict[str, Any] = {
+        "_LOGGER": _Logger(),
+        "GatewayBusyError": type("GatewayBusyError", (Exception,), {}),
+    }
     exec(compile(module, str(_CAMERA_PATH), "exec"), namespace)  # noqa: S102
-    return namespace["_force_teardown"]
+    return namespace[name]
+
+
+def _load_force_teardown() -> Callable[[object], object]:
+    return _load_camera_method("_force_teardown")
 
 
 def _coordinator() -> Any:
@@ -243,5 +250,26 @@ def test_reconnect_waits_for_hangup_instead_of_cancelling_cleanup() -> None:
         assert cancelled is False
         assert results == [None, True]
         assert coordinator.session.open_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_refused_play_closes_the_client_without_opening_a_call() -> None:
+    async def scenario() -> None:
+        coordinator = _coordinator()
+        client = _RtspClient("disarmed-client")
+        camera = SimpleNamespace(
+            _attr_name="Front door",
+            _camera_index=None,
+            _coordinator=coordinator,
+            _stream_allowed=lambda: False,
+            _station_id=lambda: "door",
+            async_write_ha_state=lambda: None,
+        )
+        await _load_camera_method("_on_rtsp_play")(camera, client)
+
+        assert client.close_calls == 1
+        assert coordinator._rtsp_play_sessions == []
+        assert coordinator.session.open_calls == 0
 
     asyncio.run(scenario())

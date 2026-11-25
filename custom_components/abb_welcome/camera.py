@@ -1272,6 +1272,9 @@ class ABBWelcomeCamera(Camera):
                 self._camera_index if self._camera_index is not None else "default",
                 self._station_id() or "unknown",
             )
+            # The server already answered PLAY; without a close the client
+            # waits for RTP that never comes instead of failing and retrying.
+            sess.close()
             return
 
         try:
