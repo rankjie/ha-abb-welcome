@@ -455,6 +455,7 @@ class TestCoordinatorPreview(unittest.IsolatedAsyncioTestCase):
         coordinator.session = self.session
         coordinator.door = types.SimpleNamespace(station_id="1", address="1")
         coordinator._stream_lock = asyncio.Lock()
+        coordinator._stream_generation = 0
         coordinator._talkback_owner = ""
         coordinator._active_file_playbacks = 0
         coordinator._state_callbacks = []
