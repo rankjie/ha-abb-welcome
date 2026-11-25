@@ -185,7 +185,7 @@ test("native video unmute and mic-denied retry work through the real card", asyn
         state: "idle",
         attributes: { friendly_name: "Door", talkback_ready: true },
       },
-      "button.unlock": { state: "idle", attributes: {} },
+      "button.unlock": { state: "unknown", attributes: {} },
     },
     entities: {
       "camera.door": { device_id: "gateway", platform: "abb_welcome" },

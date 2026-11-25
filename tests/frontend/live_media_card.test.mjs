@@ -5,6 +5,8 @@ import assert from "node:assert/strict";
 
 import {
   AbbWelcomeIntercomCard,
+  LIVE_LEASE_RENEW_MS,
+  LIVE_LEASE_SECONDS,
   LIVE_START_TIMEOUT_MS,
 } from "../../custom_components/abb_welcome/frontend/abb-welcome-intercom-card.js";
 import { deferred, settle } from "./_harness.mjs";
@@ -431,7 +433,7 @@ test("native Hold leaves the card's player, incoming audio, and owned Live windo
   assert.equal(sender.track, null, "Live starts with no microphone attached");
   await fixture.card._machine.press();
   assert.equal(sender.track, mic);
-  fixture.card._machine.notify("pointerup");
+  fixture.card._machine.release();
   assert.equal(mic.readyState, "ended");
   await settle();
   assert.equal(sender.track, null);
@@ -459,4 +461,79 @@ test("native_talkback false keeps Live receive-only even when HA supports Talk",
   assert.deepEqual(directions, [["audio", "recvonly"], ["video", "recvonly"]]);
   assert.equal(fixture.card._machine.state === "idle", false);
   fixture.card._stopLive();
+});
+
+function renewals(calls) {
+  return calls.filter((call) => call.type === "service" && call.data.renew === true);
+}
+
+async function startPlaying(fixture) {
+  const video = await startToSubscribed(fixture);
+  video.videoWidth = 1280;
+  video.videoHeight = 720;
+  video.frame();
+  return video;
+}
+
+// Advances with decoded frames, so only the lease can end Live.
+async function playFor(fixture, video, ms) {
+  for (let step = 0; step < ms; step += 1000) {
+    fixture.clock.advance(1000);
+    if (fixture.card._playerEl === video) video.frame(undefined, video.currentTime + 1);
+    await settle();
+  }
+}
+
+test("Live arms a bounded lease and renews it while open", async () => {
+  const fixture = makeCard();
+  const video = await startPlaying(fixture);
+  const [arm] = serviceCalls(fixture.calls, undefined);
+  assert.equal(arm.data.duration, LIVE_LEASE_SECONDS);
+  assert.ok(LIVE_LEASE_RENEW_MS * 2 < LIVE_LEASE_SECONDS * 1000);
+  for (const expected of [1, 2]) {
+    await playFor(fixture, video, LIVE_LEASE_RENEW_MS);
+    assert.equal(renewals(fixture.calls).length, expected);
+  }
+  assert.deepEqual(renewals(fixture.calls).at(-1).data, {
+    ...arm.data,
+    renew: true,
+  });
+  assert.equal(fixture.card._live, true);
+
+  fixture.card._stopLive();
+  fixture.clock.advance(LIVE_LEASE_RENEW_MS * 3);
+  await settle();
+  assert.equal(renewals(fixture.calls).length, 2);
+  assert.equal(serviceCalls(fixture.calls, true).length, 1);
+});
+
+test("a refused renewal ends Live and says so", async () => {
+  const fixture = makeCard({
+    arm: async (_domain, _service, data) => {
+      if (data.renew) {
+        throw { code: "home_assistant_error", message: "Streaming lease expired" };
+      }
+    },
+  });
+  const video = await startPlaying(fixture);
+  await playFor(fixture, video, LIVE_LEASE_RENEW_MS);
+  assert.equal(fixture.card._live, false);
+  assert.equal(fixture.card._playerEl, null);
+  assert.equal(fixture.peer.closes, 1);
+  assert.equal(fixture.card._statusOverride, fixture.card._strings.live_ended);
+});
+
+test("a renewal lost to a dropped connection is retried", async () => {
+  let failures = 1;
+  const fixture = makeCard({
+    arm: async (_domain, _service, data) => {
+      if (data.renew && failures-- > 0) throw { code: 3, message: "Connection lost" };
+    },
+  });
+  const video = await startPlaying(fixture);
+  await playFor(fixture, video, LIVE_LEASE_RENEW_MS);
+  assert.equal(fixture.card._live, true);
+  await playFor(fixture, video, LIVE_LEASE_RENEW_MS);
+  assert.equal(renewals(fixture.calls).length, 2);
+  assert.equal(fixture.card._live, true);
 });

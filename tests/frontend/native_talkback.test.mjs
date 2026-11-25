@@ -95,7 +95,7 @@ test("hold attaches the only microphone; release stops it and retains the same r
   assert.equal(h.machine.state, "talking");
   assert.equal(h.calls.capture, 1);
   assert.equal(h.rtcSender.track, mic);
-  h.machine.notify("pointerup");
+  h.machine.release();
   assert.equal(mic.enabled, false);
   assert.equal(mic.readyState, "ended");
   await settle();
@@ -118,7 +118,7 @@ test("release while permission is pending stops the late stream without touching
   const delayed = deferred();
   h.capture(() => delayed.promise);
   const hold = h.machine.press();
-  h.machine.notify("keyup-space");
+  h.machine.release();
   const mic = track();
   delayed.resolve({ getTracks: () => [mic], getAudioTracks: () => [mic] });
   await hold;
@@ -140,7 +140,7 @@ test("late replaceTrack cannot leak audio or detach a newer hold", async () => {
   const abandoned = h.machine.press();
   await settle();
   const [old] = h.micTracks;
-  h.machine.notify("pointercancel");
+  h.machine.release();
   assert.equal(old.readyState, "ended");
   const newHold = h.machine.press();
   await settle();
@@ -190,6 +190,49 @@ test("permission denial and failure to attach never interrupt Live and allow a n
   assert.equal(h.micTracks[0].readyState, "ended");
   assert.equal(h.calls.close, 0);
   assert.equal(h.calls.offer, 1);
+});
+
+test("a microphone error stays visible after the hold is released", async () => {
+  const h = setup();
+  await h.rtc.start();
+  await h.answer();
+  h.capture(async () => { throw Object.assign(Error("denied"), { name: "NotAllowedError" }); });
+  await h.machine.press();
+  h.machine.release();
+  assert.equal(h.machine.state, "mic_denied");
+});
+
+test("a denial after the permission prompt ended the hold is still reported", async () => {
+  const h = setup();
+  await h.rtc.start();
+  await h.answer();
+  const prompt = deferred();
+  h.capture(() => prompt.promise);
+  const hold = h.machine.press();
+  h.machine.release();
+  assert.equal(h.machine.state, "idle");
+  prompt.reject(Object.assign(Error("denied"), { name: "NotAllowedError" }));
+  await hold;
+  assert.equal(h.machine.state, "mic_denied");
+});
+
+test("a newer hold owns the state when an older permission prompt fails", async () => {
+  const h = setup();
+  await h.rtc.start();
+  await h.answer();
+  const prompt = deferred();
+  h.capture(() => prompt.promise);
+  const abandoned = h.machine.press();
+  h.machine.release();
+  h.capture(async () => {
+    const mic = track();
+    h.micTracks.push(mic);
+    return { getTracks: () => [mic], getAudioTracks: () => [mic] };
+  });
+  await h.machine.press();
+  prompt.reject(Object.assign(Error("denied"), { name: "NotAllowedError" }));
+  await abandoned;
+  assert.equal(h.machine.state, "talking");
 });
 
 test("a lost session or an ended device silences the microphone", async () => {

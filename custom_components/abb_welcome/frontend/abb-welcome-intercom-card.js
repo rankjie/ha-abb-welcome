@@ -39,6 +39,10 @@ export const CARD_VERSION = (() => {
 export const UNLOCK_CONFIRM_TIMEOUT_MS = 30000;
 export const LIVE_START_TIMEOUT_MS = 15000;
 export const LIVE_STALL_TIMEOUT_MS = 10000;
+// The lease outlives two missed renewals, so a brief WebSocket drop does not
+// end Live, and a closed tab stops holding the station within a minute.
+export const LIVE_LEASE_SECONDS = 60;
+export const LIVE_LEASE_RENEW_MS = 20000;
 const HISTORY_CACHE_MS = 5 * 60 * 1000;
 const MAX_HISTORY_PHOTOS_PER_CALL = 30;
 const HISTORY_PHOTO_CONCURRENCY = 3;
@@ -62,6 +66,7 @@ export const STRINGS = {
     video_ended: "Video ended — press Live to reconnect",
     video_stalled: "Video interrupted — press Live to reconnect",
     video_error: "Video unavailable — press Live to retry",
+    live_ended: "Live view ended — press Live to reconnect",
     play_video: "Play video",
     audio_blocked: "Listening blocked — press Listen to retry",
     audio_waiting: "Waiting for an incoming audio track",
@@ -129,6 +134,7 @@ export const STRINGS = {
     video_ended: "Video terminato — premi Live per riconnettere",
     video_stalled: "Video interrotto — premi Live per riconnettere",
     video_error: "Video non disponibile — premi Live per riprovare",
+    live_ended: "Diretta terminata — premi Live per riconnettere",
     play_video: "Riproduci video",
     audio_blocked: "Ascolto bloccato — premi Ascolta per riprovare",
     audio_waiting: "In attesa della traccia audio in ingresso",
@@ -779,8 +785,11 @@ export class NativeTalkbackMachine {
       }
       if (current()) this._set("talking");
     } catch (err) {
-      if (!current()) return;
-      this._release();
+      // The permission prompt often ends the hold before the user denies it,
+      // so a released hold still reports its failure. A newer hold owns the
+      // state instead.
+      if (this._disposed || (this._hold !== hold && this._hold !== null)) return;
+      if (this._hold === hold) this._release();
       const micDenied = err?.name === "NotAllowedError" || err?.name === "SecurityError";
       this._set(micDenied ? "mic_denied" : "error", err?.message || String(err));
     }
@@ -803,6 +812,13 @@ export class NativeTalkbackMachine {
   }
 
   notify() {
+    this._release();
+    this._idle();
+  }
+
+  // Ends the user's hold. A mic_denied or error state stays visible.
+  release() {
+    if (!this._hold) return;
     this._release();
     this._idle();
   }
@@ -1390,10 +1406,10 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     if (this._config && !this._machine) this._buildMachines();
     else if (this._config && !this._unlock) this._buildUnlockMachine();
     if (this._windowListeners) return;
-    const onPointerUp = () => this._machine && this._machine.notify("pointerup");
+    const onPointerUp = () => this._machine?.release();
     const onBlur = () => {
       this._releaseKeyboardHold();
-      if (this._machine) this._machine.notify("window-blur");
+      this._machine?.release();
     };
     const onKeyUp = (event) => {
       if (this._pttKey && event.key === this._pttKey) this._releaseKeyboardHold();
@@ -1528,7 +1544,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       if (this._config && !this._unlock) this._buildUnlockMachine();
       return;
     }
-    if (this._machine) this._machine.notify("visibility-hidden");
+    this._machine?.release();
     if (this._unlock) this._unlock.dispose();
     this._unlock = null;
     if (this._live) this._stopLive();
@@ -1551,7 +1567,8 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       return false;
     }
     const state = this._hass.states[entityId];
-    return !!state && !["unavailable", "unknown"].includes(state.state);
+    // A button that was never pressed is "unknown"; it can still unlock.
+    return !!state && state.state !== "unavailable";
   }
 
   _snapshotUnlockEntity() {
@@ -1589,6 +1606,8 @@ export class AbbWelcomeIntercomCard extends BaseElement {
   _requestArmRelease(lease = this._armLease) {
     if (!lease) return;
     lease.releaseRequested = true;
+    if (lease.renewTimer !== null) window.clearTimeout(lease.renewTimer);
+    lease.renewTimer = null;
     if (!lease.armSettled) {
       lease.releaseWhilePending = true;
       this._sendArmRelease(lease, "eager");
@@ -1596,6 +1615,33 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     }
     this._sendArmRelease(lease, "settled");
     if (this._armLease === lease) this._armLease = null;
+  }
+
+  _scheduleLeaseRenewal(lease) {
+    const owns = () => this._armLease === lease && !lease.releaseRequested;
+    lease.renewTimer = window.setTimeout(async () => {
+      lease.renewTimer = null;
+      if (!owns()) return;
+      try {
+        await lease.hass.callService("abb_welcome", "arm_streaming", {
+          ...lease.scope,
+          owner_token: lease.ownerToken,
+          duration: LIVE_LEASE_SECONDS,
+          renew: true,
+        });
+      } catch (err) {
+        if (!owns()) return;
+        // The integration refused the renewal: the window has ended, for
+        // example when a borrowed ring window closed. Anything else, such as
+        // a dropped connection, is retried while the lease still runs.
+        if (err?.code === "home_assistant_error") {
+          this._stopLive();
+          this._flashStatus(this._strings.live_ended, true, 10000);
+          return;
+        }
+      }
+      if (owns()) this._scheduleLeaseRenewal(lease);
+    }, LIVE_LEASE_RENEW_MS);
   }
 
   async _startLive() {
@@ -1642,6 +1688,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       releaseRequested: false,
       releaseWhilePending: false,
       releasePhases: new Set(),
+      renewTimer: null,
     };
     this._armLease = lease;
     let armError = null;
@@ -1649,6 +1696,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       await hass.callService("abb_welcome", "arm_streaming", {
         ...scope,
         owner_token: lease.ownerToken,
+        duration: LIVE_LEASE_SECONDS,
       });
     } catch (err) {
       armError = err;
@@ -1666,6 +1714,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       this._requestArmRelease(lease);
       return;
     }
+    this._scheduleLeaseRenewal(lease);
 
     this._mountPlayer();
     const session = new WebRtcSession({
@@ -2183,14 +2232,9 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       }
       this._machine.press();
     });
-    ptt.addEventListener("pointerup", () => this._machine?.notify("pointerup"));
-    ptt.addEventListener("pointercancel", () =>
-      this._machine?.notify("pointercancel")
-    );
-    ptt.addEventListener("pointerleave", () =>
-      this._machine?.notify("pointerleave")
-    );
-    ptt.addEventListener("lostpointercapture", () => this._machine?.notify("pointercancel"));
+    for (const name of ["pointerup", "pointercancel", "pointerleave", "lostpointercapture"]) {
+      ptt.addEventListener(name, () => this._machine?.release());
+    }
     ptt.addEventListener("contextmenu", (event) => event.preventDefault());
     ptt.addEventListener("keydown", (event) => {
       if (event.key === " " || event.key === "Enter") {
@@ -2209,7 +2253,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     ptt.addEventListener("focusout", () => {
       this._releaseKeyboardHold();
       // Pointer holds are also released if focus moves away from the control.
-      if (this._machine) this._machine.notify("pointercancel");
+      this._machine?.release();
     });
 
     this._refs.unlockBtn.addEventListener("click", () => {
@@ -2237,7 +2281,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
   _releaseKeyboardHold() {
     if (!this._pttKey) return;
     this._pttKey = "";
-    if (this._machine) this._machine.notify("keyup-space");
+    this._machine?.release();
   }
 
   _clearStatus() {

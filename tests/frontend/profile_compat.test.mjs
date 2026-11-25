@@ -213,8 +213,8 @@ test("config change disposes an uncertain unlock without stale UI or retry", asy
     states: {
       "camera.front": { state: "idle", attributes: {} },
       "camera.back": { state: "idle", attributes: {} },
-      "button.unlock_front": { state: "idle", attributes: {} },
-      "button.unlock_back": { state: "idle", attributes: {} },
+      "button.unlock_front": { state: "unknown", attributes: {} },
+      "button.unlock_back": { state: "2026-11-20T10:00:00+00:00", attributes: {} },
     },
     entities: {},
     devices: {},
@@ -260,7 +260,7 @@ test("HA disconnect invalidates in-flight unlock and reconnect creates a fresh m
     connection: { connected: true },
     states: {
       "camera.front": { state: "idle", attributes: {} },
-      "button.unlock_front": { state: "idle", attributes: {} },
+      "button.unlock_front": { state: "2026-11-20T10:00:00+00:00", attributes: {} },
     },
     entities: {},
     devices: {},
@@ -314,8 +314,8 @@ test("automatic unlock snapshots the exact door at the first tap", async () => {
         state: "idle",
         attributes: { station_id: "front" },
       },
-      "button.front": { state: "idle", attributes: {} },
-      "button.back": { state: "idle", attributes: {} },
+      "button.front": { state: "2026-11-20T10:00:00+00:00", attributes: {} },
+      "button.back": { state: "2026-11-20T10:00:00+00:00", attributes: {} },
     },
     entities: {
       "camera.door": {
@@ -367,8 +367,8 @@ test("a snapshotted unlock that disappears fails closed and never switches doors
         state: "idle",
         attributes: { station_id: "front" },
       },
-      "button.front": { state: "idle", attributes: {} },
-      "button.back": { state: "idle", attributes: {} },
+      "button.front": { state: "2026-11-20T10:00:00+00:00", attributes: {} },
+      "button.back": { state: "2026-11-20T10:00:00+00:00", attributes: {} },
     },
     entities: {
       "camera.door": {
@@ -413,7 +413,7 @@ test("visibility hidden invalidates open and in-flight unlock confirmation", asy
     connection: { connected: true },
     states: {
       "camera.front": { state: "idle", attributes: {} },
-      "button.front": { state: "idle", attributes: {} },
+      "button.front": { state: "2026-11-20T10:00:00+00:00", attributes: {} },
     },
     entities: {},
     devices: {},
@@ -467,4 +467,16 @@ test("frontend production assets contain no gateway model branch tokens", async 
   const modelToken = /m22401|mrange|wifi_panel|ip_gateway|gateway_kind|device_type/i;
   assert.doesNotMatch(cardSource, modelToken);
   assert.doesNotMatch(cardSource, /talk_(?:start|pcm16le|stop)|AudioWorklet/);
+});
+
+test("Unlock stays available until the button itself is unavailable", () => {
+  const card = new AbbWelcomeIntercomCard();
+  const withState = (state) => {
+    card._hass = { states: state === undefined ? {} : { "button.front": { state, attributes: {} } } };
+    return card._isUnlockEntityValid("button.front");
+  };
+  assert.equal(withState("unknown"), true, "a button never pressed from HA");
+  assert.equal(withState("2026-11-20T10:00:00+00:00"), true);
+  assert.equal(withState("unavailable"), false);
+  assert.equal(withState(undefined), false);
 });
