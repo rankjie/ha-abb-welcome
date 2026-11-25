@@ -1425,7 +1425,7 @@ class ABBWelcomeCamera(Camera):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
-        if self._ringing_and_armed():
+        if self._live_frame_allowed():
             # The portal screenshot of a ring arrives about 30 s late, so until
             # then the last screenshot shows an earlier visitor. A live frame
             # of the ring shows who is ringing now; without one there is no
@@ -1450,7 +1450,7 @@ class ABBWelcomeCamera(Camera):
         snapshot = self._station_screenshot()
         return snapshot.event_id if snapshot else None
 
-    def _ringing_and_armed(self) -> bool:
+    def _live_frame_allowed(self) -> bool:
         # Only during this station's own unanswered ring: once the ring is
         # over, opening the stream would call the door station. A ring that
         # is already previewed has left the pending INVITEs but still rings.

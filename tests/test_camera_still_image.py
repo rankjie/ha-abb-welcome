@@ -1,7 +1,8 @@
-"""The camera still image is the last station screenshot unless turned off.
+"""The camera still image: a live frame of a ring, else the last screenshot.
 
 Live players show the still as a poster while the call is being set up, so a
 user who does not want an old screenshot there can turn it off in the options.
+While the station rings, a live frame shows who is ringing now.
 """
 
 from __future__ import annotations
@@ -30,19 +31,16 @@ class TestCameraStillImage(unittest.IsolatedAsyncioTestCase):
         _load_submodule("intercom_dialer")
         _load_submodule("media_pipeline")
         camera_mod = _load_submodule("camera")
+        test = self
         self.ringing = ringing
-        patcher = mock.patch.object(
-            camera_mod, "is_stream_allowed", lambda *_a: self.ringing or previewing
+        patcher = mock.patch.multiple(
+            camera_mod,
+            is_stream_allowed=lambda *_a: test.ringing or previewing,
+            is_preview_before_answer=lambda *_a: preview_before_answer,
         )
         patcher.start()
         self.addCleanup(patcher.stop)
-        preview = mock.patch.object(
-            camera_mod, "is_preview_before_answer", lambda *_a: preview_before_answer
-        )
-        preview.start()
-        self.addCleanup(preview.stop)
         self.frame_requests = []
-        test = self
 
         class _Resp:
             status = 200 if frame is not None else 500
@@ -85,7 +83,7 @@ class TestCameraStillImage(unittest.IsolatedAsyncioTestCase):
         cam._camera_index = camera_index
 
         class _StreamCoordinator:
-            has_pending_call = property(lambda _self: self.ringing)
+            has_pending_call = property(lambda _self: test.ringing)
 
         cam._coordinator = _StreamCoordinator()
         cam._coordinator.previewing = previewing
@@ -167,6 +165,13 @@ class TestCameraStillImage(unittest.IsolatedAsyncioTestCase):
 
     async def test_last_station_screenshot_is_the_still_by_default(self) -> None:
         self.assertEqual(await self._camera({}).async_camera_image(), b"jpeg-bytes")
+
+    async def test_live_frame_during_a_ring_even_with_the_option_off(self) -> None:
+        # The option hides old screenshots; a live frame of the ring is current.
+        cam = self._camera(
+            {"camera_still_image": False}, ringing=True, frame=b"live-frame"
+        )
+        self.assertEqual(await cam.async_camera_image(), b"live-frame")
 
     async def test_no_still_when_the_option_is_off(self) -> None:
         cam = self._camera({"camera_still_image": False})
