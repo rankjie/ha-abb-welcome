@@ -107,9 +107,8 @@ def event(id_, type_, *, station="", belongs_to="", photo=None):
     )
 
 
-def test_only_explicit_call_links_link_photos_and_outcomes(history):
-    calls = history.portal_calls(
-        (
+def test_only_explicit_call_links_link_photos_and_outcomes_per_door(history):
+    events = (
             event("end", "call-terminated", belongs_to="answer"),
             event(
                 "other-door",
@@ -128,14 +127,23 @@ def test_only_explicit_call_links_link_photos_and_outcomes(history):
             event("ring-2", "ring", station="2"),
             event("ring-2", "ring", station="2"),
             event("ring-3", "ring", station="3"),
+            event("ring-4", "ring", station="1"),
         )
-    )
-    assert [call.ring.event_id for call in calls] == ["ring-1", "ring-2", "ring-3"]
-    assert [(call.outcome, call.photo) for call in calls] == [
-        ("answered", JPEG),
-        ("missed", None),
-        ("ring", None),
-    ]
+    calls = {station: history.portal_calls(events, station) for station in "123"}
+    assert {
+        station: [(call.ring.event_id, call.outcome, call.photo) for call in rows]
+        for station, rows in calls.items()
+    } == {
+        "1": [("ring-1", "answered", JPEG), ("ring-4", "ring", None)],
+        "2": [("ring-2", "missed", None)],
+        "3": [("ring-3", "ring", None)],
+    }
+
+
+def test_a_ring_without_a_station_is_not_shown_for_any_door(history):
+    events = (event("ring", "ring"),)
+    assert history.portal_calls(events, "1") == []
+    assert history.portal_calls(events, "") == []
 
 
 def test_history_is_bounded_and_rejects_cyclic_and_invalid_photos(history):
@@ -150,8 +158,9 @@ def test_history_is_bounded_and_rejects_cyclic_and_invalid_photos(history):
                 belongs_to="0",
                 photo=b"\xff\xd8" + b"x" * history.MAX_JPEG_BYTES,
             ),
-            *(event(str(index), "ring") for index in range(30)),
-        )
+            *(event(str(index), "ring", station="1") for index in range(30)),
+        ),
+        "1",
     )
     assert len(calls) == 20
     assert all(call.photo is None for call in calls)
@@ -163,7 +172,8 @@ def test_history_rejects_a_station_mismatch_in_a_parent_chain(history):
             event("photo", "screenshot", belongs_to="answer", photo=JPEG),
             event("answer", "call-answered", station="2", belongs_to="ring"),
             event("ring", "ring", station="1"),
-        )
+        ),
+        "1",
     )
     assert call.photo is None and call.outcome == "ring"
 
@@ -180,6 +190,7 @@ def request(
         item.entity_id: item
         for item in [
             entity("camera.door"),
+            entity("camera.back"),
             entity("event.abb_intercom"),
             entity("image.abb_screenshot"),
             entity("camera.other", "other"),
@@ -215,8 +226,13 @@ def request(
             ("other", "other-gateway"),
         ]
     }
+    camera_states = {
+        "camera.door": NS(attributes={"station_id": "1"}),
+        "camera.back": NS(attributes={"station_id": "2"}),
+    }
     hass = NS(
         registry=registry,
+        states=NS(get=camera_states.get),
         config_entries=NS(async_get_entry=entries.get),
         data={
             "abb_welcome": {
@@ -345,7 +361,7 @@ def test_warm_metadata_survives_new_http_requests_and_refresh_is_separate(
     assert cached.body == {**first, "stale": True}
     assert fetches == [True], "a new tab must not wait for ABB"
     assert "no-store" in cached.headers["Cache-Control"]
-    all_cached_rows = view._rows[coordinator][True].calls
+    all_cached_rows = view._rows[coordinator][(True, "1")].calls
     assert all(
         not isinstance(value, bytes)
         for row in all_cached_rows
@@ -393,7 +409,7 @@ def test_incomplete_photos_are_not_cached_or_exposed_without_permission(history)
     refresh = request(allow=permissions, fresh="1")
     refresh.app = req.app
     assert asyncio.run(view.get(refresh)).body["photos_incomplete"] is True
-    assert True not in view._rows[coordinator]
+    assert (True, "1") not in view._rows[coordinator]
     assert "photos_incomplete" not in asyncio.run(view.get(req)).body
     assert fetches == [True, True, True]
     permissions.remove("image.abb_screenshot")
@@ -408,7 +424,7 @@ def test_multiple_linked_photos_are_indexed_and_permission_scoped(history):
     second = b"\xff\xd8second"
 
     async def fetch(include_photos, **_kwargs):
-        ring = event("ring", "ring")
+        ring = event("ring", "ring", station="1")
         if not include_photos:
             return (ring,)
         return (ring, event("a", "screenshot", belongs_to="ring", photo=JPEG),
@@ -432,3 +448,14 @@ def test_multiple_linked_photos_are_indexed_and_permission_scoped(history):
         asyncio.run(view.get(photo_req))
     assert error.value.status == 403
     assert "photo_count" not in asyncio.run(view.get(req)).body["calls"][0]
+
+
+def test_each_door_lists_only_its_own_calls_from_a_shared_cache(history):
+    permissions = {"camera.door", "camera.back", "event.abb_intercom"}
+    door = request(allow=permissions)
+    back = request(camera="camera.back", allow=permissions)
+    back.app = door.app
+    view = history.ABBCallHistoryView()
+    assert [row["id"] for row in asyncio.run(view.get(door)).body["calls"]] == ["ring"]
+    assert asyncio.run(view.get(back)).body["calls"] == []
+    assert [row["id"] for row in asyncio.run(view.get(door)).body["calls"]] == ["ring"]

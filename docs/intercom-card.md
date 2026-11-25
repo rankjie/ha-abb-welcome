@@ -121,8 +121,9 @@ action.
 
 ## Call history
 
-Expand **Call history** to see up to 20 recent rings from the ABB portal for
-the selected camera's gateway. The card does not load history while collapsed
+Expand **Call history** to see the rings at the selected camera's door among
+the gateway's 20 most recent rings in the ABB portal. A door that rings rarely
+can show few or none. The card does not load history while collapsed
 or open a live stream. Linked photos appear inline as the rows come into view;
 turn off **Screenshots** at the top to hide them all and stop pending image reads.
 A ring can have an unknown outcome, no photo, or several photos. The integration

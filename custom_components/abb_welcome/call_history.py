@@ -106,15 +106,25 @@ def _related_call(event: IntercomEvent, events: dict[str, IntercomEvent]) -> str
     return None
 
 
-def portal_calls(events: tuple[IntercomEvent, ...]) -> list[PortalCall]:
-    """Build at most 20 newest calls from the dedicated portal history read."""
+def portal_calls(
+    events: tuple[IntercomEvent, ...], station_id: str
+) -> list[PortalCall]:
+    """Build at most 20 newest calls to one station from the portal history read.
+
+    A ring whose payload names no station is left out rather than guessed.
+    """
     by_id: dict[str, IntercomEvent] = {}
     calls: dict[str, PortalCall] = {}
     for event in events:
         if not event.event_id or event.event_id in by_id:
             continue
         by_id[event.event_id] = event
-        if event.event_type == "ring" and len(calls) < MAX_CALLS:
+        if (
+            event.event_type == "ring"
+            and station_id
+            and event.station_id == station_id
+            and len(calls) < MAX_CALLS
+        ):
             calls[event.event_id] = PortalCall(event)
 
     for event in by_id.values():
@@ -165,10 +175,10 @@ class ABBCallHistoryView(HomeAssistantView):
 
     def __init__(self) -> None:
         super().__init__()
-        # Per coordinator and image permission, never store JPEG data here.
-        # An unloaded gateway loses its cache with its coordinator.
+        # Per coordinator, image permission and station; never store JPEG
+        # data here. An unloaded gateway loses its cache with its coordinator.
         self._rows: WeakKeyDictionary[
-            ABBWelcomeCoordinator, dict[bool, _HistoryRows]
+            ABBWelcomeCoordinator, dict[tuple[bool, str], _HistoryRows]
         ] = WeakKeyDictionary()
 
     async def get(self, request: web.Request) -> web.Response:
@@ -222,17 +232,24 @@ class ABBCallHistoryView(HomeAssistantView):
         photo_allowed = _can_read(user, image_entity)
         if call_id is not None and not photo_allowed:
             raise web.HTTPForbidden(headers=PRIVATE_HEADERS)
+        camera_state = hass.states.get(camera_id)
+        station_id = (
+            str(camera_state.attributes.get("station_id") or "").strip()
+            if camera_state is not None
+            else ""
+        )
+        if not station_id:
+            raise web.HTTPServiceUnavailable(headers=PRIVATE_HEADERS)
 
+        rows_key = (photo_allowed, station_id)
         if call_id is None and fresh is None:
-            by_permission = self._rows.get(coordinator)
-            snapshot = (
-                by_permission.get(photo_allowed) if by_permission is not None else None
-            )
+            cached_rows = self._rows.get(coordinator)
+            snapshot = cached_rows.get(rows_key) if cached_rows is not None else None
             if snapshot is not None:
                 age = monotonic() - snapshot.saved_at
                 if age < METADATA_CACHE_SECONDS:
                     return snapshot.response(stale=age >= CALL_HISTORY_CACHE_SECONDS)
-                by_permission.pop(photo_allowed, None)
+                cached_rows.pop(rows_key, None)
 
         try:
             events = await coordinator.async_fetch_call_history(
@@ -251,19 +268,20 @@ class ABBCallHistoryView(HomeAssistantView):
         photo_allowed = photo_allowed and _can_read(user, image_entity)
         if call_id is not None and not photo_allowed:
             raise web.HTTPForbidden(headers=PRIVATE_HEADERS)
-        calls = portal_calls(events)
+        rows_key = (photo_allowed, station_id)
+        calls = portal_calls(events, station_id)
         if call_id is None:
             snapshot = _HistoryRows(
                 monotonic(),
                 tuple(call.as_dict(photo_allowed=photo_allowed) for call in calls),
             )
             if photo_allowed and getattr(events, "photos_incomplete", False):
-                self._rows.get(coordinator, {}).pop(True, None)
+                self._rows.get(coordinator, {}).pop(rows_key, None)
                 return web.json_response(
                     {"calls": list(snapshot.calls), "photos_incomplete": True},
                     headers=PRIVATE_HEADERS,
                 )
-            self._rows.setdefault(coordinator, {})[photo_allowed] = snapshot
+            self._rows.setdefault(coordinator, {})[rows_key] = snapshot
             return snapshot.response()
         for call in calls:
             if call.ring.event_id == call_id and photo_index < len(call.photos):
