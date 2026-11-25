@@ -438,7 +438,7 @@ def _press(
         entry_data = {"intercom_dialer": dialer} if with_dialer else {}
         if ringing is not None:
             entry_data["sip_listener"] = types.SimpleNamespace(
-                has_pending_call_for_station=lambda station_id: station_id == ringing
+                is_station_ringing_unanswered=lambda station_id: station_id == ringing
             )
 
         async def executor(function, *args):
@@ -566,6 +566,23 @@ def test_press_while_its_station_rings_unanswered_forces_the_fast_route(
     )
     assert error is None
     assert client_calls == [(BACK, ("force_fast", True))]
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    "legacy_door",
+    [
+        {"name": "Back", "body": "b:100000002"},
+        {"name": "Back", "address": "<sip:100000002@example.invalid;transport=tls>"},
+    ],
+    ids=["body", "address"],
+)
+def test_press_on_a_door_without_station_id_finds_its_ring(button_module, legacy_door):
+    client_calls, requests, error = _press(
+        button_module, legacy_door, station=None, ringing="100000002"
+    )
+    assert error is None
+    assert client_calls == [(legacy_door, ("force_fast", True))]
     assert requests == []
 
 

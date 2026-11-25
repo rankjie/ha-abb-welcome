@@ -54,6 +54,8 @@ REFRESH_MARGIN = 60
 
 # Reconnect backoff steps (seconds) used after unexpected disconnects.
 RECONNECT_BACKOFF = (2, 5, 10, 30, 60)
+# How long an unanswered INVITE counts as a ring; its CANCEL ends it sooner.
+_RING_WINDOW_SECONDS = 45
 
 USER_AGENT = "ABB-Welcome-HA-Listener/1.0"
 
@@ -532,7 +534,7 @@ class SipListener:
         now = time.time()
         pending = 0
         for call_id, frame in list(self._open_invites.items()):
-            if now - self._invite_received_at(frame) > 45:
+            if now - self._invite_received_at(frame) > _RING_WINDOW_SECONDS:
                 self._open_invites.pop(call_id, None)
                 continue
             pending += 1
@@ -550,6 +552,24 @@ class SipListener:
         """Return whether an unanswered INVITE explicitly matches this station."""
         return self._has_matching_pending_invite(
             station_id, allow_single_fallback=False
+        )
+
+    def is_station_ringing_unanswered(self, station_id: str) -> bool:
+        """Return whether this station rings and nobody has answered it yet.
+
+        Counts a pending INVITE and a ring that HA holds in preview: both end
+        with the gateway's CANCEL. A ring HA released (480) does not count,
+        because HA then gets no signal when it ends.
+        """
+        station_id = str(station_id or "").strip()
+        if not station_id:
+            return False
+        now = time.time()
+        return self.has_pending_call_for_station(station_id) or any(
+            not dialog.call.answered
+            and now - self._invite_received_at(dialog.invite) <= _RING_WINDOW_SECONDS
+            and self._frame_station_id(dialog.invite) == station_id
+            for dialog in self._accepted_dialogs.values()
         )
 
     async def accept_pending_call(
@@ -954,6 +974,9 @@ class SipListener:
         finally:
             self._reader = None
             self._writer = None
+            # Rings of the lost connection can no longer be answered, and their
+            # CANCEL may never arrive: keeping them would report a stale ring.
+            self._open_invites.clear()
             for call_id in list(self._accepted_dialogs):
                 self._finish_accepted_dialog(call_id, "listener_disconnected")
             try:
@@ -1300,7 +1323,7 @@ class SipListener:
         now = time.time()
         fallback: _SipFrame | None = None
         for call_id, frame in list(self._open_invites.items()):
-            if now - self._invite_received_at(frame) > 45:
+            if now - self._invite_received_at(frame) > _RING_WINDOW_SECONDS:
                 self._open_invites.pop(call_id, None)
                 continue
             if self._frame_station_id(frame) == station_id:
