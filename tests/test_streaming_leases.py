@@ -1,4 +1,4 @@
-"""Card-owned streaming lease contracts, isolated from Home Assistant imports."""
+"""Owner-token streaming lease contracts, isolated from Home Assistant imports."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def streaming_state(monkeypatch):
     monkeypatch.setitem(sys.modules, "homeassistant.helpers", helpers)
     monkeypatch.setitem(sys.modules, "homeassistant.helpers.dispatcher", dispatcher)
 
-    package_name = "abb_card_streaming_leases_test"
+    package_name = "abb_streaming_leases_test"
     package = types.ModuleType(package_name)
     package.__path__ = [str(_PACKAGE_ROOT)]
     const = types.ModuleType(f"{package_name}.const")

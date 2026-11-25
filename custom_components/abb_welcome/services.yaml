@@ -75,23 +75,6 @@ arm_streaming:
     the armed window to that outdoor station so HomeKit/Scrypted snapshot probes
     for other doorbells cannot start additional intercom calls.
   fields:
-    owner_token:
-      name: Streaming lease token
-      description: Optional private client token. Requires entry_id and station_id. Other clients retain their own leases.
-      selector:
-        text:
-    release:
-      name: Release streaming lease
-      description: Release only the matching owner_token lease; never disarm another client or an incoming ring.
-      default: false
-      selector:
-        boolean:
-    renew:
-      name: Renew streaming lease
-      description: Extend a matching active lease. Does not create a lease, reopen an expired window, or extend a borrowed ring or switch window. Cannot be combined with release.
-      default: false
-      selector:
-        boolean:
     entry_id:
       name: Entry ID
       description: Optional. Specific config-entry ID to arm. Defaults to all loaded entries.
@@ -115,6 +98,23 @@ arm_streaming:
           max: 600
           mode: box
           unit_of_measurement: s
+    owner_token:
+      name: Streaming lease token
+      description: Optional private client token. Requires entry_id and station_id. Other clients retain their own leases.
+      selector:
+        text:
+    release:
+      name: Release streaming lease
+      description: Release only the matching owner_token lease; never disarm another client or an incoming ring.
+      default: false
+      selector:
+        boolean:
+    renew:
+      name: Renew streaming lease
+      description: Extend a matching active lease. Does not create a lease, reopen an expired window, or extend a borrowed ring or switch window. Cannot be combined with release.
+      default: false
+      selector:
+        boolean:
 
 talk_start:
   name: Start talkback

@@ -242,6 +242,7 @@ def arm(
         cur = get_state(hass, entry_id)
         if cur.auto_disarm_task is not asyncio.current_task():
             return
+        expired_reason = cur.reason
         cur.armed = False
         cur.reason = ""
         cur.target_station_id = ""
@@ -250,8 +251,8 @@ def arm(
         cur.owner_leases.clear()
         async_dispatcher_send(hass, signal_armed_changed(entry_id))
         _LOGGER.info(
-            "[abb] streaming auto-disarmed for entry %s after %ss",
-            entry_id, duration,
+            "[abb] streaming auto-disarmed for entry %s (reason=%s)",
+            entry_id, expired_reason,
         )
 
     state.auto_disarm_task = hass.async_create_background_task(
