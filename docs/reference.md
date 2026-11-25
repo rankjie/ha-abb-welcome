@@ -26,9 +26,12 @@ Gateway-level entities:
 
 ## Services
 
-- `abb_welcome.refresh_doors` - re-read outdoor stations from a web-admin
-  gateway and reload the entry if the list changed. App-managed devices return
-  an unsupported error; re-pair after topology changes.
+- `abb_welcome.refresh_doors` - re-read outdoor stations and relays from a
+  web-admin gateway and reload the entry if the list changed. The entry also
+  reads them on every start; if the gateway does not answer, it keeps the
+  stored list and retries after 1, 5 and 15 minutes, then hourly.
+  App-managed devices return an unsupported error; re-pair after topology
+  changes.
 - `abb_welcome.arm_streaming` - arm streaming for all stations or one
   `station_id`. A client that provides an `entry_id`, `station_id` and
   a unique `owner_token` gets its own bounded lease. With the same fields,

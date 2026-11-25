@@ -15,7 +15,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.start import async_at_start
 from homeassistant.helpers.storage import Store
@@ -369,7 +369,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # normal config-entry reload pick up outdoor stations added/removed via
     # the gateway admin UI, without re-running the pairing/config flow.
     if topology_refresh_action(entry.data) == TOPOLOGY_REFRESH_ACTION_REFRESH:
-        await _async_refresh_doors_for_entry(hass, entry, reload_on_change=False)
+        if await _async_refresh_doors_for_entry(hass, entry, reload_on_change=False) is None:
+            _schedule_topology_retry(hass, entry)
 
     coordinator = ABBWelcomeCoordinator(hass, entry)
     await coordinator.async_restore_station_screenshots()
@@ -809,8 +810,12 @@ def _repair_entry_door_names(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def _async_refresh_doors_for_entry(
     hass: HomeAssistant, entry: ConfigEntry, *, reload_on_change: bool
-) -> bool:
-    """Refresh one config entry's stored door topology from the gateway."""
+) -> bool | None:
+    """Refresh one config entry's stored door topology from the gateway.
+
+    Returns whether the topology changed, or None when the gateway could not
+    be read; the stored topology is then left as it was.
+    """
     if topology_refresh_action(entry.data) != TOPOLOGY_REFRESH_ACTION_REFRESH:
         return False
     gateway_ip = entry.data.get("gateway_ip")
@@ -831,7 +836,7 @@ async def _async_refresh_doors_for_entry(
         sip_domain,
     )
     if topology is None:
-        return False
+        return None
     new_doors, new_relays = topology
 
     current = entry.data.get("doors", []) or []
@@ -879,6 +884,36 @@ async def _async_refresh_doors_for_entry(
     if reload_on_change:
         await hass.config_entries.async_reload(entry.entry_id)
     return True
+
+
+# Seconds between retries of a failed startup refresh; the last one repeats.
+_TOPOLOGY_RETRY_DELAYS = (60, 300, 900, 3600)
+
+
+def _schedule_topology_retry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Retry the device list until the gateway answers or the entry unloads."""
+    attempts = 0
+    cancel = None
+
+    def schedule() -> None:
+        nonlocal cancel
+        delay = _TOPOLOGY_RETRY_DELAYS[min(attempts, len(_TOPOLOGY_RETRY_DELAYS) - 1)]
+        _LOGGER.warning("[abb] refresh_doors: retrying the device list in %d s", delay)
+        cancel = async_call_later(hass, delay, retry)
+
+    async def retry(_now) -> None:
+        nonlocal attempts, cancel
+        cancel = None
+        attempts += 1
+        if await _async_refresh_doors_for_entry(hass, entry, reload_on_change=True) is None:
+            schedule()
+
+    def stop() -> None:
+        if cancel is not None:
+            cancel()
+
+    entry.async_on_unload(stop)
+    schedule()
 
 
 def _normalise_entity_ids(raw: object) -> list[str]:

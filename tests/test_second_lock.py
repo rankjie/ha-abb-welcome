@@ -47,6 +47,7 @@ def _topology():
         "_doors_equal",
         "_async_refresh_doors_for_entry",
         "_fire_discovery_changed",
+        "_schedule_topology_retry",
     }
     nodes = [
         node
@@ -59,7 +60,8 @@ def _topology():
             isinstance(node, ast.Assign)
             and any(
                 isinstance(target, ast.Name)
-                and target.id == "PRESERVED_DOOR_METADATA_KEYS"
+                and target.id
+                in {"PRESERVED_DOOR_METADATA_KEYS", "_TOPOLOGY_RETRY_DELAYS"}
                 for target in node.targets
             )
         )
