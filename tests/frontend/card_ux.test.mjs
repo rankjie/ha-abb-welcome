@@ -80,8 +80,11 @@ class FakeRoot extends FakeNode {
       ".placeholder",
       ".placeholder-text",
       ".status",
+      ".overlay-top",
       ".live-btn",
       ".audio-btn",
+      ".video-tools",
+      ".fullscreen-btn",
       ".ptt-btn",
       ".play-btn",
       ".audio-info",
@@ -203,7 +206,7 @@ test("the card preserves keyboard holds and accessible unlock confirmation UX", 
   );
   const Card = registry.get(module.CARD_TAG);
   const card = new Card();
-  card.setConfig({ camera: "camera.door", unlock_button: "button.unlock" });
+  card.setConfig({ camera: "camera.door", unlock_button: "button.unlock", talk_mode: "hold" });
   card.hass = {
     connected: true,
     connection: { connected: true },
@@ -269,6 +272,32 @@ test("the card preserves keyboard holds and accessible unlock confirmation UX", 
     4,
     "focus loss clears the held key, so its later keyup cannot stop twice"
   );
+
+  // Toggle mode, the default: a click starts talking and a second click ends
+  // it. Releasing the pointer, leaving the button or losing focus does not.
+  card._config = { ...card._config, talk_mode: undefined };
+  card._render();
+  assert.equal(ptt.textContent, "Talk");
+  ptt.dispatch("click");
+  await settle();
+  const toggled = attachments.at(-1);
+  assert.equal(toggled.readyState, "live");
+  assert.equal(ptt.textContent, "Tap to stop");
+  assert.equal(ptt.classList.contains("talking"), true);
+  for (const name of ["pointerup", "pointerleave", "lostpointercapture", "focusout"]) {
+    ptt.dispatch(name, {});
+  }
+  windowEvents.dispatch("pointerup", {});
+  windowEvents.dispatch("blur", {});
+  ptt.dispatch("keydown", keyEvent(" "));
+  await settle();
+  assert.equal(toggled.readyState, "live");
+  ptt.dispatch("click");
+  await settle();
+  assert.equal(toggled.readyState, "ended");
+  assert.equal(attachments.at(-1), null);
+  assert.equal(ptt.textContent, "Talk");
+  card._config = { ...card._config, talk_mode: "hold" };
 
   // The form editor invokes these callbacks with its own `this`; callers may
   // also pass hass directly while the editor has not bound one yet.

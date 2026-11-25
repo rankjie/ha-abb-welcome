@@ -1,15 +1,16 @@
 # ABB Welcome Intercom card
 
 The ABB Welcome Intercom card is a Lovelace custom card for an ABB Welcome
-camera. It provides user-initiated live video, optional street audio,
-press-and-hold talkback, ringing indication, and a separately confirmed door
-unlock action. The expandable call history is independent of Live.
+camera. It provides user-initiated live video, street audio, talkback,
+ringing indication, and a separately confirmed door unlock action. The expandable call history is independent of Live.
 
 ## Configure the card
 
 The integration registers the card when an ABB config entry loads. Refresh the
 dashboard, add **ABB Welcome Intercom**, and choose an ABB camera. The editor
-offers an optional title, unlock button, ring sensor and station identifier.
+offers an optional title, unlock button, ring sensor and station identifier,
+how the **Talk** button works (`talk_mode`), and whether Live starts with sound
+(`start_with_sound`).
 The browser console logs the loaded card version.
 
 Home Assistant loads the card's module (about 2,500 lines of JavaScript) on
@@ -38,6 +39,8 @@ camera: camera.entry_intercom
 name: Entry intercom
 unlock_button: button.entry_unlock
 ring_sensor: binary_sensor.entry_ringing
+talk_mode: toggle        # or hold
+start_with_sound: true   # false starts Live muted
 ```
 
 Entity ids in the example are placeholders. Select entities from the local
@@ -47,8 +50,13 @@ installation rather than copying them unchanged.
 
 Select the black video area or **Live** to start. The video area is also a
 keyboard-accessible button. Opening the dashboard does not request a camera
-stream or microphone. **Stop** is always available while a live request,
+stream or microphone. **Live** becomes **Stop** while a live request,
 connection, or playback is active.
+
+The card keeps a fixed layout: the video area is always 16:9 and the button
+row (**Live**, **Talk**, **Unlock**) never moves. Status messages, the ring
+badge and the unlock confirmation appear over the video instead of pushing the
+buttons down.
 
 The video area reports these states in plain language:
 
@@ -58,7 +66,8 @@ The video area reports these states in plain language:
 - `playing`: video is rendering;
 - `buffering`: playback has stalled after it began;
 - `paused`: local playback was paused;
-- `playback blocked`: the browser prevented playback and needs a user gesture;
+- `playback blocked`: the browser prevented playback; select **Play video** in
+  the middle of the video;
 - `error`: live video could not be established or has timed out.
 
 The initial connection waits up to 15 seconds for a first frame. Once playback
@@ -73,8 +82,18 @@ which ABB stations do on their own call timeout, or when a ring or
 **Streaming enabled** window that Live was using closes. Press **Live** to
 call the station again.
 
-Street audio is controlled by the speaker button and is independent from the
-microphone. The speaker may be turned on or off without changing talkback.
+While Live runs, two buttons sit at the bottom right of the video, as in a
+normal video player. The speaker button mutes or unmutes street audio; its
+icon shows the current state, and it is disabled while the station sends no
+audio. Street audio is independent from the microphone. The full screen button
+enlarges the whole video area, including its buttons and messages; on iPhone,
+Safari only allows the video itself to go full screen, so the overlays are not
+shown there. **Stop** leaves full screen. The browser's own video controls are
+not shown.
+
+Live starts with sound unless `start_with_sound` is `false`. If the browser
+refuses to autoplay with sound, the card starts muted and says so; select the
+speaker button to listen.
 
 During a ring, the integration's **Preview a ringing call without answering**
 option also applies to this card. With it enabled, opening Live previews the
@@ -86,22 +105,28 @@ requires HTTPS. On HTTP the card keeps live video available and explains the
 microphone restriction. To talk, open Home Assistant at a trusted HTTPS address
 such as Nabu Casa, then allow microphone access when prompted.
 
-## Push to talk
+## Talk
 
-Start Live before holding **Talk**. Hold the button with a pointer, Space, or
-Enter to speak; releasing stops the microphone and detaches its track while
-the same live video and listening session continue. Releasing
-outside the button, moving keyboard focus away, leaving the page, hiding the
-document, disconnecting Home Assistant, or stopping Live also terminates the
-hold. This is deliberately fail-safe: the microphone is not kept warm in the
-background.
+Start Live before using **Talk**. `talk_mode` chooses how the button works:
+
+- `toggle` (default): select **Talk** once to turn the microphone on and again
+  to turn it off.
+- `hold`: hold the button with a pointer, Space, or Enter to speak; releasing
+  it, releasing outside the button, or moving keyboard focus away turns the
+  microphone off.
+
+While the microphone is on, the button is green and reads **MIC ON** with
+**Tap to stop** or **Release to stop**. Turning it off detaches the track while
+the same live video and listening session continue. In both modes, leaving the
+page, hiding the document, disconnecting Home Assistant, or stopping Live also
+turns the microphone off. The microphone is not kept warm in the background.
 
 The card uses Home Assistant's native two-way WebRTC audio. For a camera with
 the ABB RTSP backchannel enabled, HA can route the microphone through go2rtc
-to the intercom. No audio is captured before the first hold. **Microphone on**
+to the intercom. No audio is captured before Talk is first used. **MIC ON**
 means the browser attached a track; it does not prove that the visitor heard
-it. A permission denial or microphone error stays shown after you release
-Talk and can be retried on a later hold. If the camera or HA
+it. A permission denial or microphone error stays shown after the microphone
+turns off and can be retried with another press. If the camera or HA
 cannot negotiate a microphone channel, Live and listening still work, but Talk
 is unavailable. The card does not fall back to the ABB PCM services.
 Set `native_talkback: false` in the card YAML to disable the microphone control.
@@ -141,9 +166,11 @@ clears the displayed images from the card.
 
 ## Accessibility and narrow layouts
 
-All controls retain keyboard focus indicators and reachable names. On narrow
-screens the title wraps before the header controls overlap. The confirmation controls wrap for
-narrow mobile widths rather than overflowing the card.
+All controls retain keyboard focus indicators and reachable names; the video
+buttons are named by the action they perform. On narrow screens a long title is
+shortened with an ellipsis, and messages over the video are limited to two
+lines. The confirmation controls wrap for narrow mobile widths rather than
+overflowing the card.
 
 ## Tests
 

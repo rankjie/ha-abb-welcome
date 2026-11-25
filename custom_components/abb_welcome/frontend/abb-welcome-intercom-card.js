@@ -71,15 +71,17 @@ export const STRINGS = {
     live_unavailable:
       "Cannot start live view — check the camera and connection, then retry.",
     ptt: "Hold to talk",
-    requesting_mic: "Allow microphone access…",
+    toggle_talk: "Talk",
+    tap_to_stop: "Tap to stop",
+    release_to_stop: "Release to stop",
+    requesting_mic: "Allow mic access…",
     connecting: "Connecting…",
-    native_talking: "Microphone on — release to stop",
-    native_talk_unavailable: "This live stream did not negotiate a microphone channel",
-    mic_error: "Could not start the microphone",
-    mic_denied: "Microphone access denied — allow it in the browser settings",
-    https_required: "Microphone unavailable on HTTP",
+    native_talk_unavailable: "No mic channel on this stream",
+    mic_error: "Mic failed to start",
+    mic_denied: "Mic blocked — allow it in browser settings",
+    https_required: "Mic needs HTTPS",
     https_details: "To talk, open Home Assistant via HTTPS (for example Nabu Casa). Video and listening can still work on HTTP.",
-    no_media_devices: "Microphone access is not supported by this browser",
+    no_media_devices: "No mic access in this browser",
     unlock: "Unlock",
     unlock_confirm: "Open {target}?",
     confirm: "Open",
@@ -105,8 +107,10 @@ export const STRINGS = {
     history_photo_alt: "Call photo",
     history_photo_loading: "Loading photo…",
     history_photo_error: "Photo unavailable",
-    audio_on: "Listening enabled — mute",
-    audio_off: "Listen",
+    audio_mute: "Mute",
+    audio_listen: "Listen",
+    fullscreen: "Full screen",
+    exit_fullscreen: "Exit full screen",
     disconnected: "Home Assistant is disconnected",
     err_service: "Service call failed",
     err_pickup_disabled: "Pickup is disabled — check the Allow pickup switch",
@@ -139,15 +143,17 @@ export const STRINGS = {
     live_unavailable:
       "Impossibile avviare il video — controlla camera e connessione, poi riprova.",
     ptt: "Tieni premuto per parlare",
-    requesting_mic: "Consenti l'accesso al microfono…",
+    toggle_talk: "Parla",
+    tap_to_stop: "Tocca per chiudere",
+    release_to_stop: "Rilascia per chiudere",
+    requesting_mic: "Consenti l'accesso al mic…",
     connecting: "Connessione…",
-    native_talking: "Microfono attivo — rilascia per terminare",
-    native_talk_unavailable: "La diretta non ha negoziato un canale per il microfono",
-    mic_error: "Impossibile avviare il microfono",
-    mic_denied: "Microfono negato — consentilo nelle impostazioni del browser",
-    https_required: "Microfono non disponibile su HTTP",
+    native_talk_unavailable: "Nessun canale mic in questa diretta",
+    mic_error: "Avvio del mic non riuscito",
+    mic_denied: "Mic bloccato — consentilo nelle impostazioni del browser",
+    https_required: "Il mic richiede HTTPS",
     https_details: "Per parlare apri Home Assistant via HTTPS, ad esempio con Nabu Casa. Video e ascolto possono funzionare anche su HTTP.",
-    no_media_devices: "Questo browser non supporta l'accesso al microfono",
+    no_media_devices: "Nessun accesso al mic in questo browser",
     unlock: "Apri porta",
     unlock_confirm: "Aprire {target}?",
     confirm: "Apri",
@@ -173,8 +179,10 @@ export const STRINGS = {
     history_photo_alt: "Foto della chiamata",
     history_photo_loading: "Caricamento foto…",
     history_photo_error: "Foto non disponibile",
-    audio_on: "Ascolto abilitato — silenzia",
-    audio_off: "Ascolta",
+    audio_mute: "Silenzia",
+    audio_listen: "Ascolta",
+    fullscreen: "Schermo intero",
+    exit_fullscreen: "Esci da schermo intero",
     disconnected: "Home Assistant è disconnesso",
     err_service: "Chiamata al servizio fallita",
     err_pickup_disabled: "Risposta disabilitata — controlla lo switch Allow pickup",
@@ -194,26 +202,33 @@ export function pickLanguage(lang) {
 
 const FORM_STRINGS = {
   en: {
-    labels: { camera: "ABB camera", name: "Display name", unlock_button: "Unlock button (override)", ring_sensor: "Ring sensor (override)", station_id: "Station ID (advanced override)" },
+    labels: { camera: "ABB camera", name: "Display name", unlock_button: "Unlock button (override)", ring_sensor: "Ring sensor (override)", station_id: "Station ID (advanced override)", talk_mode: "Talk button", start_with_sound: "Sound on when Live starts" },
     helpers: {
       camera: "Choose the ABB Welcome camera for this entrance.",
       name: "Optional short title, for example Entrance. Empty uses the camera name.",
       unlock_button: "Leave empty for safe automatic discovery. An override may control another button: check the target shown before confirming.",
       ring_sensor: "Leave empty to discover the ABB ring sensor. Override only when automatic discovery cannot identify it.",
       station_id: "Normally leave empty: read from the camera. Only enter the exact ABB station ID if its metadata is missing; this is not an entity ID.",
+      talk_mode: "Toggle: tap once to talk, tap again to stop. Hold: talk only while the button is held.",
+      start_with_sound: "On by default. Off starts Live muted; Listen turns the sound on.",
     },
   },
   it: {
-    labels: { camera: "Camera ABB", name: "Nome visualizzato", unlock_button: "Pulsante apertura (override)", ring_sensor: "Sensore squillo (override)", station_id: "ID stazione (override avanzato)" },
+    labels: { camera: "Camera ABB", name: "Nome visualizzato", unlock_button: "Pulsante apertura (override)", ring_sensor: "Sensore squillo (override)", station_id: "ID stazione (override avanzato)", talk_mode: "Pulsante Parla", start_with_sound: "Audio attivo all'avvio del Live" },
     helpers: {
       camera: "Seleziona la camera ABB Welcome di questo ingresso.",
       name: "Titolo breve facoltativo, ad esempio Ingresso. Se vuoto usa il nome della camera.",
       unlock_button: "Lascia vuoto per il rilevamento automatico sicuro. Un override può comandare un altro pulsante: verifica il destinatario prima di confermare.",
       ring_sensor: "Lascia vuoto per rilevare il sensore squillo ABB. Impostalo solo se il rilevamento automatico non riesce a identificarlo.",
       station_id: "Normalmente lascia vuoto: viene letto dalla camera. Inserisci l'ID ABB esatto solo se manca nei metadati; non è un ID entità.",
+      talk_mode: "Attiva/disattiva: tocca una volta per parlare, di nuovo per smettere. Tieni premuto: parla solo mentre tieni premuto.",
+      start_with_sound: "Attivo per impostazione predefinita. Se disattivato il Live parte senza audio; Ascolta lo attiva.",
     },
   },
 };
+
+// Toggle suits a mouse; hold keeps the microphone on only while pressed.
+const TALK_MODES = ["toggle", "hold"];
 
 function validateCardConfig(config) {
   if (!config || typeof config.camera !== "string" || !/^camera\.[^\s.]+$/.test(config.camera)) {
@@ -233,6 +248,12 @@ function validateCardConfig(config) {
   }
   if (config.native_talkback != null && typeof config.native_talkback !== "boolean") {
     throw new Error('abb-welcome-intercom-card: "native_talkback" must be a boolean');
+  }
+  if (config.start_with_sound != null && typeof config.start_with_sound !== "boolean") {
+    throw new Error('abb-welcome-intercom-card: "start_with_sound" must be a boolean');
+  }
+  if (config.talk_mode != null && !TALK_MODES.includes(config.talk_mode)) {
+    throw new Error('abb-welcome-intercom-card: "talk_mode" must be "toggle" or "hold"');
   }
 }
 
@@ -800,6 +821,8 @@ export class NativeTalkbackMachine {
     this._idle();
   }
 
+  get holding() { return this._hold !== null; }
+
   // Ends the user's hold. A mic_denied or error state stays visible.
   release() {
     if (!this._hold) return;
@@ -1081,19 +1104,6 @@ const BaseElement = typeof HTMLElement === "undefined" ? class {} : HTMLElement;
 
 // Hand-drawn geometric glyphs (hexagon speaker cone + arcs/lines), not traced
 // from any icon set — safe to inline without attribution.
-const SPEAKER_ON_SVG = `
-  <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" focusable="false">
-    <polygon points="3,9 7,9 12,4 12,20 7,15 3,15" fill="currentColor"/>
-    <path d="M15.5 8.5a5 5 0 0 1 0 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-    <path d="M18 6a9 9 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-  </svg>
-`;
-const SPEAKER_OFF_SVG = `
-  <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" focusable="false">
-    <polygon points="3,9 7,9 12,4 12,20 7,15 3,15" fill="currentColor"/>
-    <path d="M16 9l5 5M21 9l-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-  </svg>
-`;
 const PLACEHOLDER_ICON_SVG = `
   <svg viewBox="0 0 24 24" width="40" height="40" aria-hidden="true" focusable="false">
     <rect x="2.5" y="7" width="13" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.6"/>
@@ -1103,36 +1113,36 @@ const PLACEHOLDER_ICON_SVG = `
 `;
 
 const CARD_CSS = `
-  :host { display: block; }
+  :host {
+    display: block;
+    --icon-play: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M8 5.14v14l11-7z'/%3E%3C/svg%3E");
+    --icon-stop: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 6h12v12H6z'/%3E%3C/svg%3E");
+    --icon-speaker: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3 9h4l5-5v16l-5-5H3z'/%3E%3Cpath d='M15.5 8.5a5 5 0 0 1 0 7M18 6a9 9 0 0 1 0 12' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+    --icon-speaker-off: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3 9h4l5-5v16l-5-5H3z'/%3E%3Cpath d='M16 9l5 5M21 9l-5 5' stroke='%23000' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+    --icon-mic: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3m7 9c0 3.53-2.61 6.44-6 6.93V21h-2v-3.07c-3.39-.49-6-3.4-6-6.93h2a5 5 0 0 0 10 0z'/%3E%3C/svg%3E");
+    --icon-mic-off: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M19 11c0 1.19-.34 2.3-.9 3.28l-1.23-1.23c.27-.62.43-1.31.43-2.05zm-4 .16L9 5.18V5a3 3 0 0 1 6 0v6zM4.27 3 21 19.73 19.73 21l-4.19-4.19c-.77.46-1.63.77-2.54.91V21h-2v-3.28C7.72 17.23 5 14.41 5 11h1.7c0 3 2.54 5.1 5.3 5.1.81 0 1.6-.19 2.31-.52l-1.66-1.66L12 14a3 3 0 0 1-3-3v-.72l-6-6z'/%3E%3C/svg%3E");
+    --icon-lock-open: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M18 1a5 5 0 0 0-5 5v2H4a2 2 0 0 0-2 2v10c0 1.11.9 2 2 2h12a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2h-1V6a3 3 0 0 1 6 0v2h2V6a5 5 0 0 0-5-5m-8 12a2 2 0 1 1 0 4 2 2 0 0 1 0-4'/%3E%3C/svg%3E");
+    --icon-fullscreen: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M5 5h5v2H7v3H5zm9 0h5v5h-2V7h-3zm3 9h2v5h-5v-2h3zm-7 3v2H5v-5h2v3z'/%3E%3C/svg%3E");
+    --icon-fullscreen-exit: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M14 14h5v2h-3v3h-2zm-9 0h5v5H8v-3H5zm3-9h2v5H5V8h3zm11 3v2h-5V5h2v3z'/%3E%3C/svg%3E");
+  }
   ha-card { overflow: hidden; }
   .header {
-    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
-    gap: 12px; padding: 12px 16px 8px;
+    display: flex; align-items: center; min-height: 44px; box-sizing: border-box;
+    padding: 8px 16px;
   }
   .name {
-    flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere;
+    flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
     font-size: 1.1em; font-weight: 500; color: var(--primary-text-color);
   }
-  .header-meta {
-    display: inline-flex; align-items: center; justify-content: flex-end;
-    flex: 0 0 auto; flex-wrap: wrap; gap: 8px; max-width: 100%; margin-left: auto;
+  /* Everything that comes and goes sits on the fixed 16:9 video area, so the
+     controls below never move. */
+  .media { position: relative; overflow: hidden; background: #000; aspect-ratio: 16 / 9; }
+  .media > video {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    display: block; object-fit: contain; background: #000;
   }
-  .ring-badge {
-    display: inline-flex; align-items: center; gap: 6px;
-    background: var(--warning-color, #ffa600); color: var(--text-primary-color, #fff);
-    border-radius: 12px; padding: 2px 10px; font-size: 0.85em;
-    animation: abb-pulse 1s ease-in-out infinite alternate;
-  }
-  @keyframes abb-pulse { from { opacity: 1; } to { opacity: 0.55; } }
-  @media (prefers-reduced-motion: reduce) { .ring-badge { animation: none; } }
-  .media {
-    position: relative; background: #000; aspect-ratio: 16 / 9;
-    display: flex; align-items: center; justify-content: center;
-  }
-  .media > * { width: 100%; height: 100%; }
-  .media > video { display: block; object-fit: contain; background: #000; }
-  .media > .placeholder { position: absolute; inset: 0; }
   .placeholder {
+    position: absolute; inset: 0; width: 100%; height: 100%;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 8px; color: rgba(255, 255, 255, 0.65);
     appearance: none; margin: 0; padding: 12px; border: 0;
@@ -1145,50 +1155,115 @@ const CARD_CSS = `
   .placeholder:disabled { cursor: default; }
   .placeholder svg { opacity: 0.8; }
   .placeholder-text { font-size: 0.9em; }
-  .status {
-    min-height: 1.4em; padding: 6px 16px 0; font-size: 0.92em;
-    color: var(--secondary-text-color);
+  .overlay-top {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 2;
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 10px 12px 28px; pointer-events: none;
+    background: linear-gradient(rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0));
+    transition: opacity 160ms ease;
   }
-  .status.error { color: var(--error-color, #b3261e); }
-  .mic-info, .audio-info { padding: 4px 16px; font-size: 0.85em; color: var(--secondary-text-color); }
-  .mic-info summary { cursor: pointer; min-height: 24px; }
-  .mic-info p { margin: 4px 0; }
+  .overlay-top.empty { opacity: 0; }
+  .ring-badge {
+    flex: none; display: inline-flex; align-items: center; gap: 6px;
+    background: var(--warning-color, #ffa600); color: var(--text-primary-color, #fff);
+    border-radius: 12px; padding: 2px 10px; font-size: 0.85em; line-height: 1.5;
+    animation: abb-pulse 1s ease-in-out infinite alternate;
+  }
+  @keyframes abb-pulse { from { opacity: 1; } to { opacity: 0.55; } }
+  .status {
+    flex: 1 1 auto; min-width: 0; color: #fff; font-size: 0.9em; line-height: 1.5;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6); overflow-wrap: anywhere;
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+  }
+  .status.error { color: #ffb4ab; }
+  button.btn.play-btn {
+    position: absolute; left: 50%; top: 50%; z-index: 2; transform: translate(-50%, -50%);
+    background: rgba(0, 0, 0, 0.6); color: #fff; border-color: rgba(255, 255, 255, 0.5);
+  }
+  .confirm-wrap {
+    position: absolute; inset: 0; z-index: 3;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; padding: 16px; box-sizing: border-box; text-align: center;
+    background: rgba(0, 0, 0, 0.78); color: #fff;
+  }
+  .confirm-label { max-width: 100%; overflow-wrap: anywhere; font-size: 1em; }
+  .confirm-buttons { display: flex; gap: 8px; }
+  button.btn.confirm-no { background: rgba(255, 255, 255, 0.12); color: #fff; border-color: rgba(255, 255, 255, 0.4); }
+  button.btn.confirm-yes { background: var(--error-color, #b3261e); border-color: var(--error-color, #b3261e); color: #fff; }
+  @media (prefers-reduced-motion: reduce) {
+    .ring-badge { animation: none; }
+    .overlay-top { transition: none; }
+  }
+  /* Each label names what a tap does; colour shows the current state
+     (blue: live, green: talking). */
   .controls {
-    display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 16px 16px;
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr) minmax(0, 1fr);
+    gap: 8px; padding: 12px 16px 16px;
   }
   button.btn {
     min-height: 44px; min-width: 44px; padding: 0 16px;
     border: 1px solid var(--divider-color, #444); border-radius: 10px;
     background: var(--secondary-background-color, #333);
     color: var(--primary-text-color, #eee);
-    font: inherit; cursor: pointer;
+    font: inherit; white-space: nowrap; cursor: pointer;
     touch-action: manipulation; user-select: none; -webkit-user-select: none;
+    transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+  }
+  .controls button.btn {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 4px; min-width: 0; min-height: 60px; padding: 6px 4px; overflow: hidden;
+    font-size: 0.8em; line-height: 1.2;
+  }
+  .controls button.btn::before {
+    content: ""; flex: none; width: 22px; height: 22px; background: currentColor;
+    -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat;
   }
   button.btn:focus-visible {
     outline: 2px solid var(--primary-color, #03a9f4); outline-offset: 2px;
   }
   button.btn[disabled] { opacity: 0.5; cursor: not-allowed; }
-  button.icon-btn {
+  button.live-btn { --icon: var(--icon-play); }
+  button.live-btn.stop { --icon: var(--icon-stop); }
+  button.live-btn.active { background: var(--primary-color, #03a9f4); border-color: var(--primary-color, #03a9f4); color: #fff; }
+  /* Sound and fullscreen sit on the video like a regular player's controls;
+     their icons show the current state. */
+  .video-tools { position: absolute; right: 10px; bottom: 10px; z-index: 2; display: flex; gap: 8px; }
+  .video-tools button {
+    width: 40px; height: 40px; padding: 0; border: 0; border-radius: 50%;
+    background: rgba(0, 0, 0, 0.55); color: #fff; cursor: pointer;
     display: inline-flex; align-items: center; justify-content: center;
-    padding: 0; width: 44px;
+    transition: background-color 120ms ease;
   }
-  button.icon-btn svg { display: block; }
-  button.live-btn.active { background: var(--primary-color, #03a9f4); color: #fff; }
-  button.audio-btn.active { background: var(--primary-color, #03a9f4); color: #fff; }
-  button.audio-btn.attention {
-    border-color: var(--warning-color, #ffa600);
-    color: var(--warning-color, #ffa600);
+  .video-tools button:hover { background: rgba(0, 0, 0, 0.75); }
+  .video-tools button:focus-visible { outline: 2px solid var(--primary-color, #03a9f4); outline-offset: 2px; }
+  .video-tools button[disabled] { opacity: 0.45; cursor: not-allowed; }
+  .video-tools button::before {
+    content: ""; width: 22px; height: 22px; background: currentColor;
+    -webkit-mask: var(--icon) center / contain no-repeat; mask: var(--icon) center / contain no-repeat;
   }
-  button.ptt-btn { flex: 1 1 40%; touch-action: none; }
+  button.audio-btn { --icon: var(--icon-speaker-off); }
+  button.audio-btn.active { --icon: var(--icon-speaker); }
+  button.fullscreen-btn { --icon: var(--icon-fullscreen); }
+  button.fullscreen-btn.active { --icon: var(--icon-fullscreen-exit); }
+  .media:fullscreen { aspect-ratio: auto; width: 100%; height: 100%; }
+  button.ptt-btn { --icon: var(--icon-mic); touch-action: none; }
+  /* While the mic is on, its state takes the icon's place and the label says
+     how to stop, so the button keeps the same two lines. */
+  .controls button.ptt-btn.talking::before {
+    content: "MIC ON"; width: auto; height: 22px; line-height: 22px;
+    background: none; -webkit-mask: none; mask: none;
+    font-weight: 700; letter-spacing: 0.04em;
+  }
   button.ptt-btn.talking {
+    --icon: var(--icon-mic-off);
     background: var(--success-color, #0f9d58); color: #fff;
     border-color: var(--success-color, #0f9d58);
   }
-  button.ptt-btn.connecting { background: var(--warning-color, #ffa600); color: #fff; }
-  button.unlock-btn { border-color: var(--error-color, #b3261e); }
-  .confirm-wrap { display: flex; flex: 1 1 100%; flex-wrap: wrap; gap: 8px; align-items: center; min-width: 0; }
-  .confirm-label { flex: 1 1 100%; overflow-wrap: anywhere; font-size: 0.92em; color: var(--primary-text-color); }
-  button.confirm-yes { background: var(--error-color, #b3261e); color: #fff; }
+  button.ptt-btn.connecting {
+    --icon: var(--icon-mic-off);
+    background: var(--warning-color, #ffa600); border-color: var(--warning-color, #ffa600); color: #fff;
+  }
+  button.unlock-btn { --icon: var(--icon-lock-open); grid-column: 3; border-color: var(--error-color, #b3261e); }
   .call-history { padding: 0 16px 12px; border-top: 1px solid var(--divider-color, #444); }
   .history-summary { line-height: 44px; cursor: pointer; }
   .history-summary:focus-visible { outline: 2px solid var(--primary-color, #03a9f4); }
@@ -1296,6 +1371,11 @@ export class AbbWelcomeIntercomCard extends BaseElement {
           selector: { entity: { domain: "binary_sensor" } },
         },
         { name: "station_id", selector: { text: {} } },
+        {
+          name: "talk_mode",
+          selector: { select: { mode: "dropdown", options: TALK_MODES } },
+        },
+        { name: "start_with_sound", selector: { boolean: {} } },
       ],
       // HA calls these as methods of its form editor, supplying this.hass.
       computeLabel(schema) { return stringsFor(this).labels[schema.name]; },
@@ -1383,10 +1463,10 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     if (this._config && !this._machine) this._buildMachines();
     else if (this._config && !this._unlock) this._buildUnlockMachine();
     if (this._windowListeners) return;
-    const onPointerUp = () => this._machine?.release();
+    const onPointerUp = () => { if (this._holdMode()) this._machine?.release(); };
     const onBlur = () => {
       this._releaseKeyboardHold();
-      this._machine?.release();
+      if (this._holdMode()) this._machine?.release();
     };
     const onKeyUp = (event) => {
       if (this._pttKey && event.key === this._pttKey) this._releaseKeyboardHold();
@@ -1668,7 +1748,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
         // would reset playback and could discard the first-frame observation.
         if (this._playerEl.srcObject !== stream) {
           this._playerEl.srcObject = stream;
-          this._playVideo();
+          this._playVideo(this._audioUnmuted);
         }
         this._render();
       },
@@ -1697,13 +1777,14 @@ export class AbbWelcomeIntercomCard extends BaseElement {
   _mountPlayer() {
     this._unmountPlayer();
     const el = document.createElement("video");
-    el.controls = true;
+    // The card draws its own sound and fullscreen buttons over the video.
+    el.controls = false;
     el.autoplay = true;
     el.playsInline = true;
-    // Muting the native element permits autoplay but does not affect WebRTC
-    // track attachment. The Audio button can therefore recover street audio.
-    this._audioUnmuted = false;
-    el.muted = true;
+    // Live is started by a tap, which most browsers accept for sound. One that
+    // still refuses gets muted video and the Listen button (see _playVideo).
+    this._audioUnmuted = this._config.start_with_sound !== false;
+    el.muted = !this._audioUnmuted;
     el.addEventListener("volumechange", () => {
       const unmuted = !el.muted && el.volume > 0;
       if (unmuted === this._audioUnmuted) return;
@@ -1772,6 +1853,25 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     });
   }
 
+  _isFullscreen() {
+    return Boolean(this.shadowRoot?.fullscreenElement) &&
+      this.shadowRoot.fullscreenElement === this._refs?.media;
+  }
+
+  _toggleFullscreen() {
+    if (this._isFullscreen()) {
+      void document.exitFullscreen?.().catch(() => {});
+      return;
+    }
+    const media = this._refs.media;
+    if (typeof media.requestFullscreen === "function") {
+      void media.requestFullscreen().catch(() => {});
+    } else {
+      // iPhone Safari only takes the video element itself fullscreen.
+      this._playerEl?.webkitEnterFullscreen?.();
+    }
+  }
+
   _toggleAudio() {
     this._audioUnmuted = !this._audioUnmuted;
     this._applyAudio();
@@ -1805,6 +1905,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
   }
 
   _stopLive() {
+    if (this._isFullscreen()) void document.exitFullscreen?.().catch(() => {});
     this._liveGeneration++;
     this._clearLiveStartTimer();
     this._pttKey = "";
@@ -2054,33 +2155,33 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       <ha-card>
         <div class="header">
           <span class="name"></span>
-          <span class="header-meta">
-            <span class="ring-badge hidden" role="status"></span>
-          </span>
         </div>
         <div class="media">
           <button class="placeholder" type="button" disabled>
             ${PLACEHOLDER_ICON_SVG}
             <span class="placeholder-text"></span>
           </button>
+          <div class="overlay-top empty">
+            <span class="ring-badge hidden" role="status"></span>
+            <div class="status" role="status" aria-live="polite"></div>
+          </div>
+          <button class="btn play-btn hidden" type="button"></button>
+          <div class="video-tools hidden">
+            <button class="fullscreen-btn" type="button"></button>
+            <button class="audio-btn" type="button" disabled></button>
+          </div>
+          <div class="confirm-wrap hidden" role="group" aria-labelledby="confirm-label">
+            <span class="confirm-label" id="confirm-label"></span>
+            <div class="confirm-buttons">
+              <button class="btn confirm-no" type="button"></button>
+              <button class="btn confirm-yes" type="button"></button>
+            </div>
+          </div>
         </div>
-        <div class="status" role="status" aria-live="polite"></div>
-        <div class="audio-info hidden" role="status"></div>
-        <details class="mic-info hidden">
-          <summary class="mic-summary"></summary>
-          <p class="mic-detail"></p>
-        </details>
         <div class="controls">
           <button class="btn live-btn" type="button"></button>
-          <button class="btn play-btn hidden" type="button"></button>
-          <button class="btn icon-btn audio-btn hidden" type="button" aria-pressed="false"></button>
-          <button class="btn ptt-btn" type="button" aria-pressed="false"></button>
+          <button class="btn ptt-btn" type="button"></button>
           <button class="btn unlock-btn" type="button"></button>
-          <span class="confirm-wrap hidden" role="group" aria-labelledby="confirm-label">
-            <span class="confirm-label" id="confirm-label"></span>
-            <button class="btn confirm-yes" type="button"></button>
-            <button class="btn confirm-no" type="button"></button>
-          </span>
         </div>
         <details class="call-history hidden">
           <summary class="history-summary"></summary>
@@ -2103,13 +2204,12 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       placeholder: root.querySelector(".placeholder"),
       placeholderText: root.querySelector(".placeholder-text"),
       status: root.querySelector(".status"),
-      audioInfo: root.querySelector(".audio-info"),
-      micInfo: root.querySelector(".mic-info"),
-      micSummary: root.querySelector(".mic-summary"),
-      micDetail: root.querySelector(".mic-detail"),
+      overlayTop: root.querySelector(".overlay-top"),
       liveBtn: root.querySelector(".live-btn"),
       playBtn: root.querySelector(".play-btn"),
       audioBtn: root.querySelector(".audio-btn"),
+      videoTools: root.querySelector(".video-tools"),
+      fullscreenBtn: root.querySelector(".fullscreen-btn"),
       pttBtn: root.querySelector(".ptt-btn"),
       unlockBtn: root.querySelector(".unlock-btn"),
       confirmWrap: root.querySelector(".confirm-wrap"),
@@ -2145,10 +2245,19 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       void this._startLive();
     });
     this._refs.audioBtn.addEventListener("click", () => this._toggleAudio());
+    this._refs.fullscreenBtn.addEventListener("click", () => this._toggleFullscreen());
+    this._refs.media.addEventListener("fullscreenchange", () => this._render());
     this._refs.playBtn.addEventListener("click", () => this._playVideo());
 
     const ptt = this._refs.pttBtn;
+    // Toggle mode: a click (also Space or Enter) starts or ends talking.
+    ptt.addEventListener("click", () => {
+      if (this._holdMode() || ptt.disabled || !this._machine) return;
+      if (this._machine.holding) this._machine.release();
+      else void this._machine.press();
+    });
     ptt.addEventListener("pointerdown", (event) => {
+      if (!this._holdMode()) return;
       event.preventDefault();
       if (ptt.disabled) return;
       try {
@@ -2159,11 +2268,11 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       this._machine.press();
     });
     for (const name of ["pointerup", "pointercancel", "pointerleave", "lostpointercapture"]) {
-      ptt.addEventListener(name, () => this._machine?.release());
+      ptt.addEventListener(name, () => { if (this._holdMode()) this._machine?.release(); });
     }
     ptt.addEventListener("contextmenu", (event) => event.preventDefault());
     ptt.addEventListener("keydown", (event) => {
-      if (event.key === " " || event.key === "Enter") {
+      if (this._holdMode() && (event.key === " " || event.key === "Enter")) {
         event.preventDefault();
         if (ptt.disabled || event.repeat || this._pttKey) return;
         this._pttKey = event.key;
@@ -2179,7 +2288,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     ptt.addEventListener("focusout", () => {
       this._releaseKeyboardHold();
       // Pointer holds are also released if focus moves away from the control.
-      this._machine?.release();
+      if (this._holdMode()) this._machine?.release();
     });
 
     this._refs.unlockBtn.addEventListener("click", () => {
@@ -2202,6 +2311,10 @@ export class AbbWelcomeIntercomCard extends BaseElement {
         this._unlock.cancel();
       }
     });
+  }
+
+  _holdMode() {
+    return this._config?.talk_mode === "hold";
   }
 
   _releaseKeyboardHold() {
@@ -2230,6 +2343,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     this._render();
   }
 
+  // One message for the video overlay, most important first.
   _statusText() {
     const s = this._strings;
     if (this._statusOverride) {
@@ -2241,35 +2355,31 @@ export class AbbWelcomeIntercomCard extends BaseElement {
         return { text: `${s.error}: ${this._unlock.errorText}`, error: true };
       }
     }
-    if (this._config.native_talkback !== false && this._machine) {
-      switch (this._machine.state) {
-        case "unsupported":
-          break; // Microphone capability is shown separately from video state.
-        case "mic_denied":
-          return { text: s.mic_denied, error: true };
-        case "requesting_mic":
-          return { text: s.requesting_mic, error: false };
-        case "starting":
-          return { text: s.connecting, error: false };
-        case "talking":
-          return { text: s.native_talking, error: false };
-        case "error":
-          return {
-            text: s.mic_error,
-            error: true,
-          };
-        default:
-          break;
+    const talk = this._config.native_talkback !== false && this._machine;
+    if (talk && this._machine.state === "mic_denied") return { text: s.mic_denied, error: true };
+    if (talk && this._machine.state === "error") return { text: s.mic_error, error: true };
+    if (talk && this._machine.state === "requesting_mic") return { text: s.requesting_mic, error: false };
+    if (talk && this._machine.state === "starting") return { text: s.connecting, error: false };
+    if (talk && this._live === true) {
+      const unsupported = this._machine.state === "unsupported" &&
+        supportMessage(this._machine.supportReason, s);
+      if (unsupported) return { text: unsupported, error: false };
+      if (this._webRtc?.nativeMicNegotiated && !this._webRtc.nativeMicReady) {
+        return { text: s.native_talk_unavailable, error: false };
       }
     }
     const mediaText = {
-      connecting: s.live_starting, waiting: s.video_waiting,
-      playing: s.video_playing, buffering: s.video_buffering,
+      waiting: s.video_waiting, buffering: s.video_buffering,
       paused: s.video_paused, blocked: s.video_blocked,
     }[this._mediaState];
     if (mediaText) return { text: mediaText, error: false };
-    if (this._live === "starting") return { text: s.live_starting, error: false };
-    if (this._live !== true) return { text: "", error: false };
+    if (this._audioBlocked) return { text: s.audio_blocked, error: false };
+    if (this._live === true && !this._hasIncomingAudio) {
+      return {
+        text: this._mediaState === "playing" ? s.audio_missing : s.audio_waiting,
+        error: false,
+      };
+    }
     return { text: "", error: false };
   }
 
@@ -2320,6 +2430,7 @@ export class AbbWelcomeIntercomCard extends BaseElement {
 
     // live button
     refs.liveBtn.textContent = this._live ? s.stop : s.live;
+    refs.liveBtn.classList.toggle("stop", Boolean(this._live));
     refs.liveBtn.classList.toggle("active", this._mediaState === "playing");
     // A slow arm/signaling request must remain cancellable by the user.
     refs.liveBtn.disabled = !this._hass;
@@ -2327,28 +2438,17 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     refs.playBtn.textContent = s.play_video;
 
     // audio toggle (only meaningful while the player is mounted)
-    refs.audioBtn.classList.toggle("hidden", this._live !== true);
-    refs.audioBtn.disabled = !this._hasIncomingAudio;
-    refs.audioBtn.innerHTML = this._audioUnmuted
-      ? SPEAKER_ON_SVG
-      : SPEAKER_OFF_SVG;
-    const audioLabel = this._audioUnmuted ? s.audio_on : s.audio_off;
-    refs.audioBtn.setAttribute("aria-label", audioLabel);
-    refs.audioBtn.title = audioLabel;
-    refs.audioBtn.classList.toggle("active", this._audioUnmuted);
-    refs.audioBtn.classList.toggle(
-      "attention",
-      this._live === true && this._hasIncomingAudio && !this._audioUnmuted
-    );
-    refs.audioBtn.setAttribute(
-      "aria-pressed",
-      this._audioUnmuted ? "true" : "false"
-    );
-    const audioMessage = this._audioBlocked ? s.audio_blocked :
-      this._live === true && !this._hasIncomingAudio ?
-        (this._mediaState === "playing" ? s.audio_missing : s.audio_waiting) : "";
-    refs.audioInfo.textContent = audioMessage;
-    refs.audioInfo.classList.toggle("hidden", !audioMessage);
+    refs.videoTools.classList.toggle("hidden", this._live !== true);
+    refs.audioBtn.disabled = this._live !== true || !this._hasIncomingAudio;
+    const audioAction = this._audioUnmuted ? s.audio_mute : s.audio_listen;
+    refs.audioBtn.setAttribute("aria-label", audioAction);
+    refs.audioBtn.title = audioAction;
+    refs.audioBtn.classList.toggle("active", this._audioUnmuted && !refs.audioBtn.disabled);
+    const fullscreen = this._isFullscreen();
+    const fullscreenAction = fullscreen ? s.exit_fullscreen : s.fullscreen;
+    refs.fullscreenBtn.setAttribute("aria-label", fullscreenAction);
+    refs.fullscreenBtn.title = fullscreenAction;
+    refs.fullscreenBtn.classList.toggle("active", fullscreen);
 
     // ptt button
     const machineState = this._machine ? this._machine.state : "blocked";
@@ -2359,32 +2459,21 @@ export class AbbWelcomeIntercomCard extends BaseElement {
       );
     refs.pttBtn.disabled = !pttEnabled;
     refs.pttBtn.classList.toggle("hidden", this._config.native_talkback === false);
-    refs.pttBtn.textContent =
-      machineState === "talking"
-        ? s.native_talking
-        : machineState === "starting"
-          ? s.connecting
-          : machineState === "requesting_mic"
-            ? s.requesting_mic
-            : s.ptt;
+    const hold = this._holdMode();
+    // Short labels fit the fixed button; progress text goes to the video overlay.
+    const talkActive = ["talking", "starting", "requesting_mic"].includes(machineState);
+    refs.pttBtn.textContent = talkActive
+      ? (hold ? s.release_to_stop : s.tap_to_stop)
+      : hold ? s.ptt : s.toggle_talk;
     refs.pttBtn.classList.toggle("talking", machineState === "talking");
     refs.pttBtn.classList.toggle(
       "connecting",
-      machineState === "starting"
+      machineState === "starting" || machineState === "requesting_mic"
     );
-    refs.pttBtn.setAttribute(
-      "aria-pressed",
-      machineState === "talking" ? "true" : "false"
-    );
-    refs.pttBtn.setAttribute("aria-label", s.ptt);
-    const unsupported = this._config.native_talkback !== false && machineState === "unsupported";
-    const noNativeChannel = this._config.native_talkback !== false && this._live === true &&
-      this._webRtc?.nativeMicNegotiated && !this._webRtc.nativeMicReady;
-    refs.micInfo.classList.toggle("hidden", !unsupported && !noNativeChannel);
-    refs.micSummary.textContent = unsupported ? supportMessage(this._machine.supportReason, s) :
-      noNativeChannel ? s.native_talk_unavailable : "";
-    refs.micDetail.textContent = this._machine?.supportReason === "insecure-context" ? s.https_details :
-      supportMessage(this._machine?.supportReason, s);
+    // The buttons name the action a tap takes, so they carry no aria-pressed.
+    refs.pttBtn.title = this._machine?.supportReason === "insecure-context"
+      ? `${s.https_required}. ${s.https_details}`
+      : "";
 
     // unlock
     const unlockEntity = this._hass ? this._unlockEntity() : "";
@@ -2403,11 +2492,9 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     }
     refs.unlockBtn.textContent = s.unlock;
     refs.unlockBtn.disabled =
-      !unlockAvailable || !this._unlock || unlockState === "busy";
-    refs.unlockBtn.classList.toggle(
-      "hidden",
-      unlockState === "confirm" || !unlockAvailable
-    );
+      !unlockAvailable || !this._unlock || unlockState === "busy" || confirming;
+    // Hidden only without any unlock target; an unavailable one stays in place.
+    refs.unlockBtn.classList.toggle("hidden", !unlockEntity);
     refs.confirmWrap.classList.toggle("hidden", unlockState !== "confirm");
     refs.confirmLabel.textContent = s.unlock_confirm.replace("{target}", this._unlockTargetLabel);
     refs.confirmYes.textContent = s.confirm;
@@ -2419,10 +2506,11 @@ export class AbbWelcomeIntercomCard extends BaseElement {
     }
     this._wasUnlockConfirm = confirming;
 
-    // status line
+    // video overlay: ring badge and one message, drawn over the fixed video area
     const status = this._statusText();
     refs.status.textContent = status.text;
     refs.status.classList.toggle("error", status.error);
+    refs.overlayTop.classList.toggle("empty", !status.text && !ringing);
   }
 }
 

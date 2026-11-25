@@ -82,6 +82,7 @@ class FakeRoot extends FakeNode {
         ".placeholder",
         ".placeholder-text",
         ".status",
+        ".overlay-top",
         ".audio-info",
         ".mic-info",
         ".mic-summary",
@@ -89,6 +90,8 @@ class FakeRoot extends FakeNode {
         ".live-btn",
         ".play-btn",
         ".audio-btn",
+        ".video-tools",
+        ".fullscreen-btn",
         ".ptt-btn",
         ".unlock-btn",
         ".confirm-wrap",
@@ -175,7 +178,7 @@ test("native video unmute and mic-denied retry work through the real card", asyn
     "../../custom_components/abb_welcome/frontend/abb-welcome-intercom-card.js?dom-smoke");
   const Card = registry.get("abb-welcome-intercom-card");
   const card = new Card();
-  card.setConfig({ camera: "camera.door", unlock_button: "button.unlock" });
+  card.setConfig({ camera: "camera.door", unlock_button: "button.unlock", talk_mode: "hold", start_with_sound: false });
   card.hass = {
     connected: true,
     connection: { connected: true },
@@ -403,11 +406,12 @@ test("native video unmute and mic-denied retry work through the real card", asyn
   card._playerEl.muted = true;
   card._playerEl.listeners.get("volumechange")();
   assert.equal(card._audioUnmuted, false);
+  card._hasIncomingAudio = true;
   card._toggleAudio();
   assert.equal(card._playerEl.muted, false);
   assert.equal(card._playerEl.playCalls, 1);
   assert.equal(card._refs.audioBtn.classList.contains("active"), true);
-  assert.equal(card._refs.audioBtn.attributes.get("aria-pressed"), "true");
+  assert.equal(card._refs.audioBtn.attributes.get("aria-label"), "Mute");
 
   globalThis.document.visibilityState = "hidden";
   documentListeners.get("visibilitychange")();

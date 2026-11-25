@@ -499,3 +499,40 @@ test("an ended live window stops Live and says so", async () => {
   window.callback({ ended: true });
   assert.equal(fixture.peer.closes, 1, "a late repeat is ignored");
 });
+
+async function attachStream(fixture, config = {}) {
+  fixture.card.setConfig({ camera: "camera.front", ...config });
+  fixture.peer.setRemoteDescription = async () => {};
+  const video = await startToSubscribed(fixture);
+  const ws = fixture.calls.find(item => item.type === "subscribe");
+  ws.callback({ type: "answer", answer: "answer" });
+  await settle();
+  return video;
+}
+
+test("Live starts with sound unless start_with_sound is off", async () => {
+  for (const [config, muted] of [[{}, false], [{ start_with_sound: false }, true]]) {
+    const fixture = makeCard();
+    const video = await attachStream(fixture, config);
+    fixture.peer.ontrack({ track: new FakeTrack("video") });
+    fixture.peer.ontrack({ track: new FakeTrack("audio") });
+    await settle();
+    assert.equal(video.muted, muted);
+    assert.equal(fixture.card._audioUnmuted, !muted);
+    assert.equal(fixture.card._audioBlocked, false);
+    fixture.card._stopLive();
+  }
+});
+
+test("a browser that refuses sound at Live start plays muted and offers Listen", async () => {
+  const fixture = makeCard();
+  const video = await attachStream(fixture);
+  video.playPlan.push({ name: "NotAllowedError" });
+  fixture.peer.ontrack({ track: new FakeTrack("video") });
+  await settle();
+  assert.equal(video.muted, true);
+  assert.equal(fixture.card._audioUnmuted, false);
+  assert.equal(fixture.card._audioBlocked, true);
+  assert.equal(video.playCalls, 2);
+  assert.equal(fixture.card._live, true);
+});

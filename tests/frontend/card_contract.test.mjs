@@ -22,7 +22,12 @@ test("built-in editor exposes the supported configuration fields", () => {
     "unlock_button",
     "ring_sensor",
     "station_id",
+    "talk_mode",
+    "start_with_sound",
   ]);
+  assert.deepEqual(form.schema.at(-2).selector.select.options, ["toggle", "hold"]);
+  assert.throws(() => form.assertConfig({ camera: "camera.door", start_with_sound: "yes" }));
+  assert.throws(() => form.assertConfig({ camera: "camera.door", talk_mode: "push" }));
   assert.equal(form.schema[0].required, true);
   assert.deepEqual(form.schema[0].selector, {
     entity: { domain: "camera", integration: "abb_welcome" },
