@@ -16,6 +16,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
+from homeassistant.components import persistent_notification
 from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.start import async_at_start
 from homeassistant.helpers.storage import Store
@@ -72,6 +73,15 @@ from .credential_export import (
 )
 from .portal import GatewayAdminError, _gateway_login
 from .redaction import get_redacting_logger
+from .relay_probe import (
+    DEFAULT_PROBES as DEFAULT_RELAY_PROBES,
+    DEFAULT_WAIT_SECONDS as DEFAULT_RELAY_PROBE_WAIT,
+    MAX_PROBES as MAX_RELAY_PROBES,
+    MAX_WAIT_SECONDS as MAX_RELAY_PROBE_WAIT,
+    TESTS as RELAY_PROBE_TESTS,
+    RelayProbe,
+    scrub,
+)
 from .rtsp_proxy import RtspTcpProxy
 from .sip_client import SIPClient
 from .sip_listener import IncomingCall, SipListener
@@ -676,6 +686,7 @@ SERVICE_TALK_PCM16LE = "talk_pcm16le"
 SERVICE_TALK_TONE = "talk_tone"
 SERVICE_TALK_AUDIO_FILE = "talk_audio_file"
 SERVICE_DIAGNOSE_MESSAGES = "diagnose_messages"
+SERVICE_PROBE_RING_RELAY = "probe_ring_relay"
 EXPORT_FIELDS = (
     "gateway_ip",
     "sip_username",
@@ -1051,6 +1062,85 @@ def _async_register_services(hass: HomeAssistant) -> None:
                     vol.Coerce(int), vol.Range(min=0, max=MAX_MESSAGE_DIAGNOSTICS_SECONDS)
                 ),
             }),
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_PROBE_RING_RELAY):
+
+        async def _probe_ring_relay(call: ServiceCall) -> None:
+            entries = hass.data.get(DOMAIN, {})
+            target = call.data.get("entry_id")
+            if target is None and len(entries) == 1:
+                target = next(iter(entries))
+            if target not in entries:
+                raise HomeAssistantError(
+                    "Set entry_id to the ABB Welcome config entry to probe"
+                )
+            entry_data = entries[target]
+            entry = hass.config_entries.async_get_entry(target)
+            listener = entry_data.get("sip_listener")
+            if entry is None or listener is None:
+                raise HomeAssistantError("Selected ABB Welcome entry has no SIP listener")
+            running = entry_data.get("relay_probe_task")
+            if running is not None and not running.done():
+                raise HomeAssistantError("A relay probe is already waiting for a ring")
+            test = call.data["test"]
+            wait = call.data["wait"]
+            probe = RelayProbe(
+                listener.host,
+                listener.username,
+                listener.password,
+                listener.domain,
+                test=test,
+                probes=call.data["probes"],
+                wait=wait,
+                port=listener.port,
+                transport=listener.transport,
+            )
+            notification_id = f"{DOMAIN}_relay_probe_{target}"
+
+            async def _run() -> None:
+                persistent_notification.async_create(
+                    hass,
+                    f"Test `{test}` is ready. Ring the door station once within "
+                    f"{wait} s and let it ring until it stops. Do not open the "
+                    "camera in Home Assistant during this ring.",
+                    title="ABB Welcome relay probe",
+                    notification_id=notification_id,
+                )
+                try:
+                    report = scrub(await probe.run())
+                except Exception as err:  # noqa: BLE001
+                    report = f"Relay probe `{test}` failed: {type(err).__name__}"
+                    _LOGGER.exception("[abb] relay probe failed")
+                _LOGGER.info("[abb] relay probe result:\n%s", report)
+                persistent_notification.async_create(
+                    hass,
+                    report,
+                    title="ABB Welcome relay probe",
+                    notification_id=notification_id,
+                )
+
+            entry_data["relay_probe_task"] = entry.async_create_background_task(
+                hass, _run(), "abb_welcome_relay_probe"
+            )
+
+        async_register_admin_service(
+            hass,
+            DOMAIN,
+            SERVICE_PROBE_RING_RELAY,
+            _probe_ring_relay,
+            schema=vol.Schema(
+                {
+                    vol.Optional("entry_id"): str,
+                    vol.Required("test"): vol.In(RELAY_PROBE_TESTS),
+                    vol.Optional("probes", default=DEFAULT_RELAY_PROBES): vol.All(
+                        vol.Coerce(int), vol.Range(min=1, max=MAX_RELAY_PROBES)
+                    ),
+                    vol.Optional("wait", default=DEFAULT_RELAY_PROBE_WAIT): vol.All(
+                        vol.Coerce(int), vol.Range(min=30, max=MAX_RELAY_PROBE_WAIT)
+                    ),
+                }
+            ),
         )
 
     if not hass.services.has_service(DOMAIN, SERVICE_EXPORT_CREDENTIALS):

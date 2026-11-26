@@ -48,6 +48,9 @@ Gateway-level entities:
   MESSAGE bodies for protocol investigation. Disabled by default; accepts an
   optional `entry_id` and a `duration` of 0–600 seconds (default 300). Zero stops
   diagnostics, and an integration reload clears the window.
+- `abb_welcome.probe_ring_relay` - measure how many devices the gateway sends
+  a ringing station's audio and video to. See
+  [Ring relay probe](#ring-relay-probe). Admin users only.
 - `abb_welcome.talk_audio_file` - play an 8 kHz mono 16-bit PCM WAV file
   through the door station. See [Examples](examples.md).
 
@@ -76,6 +79,36 @@ condition:
   - condition: template
     value_template: "{{ trigger.event.data.station_id == '100000001' }}"
 ```
+
+## Ring relay probe
+
+The gateway sends a ringing station's audio and video to the devices that
+answer the ring, and can stop at a limit. A device past the limit shows no
+video. To measure this, run the action below in **Developer Tools → Actions**,
+then ring the door station once and let it ring until it stops:
+
+```yaml
+action: abb_welcome.probe_ring_relay
+data:
+  test: same_size_short_answer
+```
+
+The integration registers extra contacts for its own SIP account (8 by
+default, `probes` changes that) and answers the ring from each one, 2.5
+seconds apart, without accepting the call. When the ring ends, a notification
+lists for every contact which lines it took and how many packets it received.
+A contact with 0 packets was not served. Other devices can miss video during
+the probed ring, and Home Assistant's camera should stay closed.
+
+`test` chooses how the contacts answer:
+
+- `same_size_short_answer`: all take audio and the first video size, and
+  leave the other offered lines out of the answer.
+- `same_size_full_answer`: the same, listing the other lines as rejected.
+- `one_size_each`: each contact takes the next offered video size.
+- `same_size_no_audio`: all take only the first video size.
+
+The contacts stay registered for up to two minutes after the probe.
 
 ## SIP MESSAGE diagnostics
 

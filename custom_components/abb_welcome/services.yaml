@@ -52,6 +52,59 @@ diagnose_messages:
           mode: box
           unit_of_measurement: s
 
+probe_ring_relay:
+  name: Probe the ring relay
+  description: >-
+    Diagnostic for missing video during a ring. Registers extra contacts for
+    this integration's SIP account, waits for one ring, answers it from each
+    contact in turn without accepting the call, and counts the audio and
+    video packets each contact receives. The result appears as a notification
+    that can be pasted into an issue. Other devices can miss video during the
+    probed ring. Admin users only.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config-entry ID. Only needed with more than one ABB Welcome entry.
+      required: false
+      selector:
+        text:
+    test:
+      name: Test
+      description: >-
+        How the contacts answer. same_size_short_answer: all take the first
+        video size and leave the other lines out. same_size_full_answer: the
+        same, listing the other lines as rejected. one_size_each: each takes
+        the next offered size. same_size_no_audio: video only.
+      required: true
+      selector:
+        select:
+          options:
+            - same_size_short_answer
+            - same_size_full_answer
+            - one_size_each
+            - same_size_no_audio
+    probes:
+      name: Contacts
+      description: Number of contacts that answer the ring.
+      default: 8
+      required: false
+      selector:
+        number:
+          min: 1
+          max: 12
+          mode: box
+    wait:
+      name: Wait
+      description: How long to wait for the ring.
+      default: 300
+      required: false
+      selector:
+        number:
+          min: 30
+          max: 900
+          mode: box
+          unit_of_measurement: s
+
 refresh_doors:
   name: Refresh outdoor stations
   description: >-
