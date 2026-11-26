@@ -30,7 +30,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .redaction import get_redacting_logger
+from .redaction import get_redacting_logger, sdp_for_log
 
 _LOGGER = get_redacting_logger(__name__)
 
@@ -961,6 +961,7 @@ class IntercomDialer:
             self.username,
             local_send_keys,
         )
+        _LOGGER.debug("[abb] outbound SDP offer: %s", sdp_for_log(sdp))
         invite_cseq = self._cseq
         headers = [
             f"Via: SIP/2.0/TLS {self._local_ip}:{self._local_port};branch={invite_branch};rport",
@@ -1036,6 +1037,7 @@ class IntercomDialer:
         # the audio leg after the Contact-targeted ACK.
         await self._send_request("ACK", remote_contact or request_uri, ack_headers)
 
+        _LOGGER.debug("[abb] outbound SDP answer: %s", sdp_for_log(frame.body))
         try:
             answer = parse_sdp(
                 frame.body, custom_media_crypto=self._custom_media_crypto
