@@ -26,6 +26,7 @@ from .const import (
     CONF_ALLOW_PICKUP,
     CONF_CAMERA_STILL_IMAGE,
     CONF_PREVIEW_BEFORE_ANSWER,
+    CONF_RING_VIDEO_SIZE,
     CONF_DEFAULT_UNLOCK_STATION_ID,
     CONF_DTMF_SECOND_LOCK_CODE,
     CONF_DTMF_UNLOCK_CODE,
@@ -40,6 +41,7 @@ from .const import (
     DEFAULT_ALLOW_PICKUP,
     DEFAULT_CAMERA_STILL_IMAGE,
     DEFAULT_PREVIEW_BEFORE_ANSWER,
+    DEFAULT_RING_VIDEO_SIZE,
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_LAN_RTSP_PROXY,
     DOMAIN,
@@ -48,6 +50,7 @@ from .const import (
     GATEWAY_CLIENT_TYPES,
     GATEWAY_PROFILE_APP_MANAGED,
     GATEWAY_PROFILE_WEB_ADMIN,
+    RING_VIDEO_SIZES,
     GATEWAY_PROFILES,
     UNLOCK_STRATEGIES,
     UNLOCK_STRATEGY_FAST,
@@ -1393,6 +1396,18 @@ class ABBWelcomeOptionsFlow(OptionsFlow):
                     )
                 ),
             ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_RING_VIDEO_SIZE,
+                default=current_options.get(
+                    CONF_RING_VIDEO_SIZE, DEFAULT_RING_VIDEO_SIZE
+                ),
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=list(RING_VIDEO_SIZES),
+                    translation_key=CONF_RING_VIDEO_SIZE,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            ),
             vol.Required(
                 CONF_CAMERA_STILL_IMAGE,
                 default=bool(

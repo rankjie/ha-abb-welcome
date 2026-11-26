@@ -110,6 +110,7 @@
           "lan_rtsp_port": "Preferred LAN RTSP proxy port",
           "allow_pickup": "Allow pickup from streams",
           "preview_before_answer": "Preview a ringing call without answering (talking answers it)",
+          "ring_video_size": "Video size taken from a ringing station",
           "camera_still_image": "Show the last station screenshot as the camera still image"
         }
       }
@@ -138,6 +139,15 @@
         "hybrid": "Hybrid (app-managed physical default; web-admin first door)",
         "fast": "Fast (always plain MESSAGE) — lowest latency, may not work everywhere",
         "standard": "Standard (always INVITE first) — app-managed default"
+      }
+    },
+    "ring_video_size": {
+      "options": {
+        "first": "First size the station offers",
+        "352x288": "352 × 288",
+        "640x480": "640 × 480",
+        "1024x600": "1024 × 600",
+        "1280x720": "1280 × 720"
       }
     }
   }

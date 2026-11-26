@@ -33,7 +33,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .const import RING_VIDEO_SIZE_FIRST
 from .intercom_dialer import (
+    MediaDescription,
     MediaEncryptionKeys,
     ParsedSdp,
     generate_media_encryption_keys,
@@ -273,34 +275,67 @@ def _cseq_number(value: str) -> int:
 
 
 def _preferred_payload(
-    offer: ParsedSdp,
-    media: str,
+    desc: MediaDescription,
     preferred: tuple[str, ...],
 ) -> tuple[int, str, str | None, str, bool] | None:
-    for desc in offer.medias:
-        if desc.media != media:
-            continue
-        for codec in preferred:
-            for pt in desc.payload_types:
-                rtpmap = desc.rtpmap.get(pt, "")
-                if codec.lower() in rtpmap.lower():
-                    return (
-                        pt,
-                        rtpmap,
-                        desc.fmtp.get(pt),
-                        desc.proto or "RTP/AVP",
-                        desc.rtcp_mux,
-                    )
-        if desc.payload_types:
-            pt = desc.payload_types[0]
-            return (
-                pt,
-                desc.rtpmap.get(pt, ""),
-                desc.fmtp.get(pt),
-                desc.proto or "RTP/AVP",
-                desc.rtcp_mux,
-            )
+    for codec in preferred:
+        for pt in desc.payload_types:
+            rtpmap = desc.rtpmap.get(pt, "")
+            if codec.lower() in rtpmap.lower():
+                return (
+                    pt,
+                    rtpmap,
+                    desc.fmtp.get(pt),
+                    desc.proto or "RTP/AVP",
+                    desc.rtcp_mux,
+                )
+    if desc.payload_types:
+        pt = desc.payload_types[0]
+        return (
+            pt,
+            desc.rtpmap.get(pt, ""),
+            desc.fmtp.get(pt),
+            desc.proto or "RTP/AVP",
+            desc.rtcp_mux,
+        )
     return None
+
+
+def _offered_video_size(desc: MediaDescription) -> str | None:
+    """Return a video line's ``max-width`` x ``max-height`` as ``WxH``."""
+    payload = _preferred_payload(desc, ("H264/90000",))
+    params: dict[str, str] = {}
+    for part in ((payload[2] if payload else None) or "").split(";"):
+        key, _, value = part.partition("=")
+        params[key.strip()] = value.strip()
+    width, height = params.get("max-width"), params.get("max-height")
+    return f"{width}x{height}" if width and height else None
+
+
+def _answer_medias(
+    offer: ParsedSdp, video_size: str
+) -> tuple[MediaDescription | None, MediaDescription | None]:
+    """Pick the audio line and the one video line to accept from an offer.
+
+    Gateways can offer the camera at several sizes, one video line each, and
+    seem to give each size only to the first device that accepts it: HA and
+    the vendor app on a phone, both taking the same line, got video only one
+    at a time (#52). A size that is not offered falls back to the first line.
+    """
+    audio = next(
+        (m for m in offer.medias if m.media == "audio" and m.port > 0), None
+    )
+    videos = [m for m in offer.medias if m.media == "video" and m.port > 0]
+    video = next(
+        (
+            m
+            for m in videos
+            if video_size != RING_VIDEO_SIZE_FIRST
+            and _offered_video_size(m) == video_size
+        ),
+        videos[0] if videos else None,
+    )
+    return audio, video
 
 
 def _build_answer_sdp(
@@ -311,8 +346,13 @@ def _build_answer_sdp(
     audio_port: int,
     video_port: int,
     local_send_keys: MediaEncryptionKeys | None = None,
+    video_size: str = RING_VIDEO_SIZE_FIRST,
 ) -> str:
-    """Build a conservative SDP answer for an incoming door-station INVITE."""
+    """Build a conservative SDP answer for an incoming door-station INVITE.
+
+    The answer keeps every offered line in order, as SDP offer/answer
+    requires, and rejects the ones not taken with port 0.
+    """
     sid = int(time.time() * 1000)
     lines = [
         "v=0",
@@ -323,60 +363,82 @@ def _build_answer_sdp(
         "t=0 0",
     ]
 
-    audio = _preferred_payload(offer, "audio", ("PCMA/8000", "PCMU/8000"))
-    if audio is not None:
-        pt, rtpmap, _fmtp, proto, rtcp_mux = audio
-        lines.extend(
-            [
-                f"m=audio {audio_port} {proto} {pt}",
-                f"a=rtpmap:{pt} {rtpmap or 'PCMA/8000'}",
-                "a=ptime:20",
-                "a=sendrecv",
-            ]
-        )
-        if rtcp_mux:
-            lines.append("a=rtcp-mux")
-        _append_abb_encryption_attributes(
-            lines,
-            offer,
-            "audio",
-            local_send_keys.audio if local_send_keys is not None else None,
-        )
-
-    video = _preferred_payload(offer, "video", ("H264/90000",))
-    if video is not None:
-        pt, rtpmap, fmtp, proto, rtcp_mux = video
-        lines.extend(
-            [
-                f"m=video {video_port} {proto} {pt}",
-                f"a=rtpmap:{pt} {rtpmap or 'H264/90000'}",
-            ]
-        )
-        if fmtp:
-            lines.append(f"a=fmtp:{pt} {fmtp}")
-        lines.append("a=sendrecv")
-        if rtcp_mux:
-            lines.append("a=rtcp-mux")
-        _append_abb_encryption_attributes(
-            lines,
-            offer,
-            "video",
-            local_send_keys.video if local_send_keys is not None else None,
-        )
+    audio_desc, video_desc = _answer_medias(offer, video_size)
+    for desc in offer.medias:
+        if desc is audio_desc:
+            _append_audio_answer(lines, desc, audio_port, local_send_keys)
+        elif desc is video_desc:
+            _append_video_answer(lines, desc, video_port, local_send_keys)
+        else:
+            formats = " ".join(str(pt) for pt in desc.payload_types) or "0"
+            lines.append(f"m={desc.media} 0 {desc.proto or 'RTP/AVP'} {formats}")
 
     lines.append("")
     return "\r\n".join(lines)
 
 
+def _append_audio_answer(
+    lines: list[str],
+    desc: MediaDescription,
+    port: int,
+    local_send_keys: MediaEncryptionKeys | None,
+) -> None:
+    payload = _preferred_payload(desc, ("PCMA/8000", "PCMU/8000"))
+    if payload is None:
+        return
+    pt, rtpmap, _fmtp, proto, rtcp_mux = payload
+    lines.extend(
+        [
+            f"m=audio {port} {proto} {pt}",
+            f"a=rtpmap:{pt} {rtpmap or 'PCMA/8000'}",
+            "a=ptime:20",
+            "a=sendrecv",
+        ]
+    )
+    if rtcp_mux:
+        lines.append("a=rtcp-mux")
+    _append_abb_encryption_attributes(
+        lines,
+        desc,
+        local_send_keys.audio if local_send_keys is not None else None,
+    )
+
+
+def _append_video_answer(
+    lines: list[str],
+    desc: MediaDescription,
+    port: int,
+    local_send_keys: MediaEncryptionKeys | None,
+) -> None:
+    payload = _preferred_payload(desc, ("H264/90000",))
+    if payload is None:
+        return
+    pt, rtpmap, fmtp, proto, rtcp_mux = payload
+    lines.extend(
+        [
+            f"m=video {port} {proto} {pt}",
+            f"a=rtpmap:{pt} {rtpmap or 'H264/90000'}",
+        ]
+    )
+    if fmtp:
+        lines.append(f"a=fmtp:{pt} {fmtp}")
+    lines.append("a=sendrecv")
+    if rtcp_mux:
+        lines.append("a=rtcp-mux")
+    _append_abb_encryption_attributes(
+        lines,
+        desc,
+        local_send_keys.video if local_send_keys is not None else None,
+    )
+
+
 def _append_abb_encryption_attributes(
     lines: list[str],
-    offer: ParsedSdp,
-    media: str,
+    description: MediaDescription,
     local_send_key: bytes | None = None,
 ) -> None:
     """Answer ABB's per-media encryption negotiation without exposing keys."""
-    description = next((item for item in offer.medias if item.media == media), None)
-    if description is None or not description.abb_encrypt:
+    if not description.abb_encrypt:
         return
     if description.crypto_tag is not None:
         if (
@@ -480,6 +542,7 @@ class SipListener:
         on_message: MessageCallback | None = None,
         on_message_diagnostic: FrameCallback | None = None,
         custom_media_crypto: bool = False,
+        ring_video_size: str = RING_VIDEO_SIZE_FIRST,
     ) -> None:
         if transport not in ("tls", "tcp"):
             raise ValueError("transport must be 'tls' or 'tcp'")
@@ -496,6 +559,8 @@ class SipListener:
         self._on_message_diagnostic = on_message_diagnostic
         self._message_diagnostics_until = 0.0
         self._custom_media_crypto = custom_media_crypto
+        # Read on each accepted ring, so an options change applies to the next.
+        self.ring_video_size = ring_video_size
 
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
@@ -656,6 +721,7 @@ class SipListener:
             local_send_keys = (
                 generate_media_encryption_keys() if directional_crypto else None
             )
+            video_size = self.ring_video_size
             answer = _build_answer_sdp(
                 offer,
                 username=self.username,
@@ -663,6 +729,25 @@ class SipListener:
                 audio_port=audio_port,
                 video_port=video_port,
                 local_send_keys=local_send_keys,
+                video_size=video_size,
+            )
+            audio_desc, video_desc = _answer_medias(offer, video_size)
+            _LOGGER.info(
+                "[abb] listener: accepting video %s (requested %s, offered %s)",
+                _offered_video_size(video_desc) if video_desc else "none",
+                video_size,
+                ", ".join(
+                    _offered_video_size(m) or "?"
+                    for m in offer.medias
+                    if m.media == "video" and m.port > 0
+                ),
+            )
+            # The media session must use the lines HA accepted, not the
+            # other offered sizes.
+            negotiated = ParsedSdp(
+                session_ip=offer.session_ip,
+                medias=[m for m in (audio_desc, video_desc) if m is not None],
+                crypto_attribute_count=offer.crypto_attribute_count,
             )
             _LOGGER.debug("[abb] listener: SDP offer: %s", sdp_for_log(frame.body))
             _LOGGER.debug("[abb] listener: SDP answer: %s", sdp_for_log(answer))
@@ -690,7 +775,7 @@ class SipListener:
                 local_contact=local_contact,
                 from_header=from_header,
                 to_header=to_with_tag,
-                remote_sdp=offer,
+                remote_sdp=negotiated,
                 audio_local_port=audio_port,
                 video_local_port=video_port,
                 local_send_keys=local_send_keys,

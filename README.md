@@ -112,6 +112,7 @@ Open the integration's **Configure** menu.
 | Advertised LAN host, Preferred RTSP port | Leave as they are unless Scrypted cannot reach the stream. |
 | Allow pickup from streams | Whether opening the camera may take a ringing call. |
 | Preview a ringing call without answering | Watch a ring without answering it. Off by default. |
+| Video size taken from a ringing station | A ringing station can offer its camera at several sizes, and the gateway may send each size to only one device. If the ABB Welcome app loses video while Home Assistant shows a ring, pick a size the app does not use. Default: the first size offered. |
 | Show the last station screenshot as the camera still image | Turn it off if you do not want an old screenshot shown while the live view connects. The Apple Home doorbell snapshot uses this image too. |
 
 ## Something not working?

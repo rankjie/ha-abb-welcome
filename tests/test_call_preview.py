@@ -137,6 +137,81 @@ class TestListenerPreview(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"SIP/2.0 480", self.writer.data)
 
 
+# One audio line and the same camera at four sizes, as an ABB gateway offers it.
+_SIZED_SDP = (
+    "v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=-\r\nc=IN IP4 192.0.2.1\r\n"
+    "t=0 0\r\nm=audio 50644 RTP/AVP 8 101\r\na=rtpmap:8 PCMA/8000\r\n"
+    "a=rtpmap:101 telephone-event/8000\r\n"
+    + "".join(
+        f"m=video {port} RTP/AVP 102\r\na=rtpmap:102 H264/90000\r\n"
+        f"a=fmtp:102 max-fr=30;max-width={width};max-height={height}\r\n"
+        for port, width, height in (
+            (50646, 352, 288),
+            (50648, 640, 480),
+            (50650, 1024, 600),
+            (50652, 1280, 720),
+        )
+    )
+)
+
+
+class TestRingVideoSize(unittest.IsolatedAsyncioTestCase):
+    async def _preview(self, video_size: str):
+        listener = sip_listener.SipListener(
+            "gateway.invalid",
+            "ha",
+            "secret",
+            "example.invalid",
+            ring_video_size=video_size,
+        )
+        writer = _Writer()
+        writer.is_closing = lambda: False
+        listener._writer = writer
+        invite = _request()
+        invite.body = _SIZED_SDP.encode()
+        invite._received_at = time.time()
+        listener._open_invites[_CALL_ID] = invite
+        call = await listener.accept_pending_call(
+            station_id="",
+            media_ip="192.0.2.2",
+            audio_port=40000,
+            video_port=40002,
+            preview=True,
+        )
+        (progress,) = _responses(writer.data)
+        m_lines = [line for line in _sdp(progress).splitlines() if line.startswith("m=")]
+        return m_lines, call.remote_sdp
+
+    async def test_the_chosen_size_is_the_only_video_line_taken(self) -> None:
+        m_lines, negotiated = await self._preview("1024x600")
+        self.assertEqual(
+            m_lines,
+            [
+                "m=audio 40000 RTP/AVP 8",
+                "m=video 0 RTP/AVP 102",
+                "m=video 0 RTP/AVP 102",
+                "m=video 40002 RTP/AVP 102",
+                "m=video 0 RTP/AVP 102",
+            ],
+        )
+        self.assertEqual(
+            [(m.media, m.port) for m in negotiated.medias],
+            [("audio", 50644), ("video", 50650)],
+        )
+
+    async def test_first_takes_the_first_offered_size(self) -> None:
+        m_lines, negotiated = await self._preview("first")
+        self.assertEqual(m_lines[1], "m=video 40002 RTP/AVP 102")
+        self.assertEqual(negotiated.medias[1].port, 50646)
+
+    async def test_a_size_not_offered_falls_back_to_the_first(self) -> None:
+        m_lines, negotiated = await self._preview("1920x1080")
+        self.assertEqual(
+            [line.split()[1] for line in m_lines], ["40000", "40002", "0", "0", "0"]
+        )
+        self.assertEqual(negotiated.medias[1].port, 50646)
+
+
 class _FakeListener:
     def __init__(self, *, answers: bool = True) -> None:
         self.answers = answers

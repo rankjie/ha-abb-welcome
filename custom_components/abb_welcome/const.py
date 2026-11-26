@@ -61,6 +61,12 @@ CONF_PREVIEW_BEFORE_ANSWER = "preview_before_answer"
 DEFAULT_PREVIEW_BEFORE_ANSWER = False
 CONF_CAMERA_STILL_IMAGE = "camera_still_image"
 DEFAULT_CAMERA_STILL_IMAGE = True
+# Video size HA accepts when a ringing station offers several. "first" takes
+# the first offered line; the sizes are the ones ABB gateways offer.
+CONF_RING_VIDEO_SIZE = "ring_video_size"
+RING_VIDEO_SIZE_FIRST = "first"
+RING_VIDEO_SIZES = (RING_VIDEO_SIZE_FIRST, "352x288", "640x480", "1024x600", "1280x720")
+DEFAULT_RING_VIDEO_SIZE = RING_VIDEO_SIZE_FIRST
 
 # Per-integration option: which unlock strategy to use.
 #   hybrid   — fast plain MESSAGE for an explicit physical-default station,

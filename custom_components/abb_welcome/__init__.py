@@ -24,6 +24,7 @@ from .const import (
     CONF_ALLOW_PICKUP,
     CONF_CAMERA_STILL_IMAGE,
     CONF_PREVIEW_BEFORE_ANSWER,
+    CONF_RING_VIDEO_SIZE,
     CONF_DEFAULT_UNLOCK_STATION_ID,
     CONF_DTMF_SECOND_LOCK_CODE,
     CONF_DTMF_UNLOCK_CODE,
@@ -34,6 +35,7 @@ from .const import (
     DEFAULT_ALLOW_PICKUP,
     DEFAULT_CAMERA_STILL_IMAGE,
     DEFAULT_PREVIEW_BEFORE_ANSWER,
+    DEFAULT_RING_VIDEO_SIZE,
     DEFAULT_LAN_RTSP_BIND_HOST,
     DEFAULT_LAN_RTSP_PORT,
     DEFAULT_LAN_RTSP_PORT_PICK_ATTEMPTS,
@@ -618,6 +620,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             on_state_change=_on_state_change,
             custom_media_crypto=(
                 gateway_profile(entry.data) == GATEWAY_PROFILE_APP_MANAGED
+            ),
+            ring_video_size=entry.options.get(
+                CONF_RING_VIDEO_SIZE, DEFAULT_RING_VIDEO_SIZE
             ),
         )
         entry_data["sip_listener"] = listener
@@ -1420,6 +1425,11 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
         entry_data["camera_still_image"] = entry.options.get(
             CONF_CAMERA_STILL_IMAGE, DEFAULT_CAMERA_STILL_IMAGE
         )
+        listener = entry_data.get("sip_listener")
+        if listener is not None:
+            listener.ring_video_size = entry.options.get(
+                CONF_RING_VIDEO_SIZE, DEFAULT_RING_VIDEO_SIZE
+            )
         current_reload_options = _reload_relevant_options(entry)
         previous_reload_options = entry_data.get("reload_options")
         entry_data["reload_options"] = current_reload_options
