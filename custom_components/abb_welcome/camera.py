@@ -825,6 +825,9 @@ class ABBWelcomeCamera(Camera):
         _attr_camera_entity_capabilities = CameraEntityCapabilities(
             two_way_audio=True
         )
+    # Last live frame of a ring and the portal screenshot it replaces.
+    _ring_frame: bytes | None = None
+    _ring_frame_replaces: str | None = None
 
     def __init__(
         self,
@@ -1422,10 +1425,71 @@ class ABBWelcomeCamera(Camera):
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
+        if self._live_frame_allowed():
+            # The portal screenshot of a ring arrives about 30 s late, so until
+            # then the last screenshot shows an earlier visitor. A live frame
+            # of the ring shows who is ringing now; without one there is no
+            # still rather than a wrong one.
+            frame = await self._live_frame()
+            if frame is not None:
+                self._ring_frame = frame
+                self._ring_frame_replaces = self._screenshot_event_id()
+            return frame
         if not is_camera_still_image_enabled(self.hass, self._entry_id):
             return None
+        if self._ring_frame is not None:
+            # Until the portal delivers a screenshot newer than the last live
+            # frame, that frame is the newest picture of this station.
+            if self._screenshot_event_id() == self._ring_frame_replaces:
+                return self._ring_frame
+            self._ring_frame = None
         snapshot = self._station_screenshot()
         return snapshot.image_data if snapshot else None
+
+    def _screenshot_event_id(self) -> str | None:
+        snapshot = self._station_screenshot()
+        return snapshot.event_id if snapshot else None
+
+    def _live_frame_allowed(self) -> bool:
+        # Only during this station's own unanswered ring: once the ring is
+        # over, opening the stream would call the door station. A ring that
+        # is already previewed has left the pending INVITEs but still rings.
+        if not self._stream_allowed():
+            return False
+        if self._coordinator.previewing:
+            return True
+        # Opening the stream on a pending ring answers it unless the options
+        # say to only preview it, and a still must never answer the door. Only
+        # the default camera takes the ring: a sub-camera finding the INVITE
+        # already taken would dial the station instead.
+        return (
+            self._camera_index is None
+            and is_preview_before_answer(self.hass, self._entry_id)
+            and self.has_pending_call
+        )
+
+    async def _live_frame(self) -> bytes | None:
+        base_url = _go2rtc_url(self.hass)
+        if base_url is None:
+            return None
+        try:
+            async with _go2rtc_session(self.hass).get(
+                urljoin(base_url, "api/frame.jpeg"),
+                params={"src": self._stream_name},
+                timeout=_REQUEST_TIMEOUT,
+            ) as resp:
+                if resp.status == HTTPStatus.OK:
+                    # go2rtc answers 200 with no body when the source fails.
+                    return await resp.read() or None
+                _LOGGER.debug(
+                    "[abb] camera %s: go2rtc frame failed status=%s",
+                    self._door.name, resp.status,
+                )
+        except (ClientError, TimeoutError) as err:
+            _LOGGER.debug(
+                "[abb] camera %s: go2rtc frame error: %s", self._door.name, err
+            )
+        return None
 
     def _station_screenshot(self):
         station_id = str(self._door.station_id or "").strip()
